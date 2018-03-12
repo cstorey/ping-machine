@@ -21,18 +21,39 @@ description:         Please see the README on Github at <https://github.com/gith
 
 dependencies:
 - base >= 4.7 && < 5
+- network-transport >= 0.5.2 && < 0.6
+- network-transport-tcp >= 0.6.0 && < 0.7
+- bytestring
+- unix
+- containers
 
 library:
   source-dirs: src
 
 executables:
-  stuff-hs-exe:
-    main:                Main.hs
+  stuff-server:
+    main:                Server.hs
     source-dirs:         app
     ghc-options:
     - -threaded
     - -rtsopts
     - -with-rtsopts=-N
+    - -main-is Server
+    dependencies:
+    - stuff-hs
+  stuff-client:
+    main:                Client.hs
+    source-dirs:         app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    - -main-is Client
+    - -Wall
+    - -Wcompat
+    - -Wincomplete-record-updates
+    - -Wincomplete-uni-patterns
+    - -Wredundant-constraints
     dependencies:
     - stuff-hs
 
@@ -44,5 +65,8 @@ tests:
     - -threaded
     - -rtsopts
     - -with-rtsopts=-N
+    - -Wcompat
+    - -Wincomplete-record-updates
+    - -Wincomplete-uni-patterns
     dependencies:
     - stuff-hs
