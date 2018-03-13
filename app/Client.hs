@@ -38,16 +38,16 @@ streamsOf client = do
 talk :: Socket -> IO ()
 talk sock = do
     (is, os) <- streamsOf sock
-    Streams.write (Just Lib.Bing) os
     go is os
 
-go :: Streams.InputStream Lib.Message -> Streams.OutputStream Lib.Message -> IO ()
+go :: Streams.InputStream Lib.ClientResponse -> Streams.OutputStream Lib.ClientRequest -> IO ()
 go is os = do
-    msg <- (Streams.read is :: IO (Maybe Lib.Message))
+    Streams.write (Just Lib.Bing) os
+    putStrLn "Sent"
+    msg <- Streams.read is
     putStr "Received: "
     putStrLn $ show msg
     case msg of
-        Just x -> do
-            Streams.write (Just x) os
+        Just _ -> do
             go is os
         Nothing -> return ()

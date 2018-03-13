@@ -46,9 +46,9 @@ accepter listener = do
     Async.race_ (runModel modelQ) (runAcceptor listener modelQ)
 
 -- Messages from the model to the client
-type ClientQ =  STM.TQueue (Maybe Lib.Message)
+type ClientQ =  STM.TQueue (Maybe Lib.ClientResponse)
 -- Messages from the client to the model
-type ModelQ =  STM.TQueue (ClientQ, Maybe Lib.Message)
+type ModelQ =  STM.TQueue (ClientQ, Maybe Lib.ClientRequest)
 
 runAcceptor :: S.Socket -> ModelQ -> IO ()
 runAcceptor listener modelQ = do
@@ -66,7 +66,7 @@ streamsOf client = do
 
 handleClient ::  ModelQ
             -> ClientQ
-            -> (Streams.InputStream Lib.Message, Streams.OutputStream Lib.Message)
+            -> (Streams.InputStream Lib.ClientRequest, Streams.OutputStream Lib.ClientResponse)
             -> IO ()
 handleClient modelQ sender (is,os) = do
     Async.concurrently_ reader writer
@@ -109,10 +109,13 @@ runModel modelQ = do
                 Nothing -> return ()
         go stateRef
 
-processMessage :: Lib.Message -> RWS.RWS () [Lib.Message] Int ()
+processMessage :: Lib.ClientRequest -> RWS.RWS () [Lib.ClientResponse] Int ()
 processMessage Lib.Bing = do
     s <- RWS.get
     RWS.tell [Lib.Bong s]
     RWS.modify (+1)
-processMessage (Lib.Bong _) = do
-    RWS.tell [Lib.Bing]
+
+processMessage Lib.Ping = do
+    s <- RWS.get
+    RWS.tell [Lib.Bong s]
+    RWS.modify (flip (-) 1)
