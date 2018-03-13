@@ -42,47 +42,72 @@ listenFor addr = do
 
 accepter :: S.Socket -> IO ()
 accepter listener = do
-    stateRef <- STM.atomically $ STM.newTVar 0
-    void $ forever $ do
-        (client, x) <- S.accept listener
-        putStrLn $ show (client, x)
-        C.forkIO $ do
-            E.bracket (streamsOf client) (const $ S.close client) (handleClient stateRef)
+    modelQ <- STM.atomically STM.newTQueue
+    Async.race_ (runModel modelQ) (runAcceptor listener modelQ)
+
+-- Messages from the model to the client
+type ClientQ =  STM.TQueue (Maybe Lib.Message)
+-- Messages from the client to the model
+type ModelQ =  STM.TQueue (ClientQ, Maybe Lib.Message)
+
+runAcceptor :: S.Socket -> ModelQ -> IO ()
+runAcceptor listener modelQ = do
+        void $ forever $ do
+            (client, x) <- S.accept listener
+            sender <- STM.atomically $ STM.newTQueue
+            putStrLn $ show (client, x)
+            C.forkIO $ do
+                E.bracket (streamsOf client) (const $ S.close client) (handleClient modelQ sender)
 
 streamsOf :: (Binary.Binary a, Binary.Binary b) => S.Socket -> IO (Streams.InputStream a, Streams.OutputStream b)
 streamsOf client = do
     (is, os) <- (Streams.socketToStreams client)
     (,) <$> BStreams.decodeInputStream is <*> BStreams.encodeOutputStream os
 
-handleClient :: STM.TVar Int -> (Streams.InputStream Lib.Message, Streams.OutputStream Lib.Message) -> IO ()
-handleClient ref (is,os) = do
-    q <- STM.atomically $ STM.newTQueue
-    Async.concurrently_ (reader q) (writer q)
+handleClient ::  ModelQ
+            -> ClientQ
+            -> (Streams.InputStream Lib.Message, Streams.OutputStream Lib.Message)
+            -> IO ()
+handleClient modelQ sender (is,os) = do
+    Async.concurrently_ reader writer
+    putStrLn "Client done"
     where
-    reader q = do
+    reader = do
         it <- Streams.read is
         case it of
             Just msg -> do
                 putStrLn $ "<- " ++ show msg
-                STM.atomically $ do
-                    s <- STM.readTVar ref
-                    let ((), s', resps) = RWS.runRWS (processMessage msg) () s
-                    STM.writeTVar ref s'
-                    forM_ resps $ STM.writeTQueue q . Just
-                    return ()
-                reader q
-            Nothing -> STM.atomically $ STM.writeTQueue q Nothing
+                STM.atomically $ STM.writeTQueue modelQ $ (sender, Just (msg))
+                reader
+            Nothing -> STM.atomically $ STM.writeTQueue sender Nothing
 
-    writer q =  do
-        msg <- STM.atomically $ STM.readTQueue q
+    writer =  do
+        msg <- STM.atomically $ STM.readTQueue sender
         putStrLn $ "-> " ++ show msg
         case msg of
             Just m -> do
                 Streams.write (Just m) os
-                writer q
+                writer
             Nothing -> do
                 Streams.write Nothing os
                 return ()
+
+runModel :: ModelQ -> IO ()
+runModel modelQ = do
+    stateRef <- STM.atomically $ STM.newTVar 0
+    go stateRef
+    where
+    go stateRef = do
+        STM.atomically $ do
+            (sender, m) <- STM.readTQueue modelQ
+            case m of
+                Just msg -> do
+                    s <- STM.readTVar stateRef
+                    let ((), s', resps) = RWS.runRWS (processMessage msg) () s
+                    STM.writeTVar stateRef s'
+                    forM_ resps $ STM.writeTQueue sender . Just
+                Nothing -> return ()
+        go stateRef
 
 processMessage :: Lib.Message -> RWS.RWS () [Lib.Message] Int ()
 processMessage Lib.Bing = do
