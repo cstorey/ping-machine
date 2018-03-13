@@ -10,6 +10,7 @@ import qualified System.Environment as Env
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Concurrent.STM as STM
 import qualified Control.Concurrent.Async as Async
+import Control.Applicative ((<|>))
 
 -- import qualified Data.ByteString as B
 
@@ -96,10 +97,7 @@ handleConn modelQ (is,os) = do
 runModel :: RequestsQ Lib.ClientRequest Lib.ClientResponse -> IO ()
 runModel modelQ = do
     stateRef <- STM.atomically $ STM.newTVar 0
-    go stateRef
-    where
-    go stateRef = do
-        STM.atomically $ do
+    let processClientMessage = do
             (sender, m) <- STM.readTQueue modelQ
             case m of
                 Just msg -> do
@@ -108,7 +106,10 @@ runModel modelQ = do
                     STM.writeTVar stateRef s'
                     forM_ resps $ STM.writeTQueue sender . Just
                 Nothing -> return ()
-        go stateRef
+
+    let processPeerMessage = STM.retry
+
+    forever $ STM.atomically $ processClientMessage <|> processPeerMessage
 
 processMessage :: Lib.ClientRequest -> RWS.RWS () [Lib.ClientResponse] Int ()
 processMessage Lib.Bing = do
