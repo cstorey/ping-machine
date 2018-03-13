@@ -23,10 +23,19 @@ type RequestsQ req resp =  STM.TQueue (ResponsesQ resp, Maybe req)
 
 main :: IO ()
 main = S.withSocketsDo $ do
-    myPort : _others <- Env.getArgs
-    addr <- resolve myPort
-    modelQ <- STM.atomically STM.newTQueue
-    Async.race_ (runModel modelQ) $ E.bracket (listenFor addr) S.close (runAcceptor $ handleConn modelQ)
+    clientPort : peerPort : _peers <- Env.getArgs
+    clientAddr <- resolve clientPort
+    peerAddr <- resolve peerPort
+    clientReqQ <- STM.atomically STM.newTQueue
+    peerReqQ <- STM.atomically STM.newTQueue
+    -- We also need to start a peer manager. This will start a single process
+    -- for each known peer, attempt to connect, then relay messages to/from
+    -- peers.
+    Async.withAsync (runListener clientAddr clientReqQ) $ \_a0 -> do
+        Async.withAsync (runListener peerAddr peerReqQ) $ \_a0 -> do
+            (runModel clientReqQ peerReqQ)
+    where
+    runListener addr reqs = (E.bracket (listenFor addr) S.close (runAcceptor $ handleConn reqs))
 
 resolve :: S.ServiceName -> IO S.AddrInfo
 resolve port = do
@@ -94,8 +103,10 @@ handleConn modelQ (is,os) = do
 
 --- Model bits
 
-runModel :: RequestsQ Lib.ClientRequest Lib.ClientResponse -> IO ()
-runModel modelQ = do
+runModel :: RequestsQ Lib.ClientRequest Lib.ClientResponse
+            -> RequestsQ Lib.PeerRequest Lib.PeerResponse
+            -> IO ()
+runModel modelQ _peerReqsQ = do
     stateRef <- STM.atomically $ STM.newTVar 0
     let processClientMessage = do
             (sender, m) <- STM.readTQueue modelQ
