@@ -25,7 +25,7 @@ main = S.withSocketsDo $ do
     myPort : _others <- Env.getArgs
     addr <- resolve myPort
     modelQ <- STM.atomically STM.newTQueue
-    Async.race_ (runModel modelQ) $ E.bracket (listenFor addr) S.close (runAcceptor modelQ)
+    Async.race_ (runModel modelQ) $ E.bracket (listenFor addr) S.close (runAcceptor $ handleConn modelQ)
 
 resolve :: S.ServiceName -> IO S.AddrInfo
 resolve port = do
@@ -50,40 +50,43 @@ streamsOf client = do
     (is, os) <- (Streams.socketToStreams client)
     (,) <$> BStreams.decodeInputStream is <*> BStreams.encodeOutputStream os
 
-runAcceptor :: (Show req, Binary.Binary req, Show resp, Binary.Binary resp) => RequestsQ req resp -> S.Socket  -> IO ()
-runAcceptor modelQ listener = do
+runAcceptor :: (Binary.Binary req, Binary.Binary resp)
+            => ((Streams.InputStream req, Streams.OutputStream resp) -> IO ())
+            -> S.Socket
+            -> IO ()
+runAcceptor handler listener = do
         void $ forever $ do
             (client, x) <- S.accept listener
-            sender <- STM.atomically $ STM.newTQueue
             putStrLn $ show (client, x)
             C.forkIO $ do
-                E.bracket (streamsOf client) (const $ S.close client) (handleConn modelQ sender)
+                E.bracket (streamsOf client) (const $ S.close client) handler
 
 handleConn :: (Show req, Show resp)
             => RequestsQ req resp
-            -> ResponsesQ resp
             -> (Streams.InputStream req, Streams.OutputStream resp)
             -> IO ()
-handleConn modelQ sender (is,os) = do
-    Async.concurrently_ reader writer
+
+handleConn modelQ (is,os) = do
+    sender <- STM.atomically $ STM.newTQueue
+    Async.concurrently_ (reader sender) (writer sender)
     putStrLn "Client done"
     where
-    reader = do
+    reader sender = do
         it <- Streams.read is
         case it of
             Just msg -> do
                 putStrLn $ "<- " ++ show msg
                 STM.atomically $ STM.writeTQueue modelQ $ (sender, Just (msg))
-                reader
+                reader sender
             Nothing -> STM.atomically $ STM.writeTQueue sender Nothing
 
-    writer =  do
+    writer sender =  do
         msg <- STM.atomically $ STM.readTQueue sender
         putStrLn $ "-> " ++ show msg
         case msg of
             Just m -> do
                 Streams.write (Just m) os
-                writer
+                writer sender
             Nothing -> do
                 Streams.write Nothing os
                 return ()
