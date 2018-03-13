@@ -29,6 +29,7 @@ dependencies:
 - wire-streams
 - network
 - transformers
+- stm
 
 library:
   source-dirs: src

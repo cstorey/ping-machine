@@ -7,7 +7,7 @@ import qualified System.IO.Streams         as Streams
 import qualified System.IO.Streams.Binary  as BStreams
 import qualified Data.Binary as Binary
 import qualified Control.Monad.Trans.RWS.Strict as RWS
-import qualified Data.IORef as IORef
+import qualified Control.Concurrent.STM as STM
 
 -- import qualified Data.ByteString as B
 
@@ -41,7 +41,7 @@ listenFor addr = do
 
 accepter :: S.Socket -> IO ()
 accepter listener = do
-    stateRef <- IORef.newIORef 0
+    stateRef <- STM.atomically $ STM.newTVar 0
     void $ forever $ do
         (client, x) <- S.accept listener
         putStrLn $ show (client, x)
@@ -53,7 +53,7 @@ streamsOf client = do
     (is, os) <- (Streams.socketToStreams client)
     (,) <$> BStreams.decodeInputStream is <*> BStreams.encodeOutputStream os
 
-handleClient :: IORef.IORef Int -> (Streams.InputStream Lib.Message, Streams.OutputStream Lib.Message) -> IO ()
+handleClient :: STM.TVar Int -> (Streams.InputStream Lib.Message, Streams.OutputStream Lib.Message) -> IO ()
 handleClient ref (is,os) = go
     where
     go = do
@@ -61,8 +61,12 @@ handleClient ref (is,os) = go
         case it of
             Just msg -> do
                 putStrLn $ "<- " ++ show msg
-                resps <- IORef.atomicModifyIORef ref $ 
-                    \s -> let ((), s', resps) = RWS.runRWS (processMessage msg) () s in (s', resps)
+                resps <- STM.atomically $ do
+                    s <- STM.readTVar ref
+                    let ((), s', resps) = RWS.runRWS (processMessage msg) () s
+                    STM.writeTVar ref s'
+                    return resps
+
                 putStrLn $ "-> " ++ show resps
                 forM_ resps $ \resp -> Streams.write (Just resp) os
                 go
