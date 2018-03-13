@@ -9,10 +9,12 @@ import Network.Socket hiding (recv)
 import qualified System.IO.Streams         as Streams
 import qualified System.IO.Streams.Binary  as BStreams
 import qualified Data.Binary as Binary
+import qualified System.Environment as Env
 
 main :: IO ()
 main = withSocketsDo $ do
-    addr <- resolve "127.0.0.1" "3000"
+    [sport] <- Env.getArgs
+    addr <- resolve "127.0.0.1" sport
     E.bracket (open addr) close talk
 
 resolve :: HostName -> ServiceName -> IO AddrInfo

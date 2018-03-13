@@ -6,6 +6,7 @@ import qualified Network.Socket            as S
 import qualified System.IO.Streams         as Streams
 import qualified System.IO.Streams.Binary  as BStreams
 import qualified Data.Binary as Binary
+import qualified System.Environment as Env
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Concurrent.STM as STM
 import qualified Control.Concurrent.Async as Async
@@ -18,9 +19,10 @@ import qualified Control.Exception as E
 
 main :: IO ()
 main = S.withSocketsDo $ do
-    addr <- resolve "3000"
-    E.bracket (listenFor addr) S.close accepter
-    return ()
+    myPort : _others <- Env.getArgs
+    addr <- resolve myPort
+    modelQ <- STM.atomically STM.newTQueue
+    Async.race_ (runModel modelQ) $ E.bracket (listenFor addr) S.close (runAcceptor modelQ)
 
 resolve :: S.ServiceName -> IO S.AddrInfo
 resolve port = do
@@ -40,18 +42,13 @@ listenFor addr = do
     putStrLn . show =<< S.getSocketName sock
     return sock
 
-accepter :: S.Socket -> IO ()
-accepter listener = do
-    modelQ <- STM.atomically STM.newTQueue
-    Async.race_ (runModel modelQ) (runAcceptor listener modelQ)
-
 -- Messages from the model to the client
 type ClientQ =  STM.TQueue (Maybe Lib.ClientResponse)
 -- Messages from the client to the model
 type ModelQ =  STM.TQueue (ClientQ, Maybe Lib.ClientRequest)
 
-runAcceptor :: S.Socket -> ModelQ -> IO ()
-runAcceptor listener modelQ = do
+runAcceptor :: ModelQ -> S.Socket  -> IO ()
+runAcceptor modelQ listener = do
         void $ forever $ do
             (client, x) <- S.accept listener
             sender <- STM.atomically $ STM.newTQueue
