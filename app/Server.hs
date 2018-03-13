@@ -58,12 +58,14 @@ handleClient :: (Streams.InputStream Lib.Message, Streams.OutputStream Lib.Messa
 handleClient (is,os) = do
     it <- Streams.read is
     case it of
-        Just Lib.Bing -> do
-            putStrLn $ show Lib.Bing
-            Streams.write (Just Lib.Bong) os
-            handleClient (is,os)
-        Just Lib.Bong -> do
-            putStrLn $ show Lib.Bong
-            Streams.write (Just Lib.Bing) os
+        Just msg -> do
+            putStrLn $ "<- " ++ show Lib.Bing
+            let resp = processMessage msg
+            putStrLn $ "-> " ++ show Lib.Bing
+            Streams.write (Just resp) os
             handleClient (is,os)
         Nothing -> Streams.write Nothing os
+
+processMessage :: Lib.Message -> Lib.Message
+processMessage Lib.Bing = Lib.Bong
+processMessage Lib.Bong = Lib.Bing
