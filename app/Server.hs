@@ -17,6 +17,9 @@ import qualified Control.Concurrent as C
 import Control.Monad
 import qualified Control.Exception as E
 
+type ResponsesQ resp =  STM.TQueue (Maybe resp)
+type RequestsQ req resp =  STM.TQueue (ResponsesQ resp, Maybe req)
+
 main :: IO ()
 main = S.withSocketsDo $ do
     myPort : _others <- Env.getArgs
@@ -42,30 +45,26 @@ listenFor addr = do
     putStrLn . show =<< S.getSocketName sock
     return sock
 
--- Messages from the model to the client
-type ClientQ =  STM.TQueue (Maybe Lib.ClientResponse)
--- Messages from the client to the model
-type ModelQ =  STM.TQueue (ClientQ, Maybe Lib.ClientRequest)
+streamsOf :: (Binary.Binary a, Binary.Binary b) => S.Socket -> IO (Streams.InputStream a, Streams.OutputStream b)
+streamsOf client = do
+    (is, os) <- (Streams.socketToStreams client)
+    (,) <$> BStreams.decodeInputStream is <*> BStreams.encodeOutputStream os
 
-runAcceptor :: ModelQ -> S.Socket  -> IO ()
+runAcceptor :: (Show req, Binary.Binary req, Show resp, Binary.Binary resp) => RequestsQ req resp -> S.Socket  -> IO ()
 runAcceptor modelQ listener = do
         void $ forever $ do
             (client, x) <- S.accept listener
             sender <- STM.atomically $ STM.newTQueue
             putStrLn $ show (client, x)
             C.forkIO $ do
-                E.bracket (streamsOf client) (const $ S.close client) (handleClient modelQ sender)
+                E.bracket (streamsOf client) (const $ S.close client) (handleConn modelQ sender)
 
-streamsOf :: (Binary.Binary a, Binary.Binary b) => S.Socket -> IO (Streams.InputStream a, Streams.OutputStream b)
-streamsOf client = do
-    (is, os) <- (Streams.socketToStreams client)
-    (,) <$> BStreams.decodeInputStream is <*> BStreams.encodeOutputStream os
-
-handleClient ::  ModelQ
-            -> ClientQ
-            -> (Streams.InputStream Lib.ClientRequest, Streams.OutputStream Lib.ClientResponse)
+handleConn :: (Show req, Show resp)
+            => RequestsQ req resp
+            -> ResponsesQ resp
+            -> (Streams.InputStream req, Streams.OutputStream resp)
             -> IO ()
-handleClient modelQ sender (is,os) = do
+handleConn modelQ sender (is,os) = do
     Async.concurrently_ reader writer
     putStrLn "Client done"
     where
@@ -89,7 +88,9 @@ handleClient modelQ sender (is,os) = do
                 Streams.write Nothing os
                 return ()
 
-runModel :: ModelQ -> IO ()
+--- Model bits
+
+runModel :: RequestsQ Lib.ClientRequest Lib.ClientResponse -> IO ()
 runModel modelQ = do
     stateRef <- STM.atomically $ STM.newTVar 0
     go stateRef
