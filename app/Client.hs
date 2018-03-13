@@ -28,7 +28,7 @@ open addr = do
     return sock
 
 streamsOf :: (Binary.Binary a, Binary.Binary b) => Socket -> IO (Streams.InputStream a, Streams.OutputStream b)
-streamsOf client = do 
+streamsOf client = do
     (is, os) <- (Streams.socketToStreams client)
     eis <- BStreams.decodeInputStream is
     eos <- BStreams.encodeOutputStream os

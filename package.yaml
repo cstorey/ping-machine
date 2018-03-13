@@ -30,6 +30,7 @@ dependencies:
 - network
 - transformers
 - stm
+- async
 
 library:
   source-dirs: src

@@ -8,6 +8,7 @@ import qualified System.IO.Streams.Binary  as BStreams
 import qualified Data.Binary as Binary
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Concurrent.STM as STM
+import qualified Control.Concurrent.Async as Async
 
 -- import qualified Data.ByteString as B
 
@@ -54,23 +55,34 @@ streamsOf client = do
     (,) <$> BStreams.decodeInputStream is <*> BStreams.encodeOutputStream os
 
 handleClient :: STM.TVar Int -> (Streams.InputStream Lib.Message, Streams.OutputStream Lib.Message) -> IO ()
-handleClient ref (is,os) = go
+handleClient ref (is,os) = do
+    q <- STM.atomically $ STM.newTQueue
+    Async.concurrently_ (reader q) (writer q)
     where
-    go = do
+    reader q = do
         it <- Streams.read is
         case it of
             Just msg -> do
                 putStrLn $ "<- " ++ show msg
-                resps <- STM.atomically $ do
+                STM.atomically $ do
                     s <- STM.readTVar ref
                     let ((), s', resps) = RWS.runRWS (processMessage msg) () s
                     STM.writeTVar ref s'
-                    return resps
+                    forM_ resps $ STM.writeTQueue q . Just
+                    return ()
+                reader q
+            Nothing -> STM.atomically $ STM.writeTQueue q Nothing
 
-                putStrLn $ "-> " ++ show resps
-                forM_ resps $ \resp -> Streams.write (Just resp) os
-                go
-            Nothing -> Streams.write Nothing os
+    writer q =  do
+        msg <- STM.atomically $ STM.readTQueue q
+        putStrLn $ "-> " ++ show msg
+        case msg of
+            Just m -> do
+                Streams.write (Just m) os
+                writer q
+            Nothing -> do
+                Streams.write Nothing os
+                return ()
 
 processMessage :: Lib.Message -> RWS.RWS () [Lib.Message] Int ()
 processMessage Lib.Bing = do
