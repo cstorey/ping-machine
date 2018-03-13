@@ -6,6 +6,7 @@ import qualified Network.Socket            as S
 import qualified System.IO.Streams         as Streams
 import qualified System.IO.Streams.Binary  as BStreams
 import qualified Data.Binary as Binary
+import qualified Control.Monad.Trans.RWS.Strict as RWS
 
 -- import qualified Data.ByteString as B
 
@@ -48,24 +49,22 @@ accepter listener = do
 streamsOf :: (Binary.Binary a, Binary.Binary b) => S.Socket -> IO (Streams.InputStream a, Streams.OutputStream b)
 streamsOf client = do
     (is, os) <- (Streams.socketToStreams client)
-    eis <- BStreams.decodeInputStream is
-    eos <- BStreams.encodeOutputStream os
-
-
-    return (eis, eos)
+    (,) <$> BStreams.decodeInputStream is <*> BStreams.encodeOutputStream os
 
 handleClient :: (Streams.InputStream Lib.Message, Streams.OutputStream Lib.Message)  -> IO ()
 handleClient (is,os) = do
     it <- Streams.read is
     case it of
         Just msg -> do
-            putStrLn $ "<- " ++ show Lib.Bing
-            let resp = processMessage msg
-            putStrLn $ "-> " ++ show Lib.Bing
-            Streams.write (Just resp) os
+            putStrLn $ "<- " ++ show msg
+            let ((), (), resps) = RWS.runRWS (processMessage msg) () ()
+            putStrLn $ "-> " ++ show resps
+            forM_ resps $ \resp -> Streams.write (Just resp) os
             handleClient (is,os)
         Nothing -> Streams.write Nothing os
 
-processMessage :: Lib.Message -> Lib.Message
-processMessage Lib.Bing = Lib.Bong
-processMessage Lib.Bong = Lib.Bing
+processMessage :: Lib.Message -> RWS.RWS () [Lib.Message] () ()
+processMessage Lib.Bing = do
+    RWS.tell [Lib.Bong]
+processMessage Lib.Bong = do
+    RWS.tell [Lib.Bing]

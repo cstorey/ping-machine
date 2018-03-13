@@ -25,9 +25,10 @@ dependencies:
 - unix
 - containers
 - io-streams
+- binary
 - wire-streams
 - network
-- binary
+- transformers
 
 library:
   source-dirs: src
