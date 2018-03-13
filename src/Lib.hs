@@ -10,7 +10,7 @@ import qualified Data.Binary as Binary
 
 data Message =
     Bing
-  | Bong
+  | Bong Int
   deriving (Show, Generic)
 
 

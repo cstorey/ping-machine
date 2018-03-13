@@ -7,6 +7,7 @@ import qualified System.IO.Streams         as Streams
 import qualified System.IO.Streams.Binary  as BStreams
 import qualified Data.Binary as Binary
 import qualified Control.Monad.Trans.RWS.Strict as RWS
+import qualified Data.IORef as IORef
 
 -- import qualified Data.ByteString as B
 
@@ -40,31 +41,37 @@ listenFor addr = do
 
 accepter :: S.Socket -> IO ()
 accepter listener = do
+    stateRef <- IORef.newIORef 0
     void $ forever $ do
         (client, x) <- S.accept listener
         putStrLn $ show (client, x)
         C.forkIO $ do
-            E.bracket (streamsOf client) (const $ S.close client) handleClient
+            E.bracket (streamsOf client) (const $ S.close client) (handleClient stateRef)
 
 streamsOf :: (Binary.Binary a, Binary.Binary b) => S.Socket -> IO (Streams.InputStream a, Streams.OutputStream b)
 streamsOf client = do
     (is, os) <- (Streams.socketToStreams client)
     (,) <$> BStreams.decodeInputStream is <*> BStreams.encodeOutputStream os
 
-handleClient :: (Streams.InputStream Lib.Message, Streams.OutputStream Lib.Message)  -> IO ()
-handleClient (is,os) = do
-    it <- Streams.read is
-    case it of
-        Just msg -> do
-            putStrLn $ "<- " ++ show msg
-            let ((), (), resps) = RWS.runRWS (processMessage msg) () ()
-            putStrLn $ "-> " ++ show resps
-            forM_ resps $ \resp -> Streams.write (Just resp) os
-            handleClient (is,os)
-        Nothing -> Streams.write Nothing os
+handleClient :: IORef.IORef Int -> (Streams.InputStream Lib.Message, Streams.OutputStream Lib.Message) -> IO ()
+handleClient ref (is,os) = go
+    where
+    go = do
+        it <- Streams.read is
+        case it of
+            Just msg -> do
+                putStrLn $ "<- " ++ show msg
+                resps <- IORef.atomicModifyIORef ref $ 
+                    \s -> let ((), s', resps) = RWS.runRWS (processMessage msg) () s in (s', resps)
+                putStrLn $ "-> " ++ show resps
+                forM_ resps $ \resp -> Streams.write (Just resp) os
+                go
+            Nothing -> Streams.write Nothing os
 
-processMessage :: Lib.Message -> RWS.RWS () [Lib.Message] () ()
+processMessage :: Lib.Message -> RWS.RWS () [Lib.Message] Int ()
 processMessage Lib.Bing = do
-    RWS.tell [Lib.Bong]
-processMessage Lib.Bong = do
+    s <- RWS.get
+    RWS.tell [Lib.Bong s]
+    RWS.modify (+1)
+processMessage (Lib.Bong _) = do
     RWS.tell [Lib.Bing]
