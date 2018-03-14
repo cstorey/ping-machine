@@ -31,3 +31,8 @@ data PeerResponse =
     ThatsNiceDear Int
   deriving (Show, Generic)
 instance Binary.Binary PeerResponse
+
+data ReqResp a b = Request a
+  | Resp b
+  deriving (Show, Generic)
+instance (Binary.Binary a, Binary.Binary b) => Binary.Binary (ReqResp a b)

@@ -44,7 +44,7 @@ main = S.withSocketsDo $ do
     -- peers.
     Async.withAsync (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ) $ \_a0 -> do
         Async.withAsync (runListener (PeerID <$> nextId ids) peerAddr peers peerReqQ) $ \_a0 -> do
-            (runModel clientReqQ peerReqQ clients processMessage)
+            (runModel clientReqQ peerReqQ clients )
 
 nextId :: STM.TVar Int -> IO Int
 nextId ids = STM.atomically $ do
@@ -137,40 +137,70 @@ handleConn clients modelQ clientId (is,os) = do
 
 --- Model bits
 
-runModel :: Ord xid
-            => RequestsQ xid req
-            -> RequestsQ preq presp
-            -> STM.TVar (Map.Map xid (ResponsesQ resp))
-            -> (req -> RWS.RWS () [resp] Int ())
-            -> IO ()
-runModel modelQ _peerReqsQ clients process = do
-    stateRef <- STM.atomically $ STM.newTVar 0
-    let processClientMessage = do
-            (clientId, m) <- STM.readTQueue modelQ
-            case m of
-                Just msg -> do
-                    s <- STM.readTVar stateRef
-                    let ((), s', resps) = RWS.runRWS (process msg) () s
-                    STM.writeTVar stateRef s'
-                    clientp <- Map.lookup clientId <$> STM.readTVar clients
-                    case clientp of
-                        Just q -> forM_ resps $ STM.writeTQueue q . Just
-                        Nothing -> error "what?"
-                Nothing -> return ()
+data MessageSend clientId reply dest peerReq = Reply clientId reply
+    | PeerMessage dest peerReq
 
+type STMRespChanMap xid resp = STM.TVar (Map.Map xid (ResponsesQ resp))
+
+runModel :: RequestsQ ClientID Lib.ClientRequest
+            -> RequestsQ PeerID Lib.PeerRequest
+            -> STMRespChanMap ClientID Lib.ClientResponse
+            -> IO ()
+runModel modelQ _peerReqsQ clients = do
+    stateRef <- STM.atomically $ STM.newTVar 0
+
+    let processClientMessage = processMessageSTM stateRef modelQ processMessage
     let processPeerMessage = STM.retry
 
-    forever $ STM.atomically $ processClientMessage <|> processPeerMessage
+    forever $ STM.atomically $ do
+        outputs <- processClientMessage <|> processPeerMessage
+        sendMessages clients (error "peers") outputs
 
-processMessage :: Lib.ClientRequest -> RWS.RWS () [Lib.ClientResponse] Int ()
-processMessage Lib.Bing = do
+processMessageSTM :: STM.TVar Int
+                  -> RequestsQ xid req
+                  -> (xid -> req -> RWS.RWS () [MessageSend a b c d] Int ())
+                  -> STM.STM [MessageSend a b c d]
+processMessageSTM stateRef reqQ process = do
+    (sender, m) <- STM.readTQueue reqQ
+    case m of
+        Just msg -> do
+            s <- STM.readTVar stateRef
+            let ((), s', toSend) = RWS.runRWS (process sender msg) () s
+            STM.writeTVar stateRef s'
+            return toSend
+        Nothing -> return []
+
+sendMessages :: STMRespChanMap ClientID Lib.ClientResponse
+             -> STMRespChanMap PeerID Lib.PeerRequest
+             -> [ProcessorMessage]
+             -> STM.STM ()
+sendMessages clients peers toSend = do
+            forM_ toSend $ \msg' -> do
+                case msg' of
+                    Reply clientId reply -> do
+                        clientp <- Map.lookup clientId <$> STM.readTVar clients
+                        case clientp of
+                            Just q -> STM.writeTQueue q $ Just reply
+                            Nothing -> error "what?"
+
+                    PeerMessage peerId req -> do
+                        clientp <- Map.lookup peerId <$> STM.readTVar peers
+                        case clientp of
+                            Just q -> STM.writeTQueue q $ Just req
+                            Nothing -> error "what?"
+
+
+type ProcessorMessage = MessageSend ClientID Lib.ClientResponse PeerID Lib.PeerRequest
+
+processMessage :: ClientID -> Lib.ClientRequest -> RWS.RWS () [ProcessorMessage] Int ()
+processMessage sender Lib.Bing = do
     s <- RWS.get
-    RWS.tell [Lib.Bong s]
+    RWS.tell [Reply sender $ Lib.Bong s]
     RWS.modify (+1)
 
-processMessage Lib.Ping = do
+processMessage sender Lib.Ping = do
     s <- RWS.get
-    RWS.tell [Lib.Bong s]
+    RWS.tell [Reply sender $ Lib.Bong s]
     RWS.modify (flip (-) 1)
 
 {-
