@@ -13,6 +13,7 @@ import qualified Control.Concurrent.Async as Async
 import qualified Data.Map as Map
 import Control.Applicative ((<|>))
 
+
 -- import qualified Data.ByteString as B
 
 import qualified Control.Concurrent as C
@@ -29,7 +30,13 @@ newtype ClientID = ClientID Int
 newtype PeerID = PeerID Int
     deriving (Show, Eq, Ord)
 
-main :: IO ()
+data Tick = Tick
+
+data ProtocolState = ProtocolState {
+    bings :: Int
+}
+
+main ::  IO ()
 main = S.withSocketsDo $ do
     clientPort : peerPort : _peers <- Env.getArgs
     clientAddr <- resolve clientPort
@@ -37,6 +44,7 @@ main = S.withSocketsDo $ do
     ids <- STM.atomically $ STM.newTVar 0
     clientReqQ <- STM.atomically STM.newTQueue:: IO (STM.TQueue (ClientID,Maybe Lib.ClientRequest))
     peerReqQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerID,Maybe Lib.PeerRequest))
+    ticks <- STM.atomically STM.newTQueue :: IO (STM.TQueue ((),Maybe Tick))
     clients <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map ClientID (ResponsesQ Lib.ClientResponse)))
     peers <- STM.atomically $ STM.newTVar $ Map.empty  :: IO (STM.TVar (Map.Map PeerID (ResponsesQ Lib.PeerResponse)))
     -- We also need to start a peer manager. This will start a single process
@@ -45,7 +53,8 @@ main = S.withSocketsDo $ do
     let race = Async.race_
     (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ) `race`
         (runListener (PeerID <$> nextId ids) peerAddr peers peerReqQ) `race`
-        (runModel clientReqQ peerReqQ clients )
+        (runTicker ticks) `race`
+        (runModel clientReqQ peerReqQ clients ticks)
 
 nextId :: STM.TVar Int -> IO Int
 nextId ids = STM.atomically $ do
@@ -53,7 +62,7 @@ nextId ids = STM.atomically $ do
     STM.writeTVar ids (n+1)
     return n
 
-runListener ::  (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid, Ord xid)
+runListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid, Ord xid)
             => IO xid
             -> S.AddrInfo
             -> STM.TVar (Map.Map xid (ResponsesQ resp))
@@ -136,6 +145,13 @@ handleConn clients modelQ clientId (is,os) = do
                 Streams.write Nothing os
                 return ()
 
+
+runTicker :: STM.TQueue ((), Maybe Tick) -> IO ()
+runTicker ticks = void $ forever $ do
+    STM.atomically $ STM.writeTQueue ticks ((), Just Tick)
+    putStrLn "Tick"
+    C.threadDelay 1000000
+
 --- Model bits
 
 data MessageSend clientId reply dest peerReq = Reply clientId reply
@@ -146,20 +162,22 @@ type STMRespChanMap xid resp = STM.TVar (Map.Map xid (ResponsesQ resp))
 runModel :: RequestsQ ClientID Lib.ClientRequest
             -> RequestsQ PeerID Lib.PeerRequest
             -> STMRespChanMap ClientID Lib.ClientResponse
+            -> RequestsQ () Tick
             -> IO ()
-runModel modelQ _peerReqsQ clients = do
-    stateRef <- STM.atomically $ STM.newTVar 0
+runModel modelQ _peerReqsQ clients ticks = do
+    stateRef <- STM.atomically $ STM.newTVar $ ProtocolState 0
 
     let processClientMessage = processMessageSTM stateRef modelQ processMessage
+    let processTickMessage = processMessageSTM stateRef ticks processTick
     let processPeerMessage = STM.retry
 
     forever $ STM.atomically $ do
-        outputs <- processClientMessage <|> processPeerMessage
+        outputs <- processClientMessage <|> processPeerMessage <|> processTickMessage
         sendMessages clients (error "peers") outputs
 
-processMessageSTM :: STM.TVar Int
+processMessageSTM :: STM.TVar ProtocolState
                   -> RequestsQ xid req
-                  -> (xid -> req -> RWS.RWS () [MessageSend a b c d] Int ())
+                  -> (xid -> req -> RWS.RWS () [MessageSend a b c d] ProtocolState ())
                   -> STM.STM [MessageSend a b c d]
 processMessageSTM stateRef reqQ process = do
     (sender, m) <- STM.readTQueue reqQ
@@ -193,16 +211,20 @@ sendMessages clients peers toSend = do
 
 type ProcessorMessage = MessageSend ClientID Lib.ClientResponse PeerID Lib.PeerRequest
 
-processMessage :: ClientID -> Lib.ClientRequest -> RWS.RWS () [ProcessorMessage] Int ()
+processMessage :: ClientID -> Lib.ClientRequest -> RWS.RWS () [ProcessorMessage] ProtocolState ()
 processMessage sender Lib.Bing = do
-    s <- RWS.get
+    s <- bings <$>  RWS.get
     RWS.tell [Reply sender $ Lib.Bong s]
-    RWS.modify (+1)
+    RWS.modify $ \st -> st { bings = 1 + bings st }
 
 processMessage sender Lib.Ping = do
-    s <- RWS.get
+    s <- bings <$> RWS.get
     RWS.tell [Reply sender $ Lib.Bong s]
-    RWS.modify (flip (-) 1)
+    RWS.modify $ \st -> st { bings = 1 - bings st }
+
+processTick :: () -> Tick -> RWS.RWS () [ProcessorMessage] ProtocolState ()
+processTick () Tick = do
+    RWS.modify $ \st -> st { bings = (bings st) `div` 2 }
 
 {-
  * Track ClientIDs and make response targets explicit
