@@ -4,8 +4,7 @@ module Lib
     (
       ClientRequest(..)
     , ClientResponse(..)
-    , PeerRequest(..)
-    , PeerResponse(..)
+    , PeerMessage(..)
     ) where
 
 import GHC.Generics
@@ -22,12 +21,8 @@ data ClientResponse =
   deriving (Show, Generic)
 instance Binary.Binary ClientResponse
 
-data PeerRequest =
+data PeerMessage =
     IHave Int
+  | ThatsNiceDear Int
   deriving (Show, Generic)
-instance Binary.Binary PeerRequest
-
-data PeerResponse =
-    ThatsNiceDear Int
-  deriving (Show, Generic)
-instance Binary.Binary PeerResponse
+instance Binary.Binary PeerMessage

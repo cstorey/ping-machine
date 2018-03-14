@@ -103,32 +103,50 @@ handleConn modelQ (is,os) = do
 
 --- Model bits
 
+data MessageSend reply dest peerReq = Reply reply
+    | PeerMessage dest peerReq
+
 runModel :: RequestsQ Lib.ClientRequest Lib.ClientResponse
             -> RequestsQ Lib.PeerRequest Lib.PeerResponse
             -> IO ()
 runModel modelQ _peerReqsQ = do
     stateRef <- STM.atomically $ STM.newTVar 0
-    let processClientMessage = do
-            (sender, m) <- STM.readTQueue modelQ
-            case m of
-                Just msg -> do
-                    s <- STM.readTVar stateRef
-                    let ((), s', resps) = RWS.runRWS (processMessage msg) () s
-                    STM.writeTVar stateRef s'
-                    forM_ resps $ STM.writeTQueue sender . Just
-                Nothing -> return ()
 
+    let processClientMessage = processMessageSTM stateRef modelQ
     let processPeerMessage = STM.retry
 
     forever $ STM.atomically $ processClientMessage <|> processPeerMessage
 
-processMessage :: Lib.ClientRequest -> RWS.RWS () [Lib.ClientResponse] Int ()
+processMessageSTM :: STM.TVar Int
+                           -> RequestsQ Lib.ClientRequest Lib.ClientResponse
+                           -> RequestsQ Lib.PeerRequest Lib.PeerResponse
+                           -> STM.STM ()
+processMessageSTM stateRef reqQ peerReqs = do
+    (sender, m) <- STM.readTQueue reqQ
+    case m of
+        Just msg -> do
+            s <- STM.readTVar stateRef
+            let ((), s', toSend) = RWS.runRWS (processMessage msg) () s
+            STM.writeTVar stateRef s'
+            forM_ toSend $ \msg' -> do
+                case msg' of
+                    Reply reply -> STM.writeTQueue sender $ Just reply
+                    PeerMessage dest req -> do
+                        STM.writeTQueue dest (self, Just req)
+        Nothing -> return ()
+
+
+type ProcessorMessage = MessageSend Lib.ClientResponse
+                        (RequestsQ Lib.PeerRequest Lib.PeerResponse)
+                        Lib.PeerRequest
+
+processMessage :: Lib.ClientRequest -> RWS.RWS () [ProcessorMessage] Int ()
 processMessage Lib.Bing = do
     s <- RWS.get
-    RWS.tell [Lib.Bong s]
+    RWS.tell [Reply $ Lib.Bong s]
     RWS.modify (+1)
 
 processMessage Lib.Ping = do
     s <- RWS.get
-    RWS.tell [Lib.Bong s]
+    RWS.tell [Reply $ Lib.Bong s]
     RWS.modify (flip (-) 1)
