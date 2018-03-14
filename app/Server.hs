@@ -26,24 +26,24 @@ type RequestsQ sender req =  STM.TQueue (sender, Maybe req)
 newtype ClientID = ClientID Int
     deriving (Show, Eq, Ord)
 
--- Newtype for Int, eventually
-data PeerID
+newtype PeerID = PeerID Int
+    deriving (Show, Eq, Ord)
 
 main :: IO ()
 main = S.withSocketsDo $ do
-    clientPort : _peerPort : _peers <- Env.getArgs
+    clientPort : peerPort : _peers <- Env.getArgs
     clientAddr <- resolve clientPort
-    -- peerAddr <- resolve peerPort
+    peerAddr <- resolve peerPort
     ids <- STM.atomically $ STM.newTVar 0
     clientReqQ <- STM.atomically STM.newTQueue:: IO (STM.TQueue (ClientID,Maybe Lib.ClientRequest))
     peerReqQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerID,Maybe Lib.PeerRequest))
     clients <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map ClientID (ResponsesQ Lib.ClientResponse)))
-    -- peers <- STM.atomically $ STM.newTVar $ Map.empty
+    peers <- STM.atomically $ STM.newTVar $ Map.empty  :: IO (STM.TVar (Map.Map PeerID (ResponsesQ Lib.PeerResponse)))
     -- We also need to start a peer manager. This will start a single process
     -- for each known peer, attempt to connect, then relay messages to/from
     -- peers.
-    Async.withAsync (runListener (fmap ClientID $ nextId ids) clientAddr clients clientReqQ) $ \_a0 -> do
-        -- Async.withAsync (runListener peerAddr peers peerReqQ) $ \_a0 -> do
+    Async.withAsync (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ) $ \_a0 -> do
+        Async.withAsync (runListener (PeerID <$> nextId ids) peerAddr peers peerReqQ) $ \_a0 -> do
             (runModel clientReqQ peerReqQ clients processMessage)
 
 nextId :: STM.TVar Int -> IO Int
