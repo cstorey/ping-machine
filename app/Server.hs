@@ -42,9 +42,10 @@ main = S.withSocketsDo $ do
     -- We also need to start a peer manager. This will start a single process
     -- for each known peer, attempt to connect, then relay messages to/from
     -- peers.
-    Async.withAsync (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ) $ \_a0 -> do
-        Async.withAsync (runListener (PeerID <$> nextId ids) peerAddr peers peerReqQ) $ \_a0 -> do
-            (runModel clientReqQ peerReqQ clients )
+    let race = Async.race_
+    (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ) `race`
+        (runListener (PeerID <$> nextId ids) peerAddr peers peerReqQ) `race`
+        (runModel clientReqQ peerReqQ clients )
 
 nextId :: STM.TVar Int -> IO Int
 nextId ids = STM.atomically $ do
