@@ -33,7 +33,8 @@ newtype PeerID = PeerID Int
 data Tick = Tick
 
 data ProtocolState = ProtocolState {
-    bings :: Int
+    bings :: Int,
+    pending :: [ProcessorMessage]
 }
 
 main ::  IO ()
@@ -165,7 +166,7 @@ runModel :: RequestsQ ClientID Lib.ClientRequest
             -> RequestsQ () Tick
             -> IO ()
 runModel modelQ _peerReqsQ clients ticks = do
-    stateRef <- STM.atomically $ STM.newTVar $ ProtocolState 0
+    stateRef <- STM.atomically $ STM.newTVar $ ProtocolState 0 []
 
     let processClientMessage = processMessageSTM stateRef modelQ processMessage
     let processTickMessage = processMessageSTM stateRef ticks processTick
@@ -214,8 +215,10 @@ type ProcessorMessage = MessageSend ClientID Lib.ClientResponse PeerID Lib.PeerR
 processMessage :: ClientID -> Lib.ClientRequest -> RWS.RWS () [ProcessorMessage] ProtocolState ()
 processMessage sender Lib.Bing = do
     s <- bings <$>  RWS.get
-    RWS.tell [Reply sender $ Lib.Bong s]
-    RWS.modify $ \st -> st { bings = 1 + bings st }
+    RWS.modify $ \st -> st {
+        bings = 1 + bings st,
+        pending = pending st ++ [Reply sender $ Lib.Bong s]
+    }
 
 processMessage sender Lib.Ping = do
     s <- bings <$> RWS.get
@@ -224,11 +227,6 @@ processMessage sender Lib.Ping = do
 
 processTick :: () -> Tick -> RWS.RWS () [ProcessorMessage] ProtocolState ()
 processTick () Tick = do
-    RWS.modify $ \st -> st { bings = (bings st) `div` 2 }
-
-{-
- * Track ClientIDs and make response targets explicit
- * Acceptor adds client ids to a map in STM
- * Add a Tick event
- * Delay responses until next Tick
--}
+    toSend <- pending <$> RWS.get
+    RWS.modify $ \st -> st { pending = [] }
+    RWS.tell toSend
