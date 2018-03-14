@@ -34,6 +34,7 @@ main = S.withSocketsDo $ do
     clientPort : _peerPort : _peers <- Env.getArgs
     clientAddr <- resolve clientPort
     -- peerAddr <- resolve peerPort
+    ids <- STM.atomically $ STM.newTVar 0
     clientReqQ <- STM.atomically STM.newTQueue:: IO (STM.TQueue (ClientID,Maybe Lib.ClientRequest))
     peerReqQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerID,Maybe Lib.PeerRequest))
     clients <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map ClientID (ResponsesQ Lib.ClientResponse)))
@@ -41,19 +42,24 @@ main = S.withSocketsDo $ do
     -- We also need to start a peer manager. This will start a single process
     -- for each known peer, attempt to connect, then relay messages to/from
     -- peers.
-    Async.withAsync (runListener ClientID clientAddr clients clientReqQ) $ \_a0 -> do
+    Async.withAsync (runListener (fmap ClientID $ nextId ids) clientAddr clients clientReqQ) $ \_a0 -> do
         -- Async.withAsync (runListener peerAddr peers peerReqQ) $ \_a0 -> do
             (runModel clientReqQ peerReqQ clients processMessage)
 
+nextId :: STM.TVar Int -> IO Int
+nextId ids = STM.atomically $ do
+    n <- STM.readTVar ids
+    STM.writeTVar ids (n+1)
+    return n
+
 runListener ::  (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid, Ord xid)
-            => (Int -> xid)
+            => IO xid
             -> S.AddrInfo
             -> STM.TVar (Map.Map xid (ResponsesQ resp))
             -> RequestsQ xid req
             -> IO ()
-runListener toid addr clients reqs =
-    E.bracket (listenFor addr) S.close (runAcceptor toid $ handleConn clients reqs)
-
+runListener newId addr clients reqs =
+    E.bracket (listenFor addr) S.close (runAcceptor newId $ handleConn clients reqs)
 
 resolve :: S.ServiceName -> IO S.AddrInfo
 resolve port = do
@@ -80,19 +86,18 @@ streamsOf client = do
 
 
 runAcceptor :: (Binary.Binary req, Binary.Binary resp)
-            => (Int -> xid)
+            => IO xid
             -> (xid -> (Streams.InputStream req, Streams.OutputStream resp) -> IO ())
             -> S.Socket
             -> IO ()
-runAcceptor toid handler listener = do
-    go 0
+runAcceptor newId handler listener = go
     where
-    go n = do
-        (client, x) <- S.accept listener
-        putStrLn $ show (client, x)
-        _ <- C.forkIO $ do
-            E.bracket (streamsOf client) (const $ S.close client) (handler $ toid n)
-        go (n+1)
+    go = void $ forever $ do
+            (client, x) <- S.accept listener
+            putStrLn $ show (client, x)
+            n <- newId
+            void $ C.forkIO $ do
+                E.bracket (streamsOf client) (const $ S.close client) (handler n)
 
 handleConn :: (Show req, Show resp, Show xid, Ord xid)
             => STM.TVar (Map.Map xid (ResponsesQ resp))
