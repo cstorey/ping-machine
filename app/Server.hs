@@ -11,6 +11,7 @@ import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Concurrent.STM as STM
 import qualified Control.Concurrent.Async as Async
 import qualified Data.Map as Map
+import Data.List ((\\))
 import Control.Applicative ((<|>))
 
 
@@ -22,13 +23,25 @@ import qualified Control.Exception as E
 
 type ResponsesOutQ resp =  STM.TQueue (Maybe resp)
 type RequestsInQ sender req =  STM.TQueue (sender, Maybe req)
+type RequestsOutQ req =  STM.TQueue (Maybe req)
 
 
 newtype ClientID = ClientID Int
     deriving (Show, Eq, Ord)
 
+-- Identifier for an _incoming_ request
 newtype PeerID = PeerID Int
     deriving (Show, Eq, Ord)
+
+
+-- Identifier for an outgoing request
+newtype PeerName = PeerName { unPeerName :: String }
+    deriving (Show, Eq, Ord)
+
+data ProcessorMessage = Reply ClientID Lib.ClientResponse
+    | PeerRequest PeerName Lib.PeerRequest
+
+type STMRespChanMap xid resp = STM.TVar (Map.Map xid (ResponsesOutQ resp))
 
 data Tick = Tick
 
@@ -39,29 +52,79 @@ data ProtocolState = ProtocolState {
 
 main ::  IO ()
 main = S.withSocketsDo $ do
-    clientPort : peerPort : _peers <- Env.getArgs
+    clientPort : peerPort : peerPorts <- Env.getArgs
     clientAddr <- resolve clientPort
-    peerAddr <- resolve peerPort
+    peerListenAddr <- resolve peerPort
     ids <- STM.atomically $ STM.newTVar 0
     clientReqQ <- STM.atomically STM.newTQueue:: IO (STM.TQueue (ClientID,Maybe Lib.ClientRequest))
-    peerReqQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerID,Maybe Lib.PeerRequest))
+    peerInQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerID,Maybe Lib.PeerRequest))
+    peerRespQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerName,Maybe Lib.PeerResponse))
     ticks <- STM.atomically STM.newTQueue :: IO (STM.TQueue ((),Maybe Tick))
     clients <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map ClientID (ResponsesOutQ Lib.ClientResponse)))
-    peers <- STM.atomically $ STM.newTVar $ Map.empty  :: IO (STM.TVar (Map.Map PeerID (ResponsesOutQ Lib.PeerResponse)))
+    incomingPeers <- STM.atomically $ STM.newTVar $ Map.empty  :: IO (STM.TVar (Map.Map PeerID (ResponsesOutQ Lib.PeerRequest)))
+    outgoingPeers <- STM.atomically $ STM.newTVar $ Map.empty  :: IO (STM.TVar (Map.Map PeerName (ResponsesOutQ Lib.PeerRequest)))
     -- We also need to start a peer manager. This will start a single process
     -- for each known peer, attempt to connect, then relay messages to/from
     -- peers.
     let race = Async.race_
     (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ) `race`
-        (runListener (PeerID <$> nextId ids) peerAddr peers peerReqQ) `race`
+        (runListener (PeerID <$> nextId ids) peerListenAddr incomingPeers peerInQ) `race`
+        (runOutgoing (PeerName <$> peerPorts) outgoingPeers peerRespQ) `race`
         (runTicker ticks) `race`
-        (runModel clientReqQ peerReqQ clients ticks)
+        (runModel clientReqQ peerInQ clients ticks outgoingPeers)
 
 nextId :: STM.TVar Int -> IO Int
 nextId ids = STM.atomically $ do
     n <- STM.readTVar ids
     STM.writeTVar ids (n+1)
     return n
+
+
+-- Supervisor
+runOutgoing :: [PeerName]
+            -> STMRespChanMap PeerName Lib.PeerRequest
+            -> RequestsInQ PeerName Lib.PeerResponse
+            -> IO ()
+runOutgoing peerNames peers peerRespQ = do
+    putStrLn $ "peers:" ++ show peerNames
+    processes <- STM.atomically $ STM.newTVar $ Map.empty
+
+    void $ forever $ do
+        runningProcesses <- Map.elems <$> STM.readTVarIO processes
+        forM_ (peerNames \\ runningProcesses) $ \name -> do
+            q <- STM.newTQueueIO
+            a <- Async.async $ runPeer peerRespQ name q
+            STM.atomically $ do
+                STM.modifyTVar peers $ Map.insert name q
+                STM.modifyTVar processes $ Map.insert a name
+            putStrLn $ "Starting: " ++ show name
+        do
+            procNames <- Map.elems <$> STM.readTVarIO processes
+            putStrLn $ "procs:" ++ show procNames
+
+        (peerNamep, ret) <- STM.atomically $ do
+            procs <- STM.readTVar processes
+            (a, retOrError) <- Async.waitAnyCatchSTM $ Map.keys procs
+            let namep = Map.lookup a procs
+            STM.writeTVar processes $ Map.delete a procs
+            return (namep, retOrError)
+
+        putStrLn $ "runOutgoing : " ++ show (peerNamep, ret)
+        C.threadDelay 1000000
+
+connect :: S.AddrInfo -> IO S.Socket
+connect addr = do
+    sock <- S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)
+    S.connect sock $ S.addrAddress addr
+    return sock
+
+runPeer :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp) => RequestsInQ PeerName req -> PeerName -> ResponsesOutQ resp -> IO ()
+runPeer fromPeerQ name toPeerQ = do
+    addrInfo <- resolve $ unPeerName name
+    (is, os) <- streamsOf =<< connect addrInfo
+
+    processMessages fromPeerQ name toPeerQ (is, os)
+    error $ "runPeer: " ++ show name
 
 runListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid, Ord xid)
             => IO xid
@@ -122,16 +185,25 @@ handleConn clients modelQ clientId (is,os) = do
         q <- STM.newTQueue
         STM.modifyTVar clients $ Map.insert clientId q
         return q
+    processMessages modelQ clientId q (is, os)
 
-    Async.concurrently_ (reader clientId q) (writer q)
-    putStrLn "Client done"
+processMessages :: (Show xid, Show req, Show resp) =>
+       RequestsInQ xid req
+    -> xid
+    -> STM.TQueue (Maybe resp)
+    -> (Streams.InputStream req, Streams.OutputStream resp)
+    -> IO ()
+
+processMessages outQ clientId inQ (is, os) = do
+    Async.concurrently_ (reader clientId inQ) (writer inQ)
+    putStrLn $ "Done: " ++ show clientId
     where
     reader senderId writerQ = do
         it <- Streams.read is
         case it of
             Just msg -> do
                 putStrLn $ "<- " ++ show clientId ++ ":" ++ show msg
-                STM.atomically $ STM.writeTQueue modelQ $ (senderId, Just (msg))
+                STM.atomically $ STM.writeTQueue outQ $ (senderId, Just (msg))
                 reader senderId writerQ
             Nothing -> STM.atomically $ STM.writeTQueue writerQ Nothing
 
@@ -155,31 +227,27 @@ runTicker ticks = void $ forever $ do
 
 --- Model bits
 
-data MessageSend clientId reply dest peerReq = Reply clientId reply
-    | PeerMessage dest peerReq
-
-type STMRespChanMap xid resp = STM.TVar (Map.Map xid (ResponsesOutQ resp))
-
 runModel :: RequestsInQ ClientID Lib.ClientRequest
             -> RequestsInQ PeerID Lib.PeerRequest
             -> STMRespChanMap ClientID Lib.ClientResponse
             -> RequestsInQ () Tick
+            -> STMRespChanMap PeerName Lib.PeerRequest
             -> IO ()
-runModel modelQ _peerReqsQ clients ticks = do
+runModel modelQ _peerReqsQ clients ticks peerOuts = do
     stateRef <- STM.atomically $ STM.newTVar $ ProtocolState 0 []
 
     let processClientMessage = processMessageSTM stateRef modelQ processMessage
     let processTickMessage = processMessageSTM stateRef ticks processTick
-    let processPeerMessage = STM.retry
+    let processPeerRequest = STM.retry
 
     forever $ STM.atomically $ do
-        outputs <- processClientMessage <|> processPeerMessage <|> processTickMessage
-        sendMessages clients (error "peers") outputs
+        outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage
+        sendMessages clients peerOuts outputs
 
 processMessageSTM :: STM.TVar ProtocolState
                   -> RequestsInQ xid req
-                  -> (xid -> req -> RWS.RWS () [MessageSend a b c d] ProtocolState ())
-                  -> STM.STM [MessageSend a b c d]
+                  -> (xid -> req -> RWS.RWS () [ProcessorMessage] ProtocolState ())
+                  -> STM.STM [ProcessorMessage]
 processMessageSTM stateRef reqQ process = do
     (sender, m) <- STM.readTQueue reqQ
     case m of
@@ -191,14 +259,14 @@ processMessageSTM stateRef reqQ process = do
         Nothing -> return []
 
 sendMessages :: STMRespChanMap ClientID Lib.ClientResponse
-             -> STMRespChanMap PeerID Lib.PeerRequest
+             -> STMRespChanMap PeerName Lib.PeerRequest
              -> [ProcessorMessage]
              -> STM.STM ()
 sendMessages clients peers toSend = do
             forM_ toSend $ \msg' -> do
                 case msg' of
                     Reply clientId reply -> sendTo clients clientId reply
-                    PeerMessage peerId req -> sendTo peers peerId req
+                    PeerRequest peerName req -> sendTo peers peerName req
     where
         sendTo mapping xid msg = do
             queuep <- Map.lookup xid <$> STM.readTVar mapping
@@ -207,8 +275,6 @@ sendMessages clients peers toSend = do
                 Nothing -> error "what?"
 
 
-
-type ProcessorMessage = MessageSend ClientID Lib.ClientResponse PeerID Lib.PeerRequest
 
 processMessage :: ClientID -> Lib.ClientRequest -> RWS.RWS () [ProcessorMessage] ProtocolState ()
 processMessage sender Lib.Bing = do
