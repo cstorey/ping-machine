@@ -197,17 +197,15 @@ sendMessages :: STMRespChanMap ClientID Lib.ClientResponse
 sendMessages clients peers toSend = do
             forM_ toSend $ \msg' -> do
                 case msg' of
-                    Reply clientId reply -> do
-                        clientp <- Map.lookup clientId <$> STM.readTVar clients
-                        case clientp of
-                            Just q -> STM.writeTQueue q $ Just reply
-                            Nothing -> error "what?"
+                    Reply clientId reply -> sendTo clients clientId reply
+                    PeerMessage peerId req -> sendTo peers peerId req
+    where
+        sendTo mapping xid msg = do
+            queuep <- Map.lookup xid <$> STM.readTVar mapping
+            case queuep of
+                Just q -> STM.writeTQueue q $ Just msg
+                Nothing -> error "what?"
 
-                    PeerMessage peerId req -> do
-                        clientp <- Map.lookup peerId <$> STM.readTVar peers
-                        case clientp of
-                            Just q -> STM.writeTQueue q $ Just req
-                            Nothing -> error "what?"
 
 
 type ProcessorMessage = MessageSend ClientID Lib.ClientResponse PeerID Lib.PeerRequest
