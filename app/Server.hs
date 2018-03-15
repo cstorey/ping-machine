@@ -20,8 +20,8 @@ import qualified Control.Concurrent as C
 import Control.Monad
 import qualified Control.Exception as E
 
-type ResponsesQ resp =  STM.TQueue (Maybe resp)
-type RequestsQ sender req =  STM.TQueue (sender, Maybe req)
+type ResponsesOutQ resp =  STM.TQueue (Maybe resp)
+type RequestsInQ sender req =  STM.TQueue (sender, Maybe req)
 
 
 newtype ClientID = ClientID Int
@@ -46,8 +46,8 @@ main = S.withSocketsDo $ do
     clientReqQ <- STM.atomically STM.newTQueue:: IO (STM.TQueue (ClientID,Maybe Lib.ClientRequest))
     peerReqQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerID,Maybe Lib.PeerRequest))
     ticks <- STM.atomically STM.newTQueue :: IO (STM.TQueue ((),Maybe Tick))
-    clients <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map ClientID (ResponsesQ Lib.ClientResponse)))
-    peers <- STM.atomically $ STM.newTVar $ Map.empty  :: IO (STM.TVar (Map.Map PeerID (ResponsesQ Lib.PeerResponse)))
+    clients <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map ClientID (ResponsesOutQ Lib.ClientResponse)))
+    peers <- STM.atomically $ STM.newTVar $ Map.empty  :: IO (STM.TVar (Map.Map PeerID (ResponsesOutQ Lib.PeerResponse)))
     -- We also need to start a peer manager. This will start a single process
     -- for each known peer, attempt to connect, then relay messages to/from
     -- peers.
@@ -66,8 +66,8 @@ nextId ids = STM.atomically $ do
 runListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid, Ord xid)
             => IO xid
             -> S.AddrInfo
-            -> STM.TVar (Map.Map xid (ResponsesQ resp))
-            -> RequestsQ xid req
+            -> STM.TVar (Map.Map xid (ResponsesOutQ resp))
+            -> RequestsInQ xid req
             -> IO ()
 runListener newId addr clients reqs =
     E.bracket (listenFor addr) S.close (runAcceptor newId $ handleConn clients reqs)
@@ -111,8 +111,8 @@ runAcceptor newId handler listener = go
                 E.bracket (streamsOf client) (const $ S.close client) (handler n)
 
 handleConn :: (Show req, Show resp, Show xid, Ord xid)
-            => STM.TVar (Map.Map xid (ResponsesQ resp))
-            -> RequestsQ xid req
+            => STM.TVar (Map.Map xid (ResponsesOutQ resp))
+            -> RequestsInQ xid req
             -> xid
             -> (Streams.InputStream req, Streams.OutputStream resp)
             -> IO ()
@@ -158,12 +158,12 @@ runTicker ticks = void $ forever $ do
 data MessageSend clientId reply dest peerReq = Reply clientId reply
     | PeerMessage dest peerReq
 
-type STMRespChanMap xid resp = STM.TVar (Map.Map xid (ResponsesQ resp))
+type STMRespChanMap xid resp = STM.TVar (Map.Map xid (ResponsesOutQ resp))
 
-runModel :: RequestsQ ClientID Lib.ClientRequest
-            -> RequestsQ PeerID Lib.PeerRequest
+runModel :: RequestsInQ ClientID Lib.ClientRequest
+            -> RequestsInQ PeerID Lib.PeerRequest
             -> STMRespChanMap ClientID Lib.ClientResponse
-            -> RequestsQ () Tick
+            -> RequestsInQ () Tick
             -> IO ()
 runModel modelQ _peerReqsQ clients ticks = do
     stateRef <- STM.atomically $ STM.newTVar $ ProtocolState 0 []
@@ -177,7 +177,7 @@ runModel modelQ _peerReqsQ clients ticks = do
         sendMessages clients (error "peers") outputs
 
 processMessageSTM :: STM.TVar ProtocolState
-                  -> RequestsQ xid req
+                  -> RequestsInQ xid req
                   -> (xid -> req -> RWS.RWS () [MessageSend a b c d] ProtocolState ())
                   -> STM.STM [MessageSend a b c d]
 processMessageSTM stateRef reqQ process = do
