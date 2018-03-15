@@ -14,6 +14,7 @@ import qualified Data.Map as Map
 import Data.List ((\\))
 import Control.Applicative ((<|>))
 import qualified Data.Time.Clock.POSIX as Clock
+import Data.Maybe (listToMaybe)
 
 
 -- import qualified Data.ByteString as B
@@ -213,13 +214,8 @@ processClientRequests outQ clientId inQ (is, os) = do
     writer sender =  do
         msg <- STM.atomically $ STM.readTQueue sender
         putStrLn $ "-> " ++ show clientId ++ ":" ++ show msg
-        case msg of
-            Just m -> do
-                Streams.write (Just m) os
-                writer sender
-            Nothing -> do
-                Streams.write Nothing os
-                return ()
+        Streams.write msg os
+        maybe (return ()) (const $ writer sender) msg
 
 
 runTicker :: STM.TQueue ((), Maybe Tick) -> IO ()
@@ -292,14 +288,17 @@ processClientRequestMessage :: ClientID -> Lib.ClientRequest -> RWS.RWS [PeerNam
 processClientRequestMessage sender Lib.Bing = do
     s <- bings <$>  RWS.get
     peers <- RWS.ask
-    let aPeerName = peers !! (s `mod` length peers)
 
-    RWS.tell [PeerRequest aPeerName $ Lib.IHave s]
+    case listToMaybe $ drop (if length peers > 0 then (s `mod` length peers) else 0) peers of
+        Just aPeerName -> do
+            RWS.tell [PeerRequest aPeerName $ Lib.IHave s]
+            RWS.modify $ \st -> st {
+                bings = 1 + bings st,
+                pending = Map.insert s (Reply sender $ Lib.Bong s) $ pending st
+            }
+        Nothing -> do
+            RWS.tell [Reply sender $ Lib.Bong s]
 
-    RWS.modify $ \st -> st {
-        bings = 1 + bings st,
-        pending = Map.insert s (Reply sender $ Lib.Bong s) $ pending st
-    }
 
 processClientRequestMessage sender Lib.Ping = do
     s <- bings <$> RWS.get
