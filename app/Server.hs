@@ -14,7 +14,7 @@ import qualified Data.Map as Map
 import Data.List ((\\))
 import Control.Applicative ((<|>))
 import qualified Data.Time.Clock.POSIX as Clock
-import Data.Maybe (listToMaybe)
+-- import Data.Maybe (listToMaybe)
 
 
 -- import qualified Data.ByteString as B
@@ -49,7 +49,12 @@ type STMRespChanMap xid resp = STM.TVar (Map.Map xid (ResponsesOutQ resp))
 
 data Tick = Tick Clock.POSIXTime
 
+data RaftState =
+    Follower
+    deriving (Show)
+
 data ProtocolState = ProtocolState {
+    state :: RaftState,
     bings :: Int,
     pending :: Map.Map Int ProcessorMessage
 } deriving (Show)
@@ -236,7 +241,7 @@ runModel :: RequestsInQ ClientID Lib.ClientRequest
             -> STMRespChanMap PeerID Lib.PeerResponse
             -> IO ()
 runModel modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePeers = do
-    stateRef <- STM.atomically $ STM.newTVar $ ProtocolState 0 Map.empty
+    stateRef <- STM.atomically $ STM.newTVar $ ProtocolState Follower 0 Map.empty
 
     let peerNames = Map.keys <$> STM.readTVar peerOuts
     let processClientMessage = processMessageSTM stateRef peerNames modelQ processClientRequestMessage
@@ -285,7 +290,9 @@ sendMessages clients peers responsePeers toSend = do
 
 
 processClientRequestMessage :: ClientID -> Lib.ClientRequest -> RWS.RWS [PeerName] [ProcessorMessage] ProtocolState ()
-processClientRequestMessage sender Lib.Bing = do
+processClientRequestMessage _sender Lib.Bing = do
+    return ()
+    {-
     s <- bings <$>  RWS.get
     peers <- RWS.ask
 
@@ -298,28 +305,36 @@ processClientRequestMessage sender Lib.Bing = do
             }
         Nothing -> do
             RWS.tell [Reply sender $ Lib.Bong s]
+    -}
 
 
-processClientRequestMessage sender Lib.Ping = do
+processClientRequestMessage _sender Lib.Ping = do
+    return ()
+    {-
     s <- bings <$> RWS.get
     RWS.tell [Reply sender $ Lib.Bong s]
     RWS.modify $ \st -> st { bings = 1 - bings st }
+    -}
 
 
 processPeerRequestMessage :: PeerID -> Lib.PeerRequest -> RWS.RWS [PeerName] [ProcessorMessage] ProtocolState ()
-processPeerRequestMessage sender (Lib.IHave n) = do
+processPeerRequestMessage _sender (Lib.IHave _) = do
+    return ()
+    {-
     RWS.tell [PeerReply sender $ Lib.ThatsNiceDear n]
+    -}
 
 processPeerResponseMessage :: PeerName -> Lib.PeerResponse -> RWS.RWS [PeerName] [ProcessorMessage] ProtocolState ()
-processPeerResponseMessage _sender (Lib.ThatsNiceDear n) = do
-    -- error $"processPeerResponseMessage" ++ show (_sender, resp)
-
+processPeerResponseMessage _sender (Lib.ThatsNiceDear _) = do
+    return ()
+    {-
     toSend <- Map.lookup n . pending <$> RWS.get
     RWS.modify $ \st -> st {
         pending = Map.delete n $ pending st
     }
 
     RWS.tell $ maybe [] return toSend
+    -}
 
 
 processTick :: () -> Tick -> RWS.RWS [PeerName] [ProcessorMessage] ProtocolState ()
