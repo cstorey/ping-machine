@@ -125,7 +125,7 @@ runOutgoing seedPeers peers peerRespQ = do
 connect :: S.AddrInfo -> IO S.Socket
 connect addr = do
     sock <- S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)
-    S.connect sock $ S.addrAddress addr
+    (S.connect sock $ S.addrAddress addr) `E.onException` S.close sock
     return sock
 
 runPeer :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp) => RequestsInQ PeerName req -> PeerName -> ResponsesOutQ resp -> IO ()
