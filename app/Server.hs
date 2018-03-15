@@ -49,10 +49,16 @@ type STMRespChanMap xid resp = STM.TVar (Map.Map xid (ResponsesOutQ resp))
 
 data Tick = Tick Clock.POSIXTime
 
+data ProtocolEnv = ProtocolEnv {
+    peerNames :: [PeerName]
+}
+
 data ProtocolState = ProtocolState {
     bings :: Int,
     pending :: Map.Map Int ProcessorMessage
 } deriving (Show)
+
+type ProtoStateMachine = RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState ()
 
 main ::  IO ()
 main = S.withSocketsDo $ do
@@ -89,13 +95,13 @@ runOutgoing :: [PeerName]
             -> STMRespChanMap PeerName Lib.PeerRequest
             -> RequestsInQ PeerName Lib.PeerResponse
             -> IO ()
-runOutgoing peerNames peers peerRespQ = do
-    putStrLn $ "peers:" ++ show peerNames
+runOutgoing seedPeers peers peerRespQ = do
+    putStrLn $ "peers:" ++ show seedPeers
     processes <- STM.atomically $ STM.newTVar $ Map.empty
 
     void $ forever $ do
         runningProcesses <- Map.elems <$> STM.readTVarIO processes
-        forM_ (peerNames \\ runningProcesses) $ \name -> do
+        forM_ (seedPeers \\ runningProcesses) $ \name -> do
             q <- STM.newTQueueIO
             a <- Async.async $ runPeer peerRespQ name q
             STM.atomically $ do
@@ -238,28 +244,28 @@ runModel :: RequestsInQ ClientID Lib.ClientRequest
 runModel modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePeers = do
     stateRef <- STM.atomically $ STM.newTVar $ ProtocolState 0 Map.empty
 
-    let peerNames = Map.keys <$> STM.readTVar peerOuts
-    let processClientMessage = processMessageSTM stateRef peerNames modelQ processClientRequestMessage
-    let processTickMessage = processMessageSTM stateRef peerNames ticks processTick
-    let processPeerRequest = processMessageSTM stateRef peerNames peerReqInQ processPeerRequestMessage
-    let processPeerResponse = processMessageSTM stateRef peerNames peerRespInQ processPeerResponseMessage
+    let protocolEnv = ProtocolEnv <$> (Map.keys <$> STM.readTVar peerOuts)
+    let processClientMessage = processMessageSTM stateRef protocolEnv modelQ processClientRequestMessage
+    let processTickMessage = processMessageSTM stateRef protocolEnv ticks processTick
+    let processPeerRequest = processMessageSTM stateRef protocolEnv peerReqInQ processPeerRequestMessage
+    let processPeerResponse = processMessageSTM stateRef protocolEnv peerRespInQ processPeerResponseMessage
 
     forever $ STM.atomically $ do
         outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
         sendMessages clients peerOuts responsePeers outputs
 
 processMessageSTM :: STM.TVar ProtocolState
-                  -> STM.STM [PeerName]
+                  -> STM.STM ProtocolEnv
                   -> RequestsInQ xid req
-                  -> (xid -> req -> RWS.RWS [PeerName] [ProcessorMessage] ProtocolState ())
+                  -> (xid -> req -> ProtoStateMachine)
                   -> STM.STM [ProcessorMessage]
-processMessageSTM stateRef peersSTM reqQ process = do
+processMessageSTM stateRef envSTM reqQ process = do
     (sender, m) <- STM.readTQueue reqQ
     case m of
         Just msg -> do
             s <- STM.readTVar stateRef
-            peerNames <- peersSTM
-            let ((), s', toSend) = RWS.runRWS (process sender msg) peerNames s
+            env <- envSTM
+            let ((), s', toSend) = RWS.runRWS (process sender msg) env s
             STM.writeTVar stateRef s'
             return toSend
         Nothing -> return []
@@ -284,10 +290,10 @@ sendMessages clients peers responsePeers toSend = do
 
 
 
-processClientRequestMessage :: ClientID -> Lib.ClientRequest -> RWS.RWS [PeerName] [ProcessorMessage] ProtocolState ()
+processClientRequestMessage :: ClientID -> Lib.ClientRequest -> ProtoStateMachine
 processClientRequestMessage sender Lib.Bing = do
     s <- bings <$>  RWS.get
-    peers <- RWS.ask
+    peers <- RWS.asks peerNames
 
     case listToMaybe $ drop (if length peers > 0 then (s `mod` length peers) else 0) peers of
         Just aPeerName -> do
@@ -306,11 +312,11 @@ processClientRequestMessage sender Lib.Ping = do
     RWS.modify $ \st -> st { bings = 1 - bings st }
 
 
-processPeerRequestMessage :: PeerID -> Lib.PeerRequest -> RWS.RWS [PeerName] [ProcessorMessage] ProtocolState ()
+processPeerRequestMessage :: PeerID -> Lib.PeerRequest -> ProtoStateMachine
 processPeerRequestMessage sender (Lib.IHave n) = do
     RWS.tell [PeerReply sender $ Lib.ThatsNiceDear n]
 
-processPeerResponseMessage :: PeerName -> Lib.PeerResponse -> RWS.RWS [PeerName] [ProcessorMessage] ProtocolState ()
+processPeerResponseMessage :: PeerName -> Lib.PeerResponse -> ProtoStateMachine
 processPeerResponseMessage _sender (Lib.ThatsNiceDear n) = do
     -- error $"processPeerResponseMessage" ++ show (_sender, resp)
 
@@ -321,8 +327,7 @@ processPeerResponseMessage _sender (Lib.ThatsNiceDear n) = do
 
     RWS.tell $ maybe [] return toSend
 
-
-processTick :: () -> Tick -> RWS.RWS [PeerName] [ProcessorMessage] ProtocolState ()
+processTick :: () -> Tick -> ProtoStateMachine
 processTick () (Tick _t) = do
     -- toSend <- pending <$> RWS.get
     -- RWS.modify $ \st -> st { pending = [] }
