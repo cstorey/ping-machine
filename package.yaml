@@ -31,6 +31,7 @@ dependencies:
 - transformers
 - stm
 - async
+- time
 
 library:
   source-dirs: src

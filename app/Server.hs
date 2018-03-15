@@ -13,6 +13,7 @@ import qualified Control.Concurrent.Async as Async
 import qualified Data.Map as Map
 import Data.List ((\\))
 import Control.Applicative ((<|>))
+import qualified Data.Time.Clock.POSIX as Clock
 
 
 -- import qualified Data.ByteString as B
@@ -45,7 +46,7 @@ data ProcessorMessage = Reply ClientID Lib.ClientResponse
 
 type STMRespChanMap xid resp = STM.TVar (Map.Map xid (ResponsesOutQ resp))
 
-data Tick = Tick
+data Tick = Tick Clock.POSIXTime
 
 data ProtocolState = ProtocolState {
     bings :: Int,
@@ -223,8 +224,9 @@ processClientRequests outQ clientId inQ (is, os) = do
 
 runTicker :: STM.TQueue ((), Maybe Tick) -> IO ()
 runTicker ticks = void $ forever $ do
-    STM.atomically $ STM.writeTQueue ticks ((), Just Tick)
-    putStrLn "Tick"
+    t <- Clock.getPOSIXTime
+    STM.atomically $ STM.writeTQueue ticks ((), Just $ Tick t)
+    putStrLn $ "Tick: " ++ show t
     C.threadDelay 1000000
 
 --- Model bits
@@ -322,7 +324,7 @@ processPeerResponseMessage _sender (Lib.ThatsNiceDear n) = do
 
 
 processTick :: () -> Tick -> RWS.RWS [PeerName] [ProcessorMessage] ProtocolState ()
-processTick () Tick = do
+processTick () (Tick _t) = do
     -- toSend <- pending <$> RWS.get
     -- RWS.modify $ \st -> st { pending = [] }
     -- RWS.tell toSend
