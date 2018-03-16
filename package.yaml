@@ -32,6 +32,7 @@ dependencies:
 - stm
 - async
 - time
+- random
 
 library:
   source-dirs: src

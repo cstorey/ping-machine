@@ -11,11 +11,12 @@ import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Concurrent.STM as STM
 import qualified Control.Concurrent.Async as Async
 import qualified Data.Map as Map
+import qualified Debug.Trace as Trace
 import Data.List ((\\))
 import Control.Applicative ((<|>))
 import qualified Data.Time.Clock.POSIX as Clock
-import Data.Maybe (listToMaybe)
-
+import Data.Maybe (isNothing)
+import System.Random as Random
 
 -- import qualified Data.ByteString as B
 
@@ -35,43 +36,74 @@ newtype ClientID = ClientID Int
 newtype PeerID = PeerID Int
     deriving (Show, Eq, Ord)
 
-
--- Identifier for an outgoing request
-newtype PeerName = PeerName { unPeerName :: String }
-    deriving (Show, Eq, Ord)
-
 data ProcessorMessage = Reply ClientID Lib.ClientResponse
-    | PeerRequest PeerName Lib.PeerRequest
+    | PeerRequest Lib.PeerName Lib.PeerRequest
     | PeerReply PeerID Lib.PeerResponse
     deriving (Show)
 
 type STMRespChanMap xid resp = STM.TVar (Map.Map xid (ResponsesOutQ resp))
 
-data Tick = Tick Clock.POSIXTime
+type Time = Double
+data Tick = Tick Time
 
 data ProtocolEnv = ProtocolEnv {
-    peerNames :: [PeerName]
-}
+    selfId :: Lib.PeerName,
+    peerNames :: [Lib.PeerName]
+} deriving (Show)
+
+data FollowerState = FollowerState {
+    lastLeaderHeartbeat :: Time
+} deriving (Show)
+data CandidateState = CandidateState {
+    requestVoteSentAt :: Time
+,   votesForMe :: [Lib.PeerName]
+} deriving (Show)
+data LeaderState = LeaderState {
+} deriving (Show)
+
+data RaftState =
+    Follower FollowerState
+  | Candidate CandidateState
+  | Leader LeaderState
+    deriving (Show)
 
 data ProtocolState = ProtocolState {
-    bings :: Int,
-    pending :: Map.Map Int ProcessorMessage
+    role :: RaftState
+,   currentTerm :: Int
+,   logEntries :: Map.Map Lib.LogIdx Lib.LogEntry
+,   votedFor :: Maybe Lib.PeerName
+,   prevTickTime :: Time
 } deriving (Show)
 
 type ProtoStateMachine = RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState ()
 
+
+
+oneSecond :: Time
+oneSecond = 1
+
+oneSecondNS :: Int
+oneSecondNS = 1000000000
+
+timeout :: Time
+timeout = oneSecond * 3
+
+now :: IO Time
+now = fromRational . toRational <$> Clock.getPOSIXTime
+
 main ::  IO ()
 main = S.withSocketsDo $ do
     clientPort : peerPort : peerPorts <- Env.getArgs
+    let myName = Lib.PeerName peerPort
     clientAddr <- resolve clientPort
     peerListenAddr <- resolve peerPort
     ids <- STM.atomically $ STM.newTVar 0
     clientReqQ <- STM.atomically STM.newTQueue:: IO (STM.TQueue (ClientID,Maybe Lib.ClientRequest))
     peerReqInQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerID,Maybe Lib.PeerRequest))
-    peerRespQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerName,Maybe Lib.PeerResponse))
+    peerRespQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (Lib.PeerName,Maybe Lib.PeerResponse))
     ticks <- STM.atomically STM.newTQueue :: IO (STM.TQueue ((),Maybe Tick))
     clients <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map ClientID (ResponsesOutQ Lib.ClientResponse)))
-    requestToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map PeerName (ResponsesOutQ Lib.PeerRequest)))
+    requestToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map Lib.PeerName (ResponsesOutQ Lib.PeerRequest)))
     responsesToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map PeerID (ResponsesOutQ Lib.PeerResponse)))
     -- We also need to start a peer manager. This will start a single process
     -- for each known peer, attempt to connect, then relay messages to/from
@@ -79,9 +111,9 @@ main = S.withSocketsDo $ do
     let race = Async.race_
     (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ) `race`
         (runListener (PeerID <$> nextId ids) peerListenAddr responsesToPeers peerReqInQ) `race`
-        (runOutgoing (PeerName <$> peerPorts) requestToPeers peerRespQ) `race`
+        (runOutgoing (Lib.PeerName <$> peerPorts) requestToPeers peerRespQ) `race`
         (runTicker ticks) `race`
-        (runModel clientReqQ peerReqInQ peerRespQ clients ticks requestToPeers responsesToPeers)
+        (runModel myName clientReqQ peerReqInQ peerRespQ clients ticks requestToPeers responsesToPeers)
 
 nextId :: STM.TVar Int -> IO Int
 nextId ids = STM.atomically $ do
@@ -91,9 +123,9 @@ nextId ids = STM.atomically $ do
 
 
 -- Supervisor
-runOutgoing :: [PeerName]
-            -> STMRespChanMap PeerName Lib.PeerRequest
-            -> RequestsInQ PeerName Lib.PeerResponse
+runOutgoing :: [Lib.PeerName]
+            -> STMRespChanMap Lib.PeerName Lib.PeerRequest
+            -> RequestsInQ Lib.PeerName Lib.PeerResponse
             -> IO ()
 runOutgoing seedPeers peers peerRespQ = do
     putStrLn $ "peers:" ++ show seedPeers
@@ -120,7 +152,7 @@ runOutgoing seedPeers peers peerRespQ = do
             return (namep, retOrError)
 
         putStrLn $ "runOutgoing : " ++ show (peerNamep, ret)
-        C.threadDelay 1000000
+        C.threadDelay $ oneSecondNS
 
 connect :: S.AddrInfo -> IO S.Socket
 connect addr = do
@@ -128,13 +160,12 @@ connect addr = do
     (S.connect sock $ S.addrAddress addr) `E.onException` S.close sock
     return sock
 
-runPeer :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp) => RequestsInQ PeerName req -> PeerName -> ResponsesOutQ resp -> IO ()
+runPeer :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp) => RequestsInQ Lib.PeerName req -> Lib.PeerName -> ResponsesOutQ resp -> IO ()
 runPeer fromPeerQ name toPeerQ = do
-    addrInfo <- resolve $ unPeerName name
+    addrInfo <- resolve $ Lib.unPeerName name
     (is, os) <- streamsOf =<< connect addrInfo
 
     processClientRequests fromPeerQ name toPeerQ (is, os)
-    error $ "runPeer: " ++ show name
 
 runListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid, Ord xid)
             => IO xid
@@ -226,33 +257,50 @@ processClientRequests outQ clientId inQ (is, os) = do
 
 runTicker :: STM.TQueue ((), Maybe Tick) -> IO ()
 runTicker ticks = void $ forever $ do
-    t <- Clock.getPOSIXTime
+    t <- now
     STM.atomically $ STM.writeTQueue ticks ((), Just $ Tick t)
     putStrLn $ "Tick: " ++ show t
-    C.threadDelay 1000000
+    sleepTime <- Random.getStdRandom $ Random.randomR (oneSec `div` 2, oneSec * 3 `div` 2 )
+    C.threadDelay sleepTime
+    where
+    oneSec = 1000000
 
 --- Model bits
 
-runModel :: RequestsInQ ClientID Lib.ClientRequest
+
+newFollower :: RaftState
+newFollower = Follower $ FollowerState 0
+
+runModel :: Lib.PeerName
+            -> RequestsInQ ClientID Lib.ClientRequest
             -> RequestsInQ PeerID Lib.PeerRequest
-            -> RequestsInQ PeerName Lib.PeerResponse
+            -> RequestsInQ Lib.PeerName Lib.PeerResponse
             -> STMRespChanMap ClientID Lib.ClientResponse
             -> RequestsInQ () Tick
-            -> STMRespChanMap PeerName Lib.PeerRequest
+            -> STMRespChanMap Lib.PeerName Lib.PeerRequest
             -> STMRespChanMap PeerID Lib.PeerResponse
             -> IO ()
-runModel modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePeers = do
-    stateRef <- STM.atomically $ STM.newTVar $ ProtocolState 0 Map.empty
+runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePeers = do
+    stateRef <- STM.atomically $ STM.newTVar $ ProtocolState newFollower 0 Map.empty Nothing 0
 
-    let protocolEnv = ProtocolEnv <$> (Map.keys <$> STM.readTVar peerOuts)
+    let protocolEnv = ProtocolEnv myName <$> (Map.keys <$> STM.readTVar peerOuts)
     let processClientMessage = processMessageSTM stateRef protocolEnv modelQ processClientRequestMessage
     let processTickMessage = processMessageSTM stateRef protocolEnv ticks processTick
     let processPeerRequest = processMessageSTM stateRef protocolEnv peerReqInQ processPeerRequestMessage
     let processPeerResponse = processMessageSTM stateRef protocolEnv peerRespInQ processPeerResponseMessage
 
-    forever $ STM.atomically $ do
-        outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
-        sendMessages clients peerOuts responsePeers outputs
+
+    forever $ do
+        do
+            env <- STM.atomically protocolEnv
+            putStrLn $ "Env: " ++ show env
+        (st', outputs) <- STM.atomically $ do
+            outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
+            sendMessages clients peerOuts responsePeers outputs
+            st' <- STM.readTVar stateRef
+            return (st', outputs)
+        putStrLn $ "state now: " ++ show st'
+        putStrLn $ "sent: " ++ show outputs
 
 processMessageSTM :: STM.TVar ProtocolState
                   -> STM.STM ProtocolEnv
@@ -271,7 +319,7 @@ processMessageSTM stateRef envSTM reqQ process = do
         Nothing -> return []
 
 sendMessages :: STMRespChanMap ClientID Lib.ClientResponse
-             -> STMRespChanMap PeerName Lib.PeerRequest
+             -> STMRespChanMap Lib.PeerName Lib.PeerRequest
              -> STMRespChanMap PeerID Lib.PeerResponse
              -> [ProcessorMessage]
              -> STM.STM ()
@@ -291,45 +339,225 @@ sendMessages clients peers responsePeers toSend = do
 
 
 processClientRequestMessage :: ClientID -> Lib.ClientRequest -> ProtoStateMachine
-processClientRequestMessage sender Lib.Bing = do
+processClientRequestMessage _sender Lib.Bing = do
+    return ()
+    {-
     s <- bings <$>  RWS.get
     peers <- RWS.asks peerNames
 
     case listToMaybe $ drop (if length peers > 0 then (s `mod` length peers) else 0) peers of
-        Just aPeerName -> do
-            RWS.tell [PeerRequest aPeerName $ Lib.IHave s]
+        Just aLib.PeerName -> do
+            RWS.tell [PeerRequest aLib.PeerName $ Lib.IHave s]
             RWS.modify $ \st -> st {
                 bings = 1 + bings st,
                 pending = Map.insert s (Reply sender $ Lib.Bong s) $ pending st
             }
         Nothing -> do
             RWS.tell [Reply sender $ Lib.Bong s]
+    -}
 
 
-processClientRequestMessage sender Lib.Ping = do
+processClientRequestMessage _sender Lib.Ping = do
+    return ()
+    {-
     s <- bings <$> RWS.get
     RWS.tell [Reply sender $ Lib.Bong s]
     RWS.modify $ \st -> st { bings = 1 - bings st }
+    -}
 
-
-processPeerRequestMessage :: PeerID -> Lib.PeerRequest -> ProtoStateMachine
-processPeerRequestMessage sender (Lib.IHave n) = do
-    RWS.tell [PeerReply sender $ Lib.ThatsNiceDear n]
-
-processPeerResponseMessage :: PeerName -> Lib.PeerResponse -> ProtoStateMachine
-processPeerResponseMessage _sender (Lib.ThatsNiceDear n) = do
-    -- error $"processPeerResponseMessage" ++ show (_sender, resp)
-
-    toSend <- Map.lookup n . pending <$> RWS.get
+laterTermObserved :: Lib.Term -> ProtoStateMachine
+laterTermObserved laterTerm = do
+    thisTerm <- currentTerm <$> RWS.get
+    Trace.trace ("Later term observed: " ++ show laterTerm ++ " > " ++ show thisTerm) $ return ()
+    prevTick <- prevTickTime <$> RWS.get
+    RWS.modify $ \st -> st { currentTerm = laterTerm, votedFor = Nothing }
+    Trace.trace "stepDownIfCandidateOrLeader " $ return ()
     RWS.modify $ \st -> st {
-        pending = Map.delete n $ pending st
+        role = Follower $ FollowerState {
+            lastLeaderHeartbeat = prevTick
+        }
     }
 
-    RWS.tell $ maybe [] return toSend
+getPrevLogTermIdx :: RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState (Lib.Term, Lib.LogIdx)
+getPrevLogTermIdx = do
+    myLog <- logEntries <$> RWS.get
+    return $ maybe (0, 0) (\(idx, it) -> (idx, Lib.logTerm it)) $ Map.lookupMax myLog
+
+processPeerRequestMessage :: PeerID -> Lib.PeerRequest -> ProtoStateMachine
+processPeerRequestMessage sender (Lib.RequestVote candidateTerm candidateName candidateIdx) = do
+    thisTerm <- currentTerm <$> RWS.get
+    vote <- votedFor <$> RWS.get
+    (_prevTerm, logIdx) <- getPrevLogTermIdx
+    case () of
+        _ | candidateTerm < thisTerm -> do
+            Trace.trace (show candidateTerm ++ " < " ++ show thisTerm) $ return ()
+            refuseVote thisTerm
+        _ | candidateTerm > thisTerm -> do
+            laterTermObserved candidateTerm
+            Trace.trace ("Granting vote") $ grantVote thisTerm
+            -- Reply No?
+        _ | isNothing vote && candidateIdx >= logIdx -> do
+            Trace.trace ("Granting vote") $ return ()
+            grantVote thisTerm
+            -- Already
+        _ -> do
+            Trace.trace ("Already voted for " ++ show vote) $ return ()
+            refuseVote thisTerm
+
+    return ()
+    {-
+    RWS.tell [PeerReply sender $ Lib.ThatsNiceDear n]
+    -}
+
+    where
+        refuseVote thisTerm = RWS.tell [PeerReply sender $ Lib.VoteResult thisTerm False]
+        grantVote thisTerm = do
+            RWS.modify $ \st -> st { votedFor = Just candidateName }
+            RWS.tell [PeerReply sender $ Lib.VoteResult thisTerm True]
+
+processPeerRequestMessage sender
+    _msg@(Lib.AppendEntries (Lib.AppendEntriesReq leaderTerm _leaderName prevTerm prevIdx newEntries)) = do
+    -- prevTick <- prevTickTime <$> RWS.get
+    Trace.trace ("Append Entries: " ++ show _msg) $ return ()
+
+    thisTerm <- currentTerm <$> RWS.get
+    -- myLog <- logEntries <$> RWS.get
+    -- let logIdx = maybe (0, 0) fst $ Map.lookupMax myLog
+    if leaderTerm < thisTerm
+    then do
+        return ()
+        Trace.trace (show leaderTerm ++ " < " ++ show thisTerm) $ return ()
+        Trace.trace ("Refuse appendentries") $ return ()
+        refuseAppendEntries thisTerm
+    else
+        if leaderTerm > thisTerm
+        then laterTermObserved leaderTerm
+        else
+        do
+            state <- role <$> RWS.get
+            case state of
+                Follower follower -> do
+                    whenFollower thisTerm follower
+                Candidate _st -> do
+                    error ("appendEntries recieved when leader? " ++ show _msg)
+                Leader _st -> do
+                    error ("appendEntries recieved when leader? " ++ show _msg)
+
+    where
+        refuseAppendEntries thisTerm = RWS.tell [PeerReply sender $ Lib.VoteResult thisTerm False]
+        ackAppendEntries thisTerm = RWS.tell [PeerReply sender $ Lib.VoteResult thisTerm True]
+        whenFollower thisTerm follower = do
+            entries <- logEntries <$> RWS.get
+            let prevItem = Map.lookup prevIdx entries
+            if maybe False ((== prevTerm) . Lib.logTerm) prevItem
+            then do
+                Trace.trace ("Refusing as prev item was: " ++ show prevItem) $ refuseAppendEntries thisTerm
+            else do
+                prevTick <- prevTickTime <$> RWS.get
+                let idx = succ prevIdx
+                let (entries', _)  = Map.split idx entries
+                let entries'' = Map.union entries' $ Map.fromList $ zip [idx..] newEntries
+                let follower' = follower {
+                    lastLeaderHeartbeat = prevTick
+                }
+                RWS.modify $ \st -> st {
+                    logEntries = entries'',
+                    role = Follower follower'
+                }
+                ackAppendEntries thisTerm
+                Trace.trace "Someething something apply committed entries" $ return ()
+
+resetElectionTimeout :: ProtoStateMachine
+resetElectionTimeout = Trace.trace ("Reset election timeout?") $ return ()
+
+processPeerResponseMessage :: Lib.PeerName -> Lib.PeerResponse -> ProtoStateMachine
+processPeerResponseMessage _sender _msg@(Lib.VoteResult _term granted) = do
+    Trace.trace ("processPeerResponseMessage: " ++ show _msg) $ return ()
+    state <- role <$> RWS.get
+    case state of
+        Follower _ -> do
+            Trace.trace ("vote recieved when follower? " ++ show _msg) $ return ()
+        Candidate st -> do
+            whenCandidate st
+        Leader _st -> do
+            Trace.trace ("vote recieved when leader? " ++ show _msg) $ return ()
+    where
+    whenCandidate candidate = do
+        if granted
+        then do
+            let newCandidate = candidate {
+                votesForMe = _sender : votesForMe candidate
+            }
+
+            let currentVotes = length $ votesForMe newCandidate
+            memberCount <- succ . length <$> RWS.asks peerNames
+            let neededVotes = (memberCount `div` 2) + 1
+
+            Trace.trace ("needed: " ++ show neededVotes ++ " have: " ++ show currentVotes) $ return ()
+
+            let newRole = if currentVotes >= neededVotes
+                then Leader LeaderState
+                else Candidate newCandidate
+
+            RWS.modify $ \st -> st {
+                role = newRole
+            }
+        else
+            return ()
+
 
 processTick :: () -> Tick -> ProtoStateMachine
-processTick () (Tick _t) = do
+processTick () (Tick t) = do
+    state <- role <$> RWS.get
+    case state of
+        Follower st -> do
+            whenFollower st
+        Candidate st -> do
+            whenCandidate st
+        Leader st -> do
+            whenLeader st
+
     -- toSend <- pending <$> RWS.get
     -- RWS.modify $ \st -> st { pending = [] }
     -- RWS.tell toSend
+    RWS.modify $ \st -> st { prevTickTime = t }
     return ()
+
+    where
+    whenFollower follower = do
+        if (t - lastLeaderHeartbeat follower) > timeout
+        then Trace.trace "Election timeout elapsed" $ transitionToCandidate
+        else return ()
+
+    transitionToCandidate = do
+        myName <- RWS.asks selfId
+        RWS.modify $ \st -> st {
+            role = Candidate $ CandidateState t [myName],
+            currentTerm = currentTerm st + 1,
+            votedFor = Just myName
+        }
+        peers <- RWS.asks peerNames
+        myId <- RWS.asks selfId
+        thisTerm <- currentTerm <$> RWS.get
+        (_prevTerm, prevIdx) <- getPrevLogTermIdx
+        let req = Lib.RequestVote thisTerm myId prevIdx
+        RWS.tell $ map (\p -> PeerRequest p req) peers
+        Trace.trace ("transitionToCandidate new term: " ++ show thisTerm) $ return ()
+
+    whenCandidate candidate = do
+        -- has the election timeout passed?
+        let elapsed = t - requestVoteSentAt candidate
+        Trace.trace ("Elapsed: " ++ show elapsed ) $ return ()
+        if elapsed > timeout
+        then Trace.trace "Election timeout elapsed" $ transitionToCandidate
+        else return ()
+
+    whenLeader _leader = do
+        Trace.trace ("Leader Tick") $ return ()
+        peers <- RWS.asks peerNames
+        myId <- RWS.asks selfId
+        thisTerm <- currentTerm <$> RWS.get
+        (prevTerm, prevIdx) <- getPrevLogTermIdx
+        let req = Lib.AppendEntries $ Lib.AppendEntriesReq thisTerm myId prevTerm prevIdx []
+        RWS.tell $ map (\p -> PeerRequest p req) peers
+        Trace.trace ("whenLeader new term: " ++ show thisTerm) $ return ()
