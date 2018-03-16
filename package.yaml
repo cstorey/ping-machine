@@ -33,6 +33,7 @@ dependencies:
 - async
 - time
 - random
+- mtl
 
 library:
   source-dirs: src
