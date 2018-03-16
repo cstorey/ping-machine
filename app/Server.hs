@@ -65,14 +65,14 @@ data LeaderState = LeaderState {
 ,   committed :: Maybe Lib.LogIdx
 } deriving (Show)
 
-data RaftState =
+data RaftRole =
     Follower FollowerState
   | Candidate CandidateState
   | Leader LeaderState
     deriving (Show)
 
-data ProtocolState = ProtocolState {
-    role :: RaftState
+data RaftState = RaftState {
+    role :: RaftRole
 ,   currentTerm :: Int
 ,   logEntries :: Map.Map Lib.LogIdx Lib.LogEntry
 ,   votedFor :: Maybe Lib.PeerName
@@ -80,7 +80,7 @@ data ProtocolState = ProtocolState {
 ,   currentLeader :: Maybe Lib.PeerName
 } deriving (Show)
 
-type ProtoStateMachine = RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState ()
+type ProtoStateMachine = RWS.RWS ProtocolEnv [ProcessorMessage] RaftState ()
 
 
 
@@ -273,7 +273,7 @@ runTicker ticks = void $ forever $ do
 --- Model bits
 
 
-newFollower :: RaftState
+newFollower :: RaftRole
 newFollower = Follower $ FollowerState 0
 
 runModel :: Lib.PeerName
@@ -286,7 +286,7 @@ runModel :: Lib.PeerName
             -> STMRespChanMap PeerID Lib.PeerResponse
             -> IO ()
 runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePeers = do
-    stateRef <- STM.atomically $ STM.newTVar $ ProtocolState newFollower 0 Map.empty Nothing 0 Nothing
+    stateRef <- STM.atomically $ STM.newTVar $ RaftState newFollower 0 Map.empty Nothing 0 Nothing
 
     let protocolEnv = ProtocolEnv myName <$> (Map.keys <$> STM.readTVar peerOuts)
     let processClientMessage = processMessageSTM stateRef protocolEnv modelQ processClientRequestMessage
@@ -307,7 +307,7 @@ runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePee
         putStrLn $ "state now: " ++ show st'
         putStrLn $ "sent: " ++ show outputs
 
-processMessageSTM :: STM.TVar ProtocolState
+processMessageSTM :: STM.TVar RaftState
                   -> STM.STM ProtocolEnv
                   -> RequestsInQ xid req
                   -> (xid -> req -> ProtoStateMachine)
@@ -342,21 +342,24 @@ sendMessages clients peers responsePeers toSend = do
                 Nothing -> error "what?"
 
 
-appendToLog :: Lib.ClientRequest -> ProtoStateMachine
+appendToLog :: Lib.ClientRequest ->  RWS.RWS ProtocolEnv [ProcessorMessage] RaftState Int
 appendToLog command = do
     thisTerm <- currentTerm <$> RWS.get
     let entry = Lib.LogEntry thisTerm command
     (_, prevIdx) <- getPrevLogTermIdx
+    let idx = succ prevIdx
     RWS.modify $ \st -> st {
-        logEntries = Map.insert (succ prevIdx) entry $ logEntries st
+        logEntries = Map.insert idx entry $ logEntries st
     }
+    return idx
 
 processClientRequestMessage :: ClientID -> Lib.ClientRequest -> ProtoStateMachine
 processClientRequestMessage sender command = do
     currentRole <- role <$> RWS.get
     case currentRole of
         Leader _ -> do
-            appendToLog command
+            idx <- appendToLog command
+            error $ "Something something" ++ show idx
         _ -> do
             refuseClientRequest
 
@@ -379,14 +382,14 @@ laterTermObserved laterTerm = do
         }
     }
 
-getPrevLogTermIdx :: RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState (Lib.Term, Lib.LogIdx)
+getPrevLogTermIdx :: RWS.RWS ProtocolEnv [ProcessorMessage] RaftState (Lib.Term, Lib.LogIdx)
 getPrevLogTermIdx = do
     myLog <- logEntries <$> RWS.get
     return $ maybe (0, 0) (\(idx, it) -> (idx, Lib.logTerm it)) $ Map.lookupMax myLog
 
 
 
-getMajority :: RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState Int
+getMajority :: RWS.RWS ProtocolEnv [ProcessorMessage] RaftState Int
 getMajority = do
     memberCount <- succ . length <$> RWS.asks peerNames
     return $ succ (memberCount `div` 2)
@@ -612,7 +615,7 @@ processTick () (Tick t) = do
     updatePeer :: Map.Map Lib.PeerName Lib.LogIdx
                -> Map.Map Lib.PeerName Lib.LogIdx
                -> Lib.PeerName
-               -> RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState (Map.Map Lib.PeerName Lib.LogIdx)
+               -> RWS.RWS ProtocolEnv [ProcessorMessage] RaftState (Map.Map Lib.PeerName Lib.LogIdx)
     updatePeer peerPrevIxes lastSentTo peer = do
         thisTerm <- currentTerm <$> RWS.get
         myId <- RWS.asks selfId
