@@ -1,3 +1,6 @@
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+
 module Server where
 
 import qualified Lib
@@ -8,9 +11,9 @@ import qualified System.IO.Streams.Binary  as BStreams
 import qualified Data.Binary as Binary
 import qualified System.Environment as Env
 import qualified Control.Monad.Trans.RWS.Strict as RWS
--- import           Control.Monad.Writer.Class (MonadWriter)
--- import           Control.Monad.State.Class (MonadState)
--- import           Control.Monad.Reader.Class (MonadReader)
+import           Control.Monad.Writer.Class (MonadWriter(..))
+import           Control.Monad.State.Class (MonadState(..), modify)
+import           Control.Monad.Reader.Class (MonadReader(..), asks)
 import qualified Control.Concurrent.STM as STM
 import qualified Control.Concurrent.Async as Async
 import qualified Data.Map as Map
@@ -75,7 +78,7 @@ data RaftState =
     deriving (Show)
 
 data ProtocolState = ProtocolState {
-    role :: RaftState
+    currentRole :: RaftState
 ,   currentTerm :: Int
 ,   logEntries :: Map.Map Lib.LogIdx Lib.LogEntry
 ,   votedFor :: Maybe Lib.PeerName
@@ -83,7 +86,9 @@ data ProtocolState = ProtocolState {
 ,   currentLeader :: Maybe Lib.PeerName
 } deriving (Show)
 
-type ProtoStateMachine = RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState ()
+newtype ProtoStateMachine a = ProtoStateMachine {
+    runProto :: RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState a
+} deriving (Monad, Applicative, Functor, MonadState ProtocolState, MonadWriter [ProcessorMessage], MonadReader ProtocolEnv)
 
 oneSecond :: Time
 oneSecond = 1
@@ -242,23 +247,23 @@ processClientRequests :: (Show xid, Show req, Show resp) =>
     -> IO ()
 
 processClientRequests outQ clientId inQ (is, os) = do
-    Async.concurrently_ (reader clientId inQ) (writer inQ)
+    Async.concurrently_ (reader_ clientId inQ) (writer_ inQ)
     putStrLn $ "Done: " ++ show clientId
     where
-    reader senderId writerQ = do
+    reader_ senderId writerQ = do
         it <- Streams.read is
         case it of
             Just msg -> do
                 putStrLn $ "<- " ++ show clientId ++ ":" ++ show msg
                 STM.atomically $ STM.writeTQueue outQ $ (senderId, Just (msg))
-                reader senderId writerQ
+                reader_ senderId writerQ
             Nothing -> STM.atomically $ STM.writeTQueue writerQ Nothing
 
-    writer sender =  do
+    writer_ sender =  do
         msg <- STM.atomically $ STM.readTQueue sender
         putStrLn $ "-> " ++ show clientId ++ ":" ++ show msg
         Streams.write msg os
-        maybe (return ()) (const $ writer sender) msg
+        maybe (return ()) (const $ writer_ sender) msg
 
 
 runTicker :: STM.TQueue ((), Maybe Tick) -> IO ()
@@ -311,7 +316,7 @@ runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePee
 processMessageSTM :: STM.TVar ProtocolState
                   -> STM.STM ProtocolEnv
                   -> RequestsInQ xid req
-                  -> (xid -> req -> ProtoStateMachine)
+                  -> (xid -> req -> ProtoStateMachine ())
                   -> STM.STM [ProcessorMessage]
 processMessageSTM stateRef envSTM reqQ process = do
     (sender, m) <- STM.readTQueue reqQ
@@ -319,7 +324,7 @@ processMessageSTM stateRef envSTM reqQ process = do
         Just msg -> do
             s <- STM.readTVar stateRef
             env <- envSTM
-            let ((), s', toSend) = RWS.runRWS (process sender msg) env s
+            let ((), s', toSend) = RWS.runRWS (runProto $ process sender msg) env s
             STM.writeTVar stateRef s'
             return toSend
         Nothing -> return []
@@ -343,19 +348,19 @@ sendMessages clients peers responsePeers toSend = do
                 Nothing -> error "what?"
 
 
-appendToLog :: Lib.ClientRequest -> ProtoStateMachine
+appendToLog :: Lib.ClientRequest -> ProtoStateMachine ()
 appendToLog command = do
-    thisTerm <- currentTerm <$> RWS.get
+    thisTerm <- currentTerm <$> get
     let entry = Lib.LogEntry thisTerm command
     (_, prevIdx) <- getPrevLogTermIdx
-    RWS.modify $ \st -> st {
+    modify $ \st -> st {
         logEntries = Map.insert (succ prevIdx) entry $ logEntries st
     }
 
-processClientRequestMessage :: ClientID -> Lib.ClientRequest -> ProtoStateMachine
+processClientRequestMessage :: ClientID -> Lib.ClientRequest -> ProtoStateMachine ()
 processClientRequestMessage sender command = do
-    currentRole <- role <$> RWS.get
-    case currentRole of
+    role <- currentRole <$> get
+    case role of
         Leader _ -> do
             appendToLog command
         _ -> do
@@ -363,39 +368,39 @@ processClientRequestMessage sender command = do
 
     where
     refuseClientRequest = do
-        myLeader <- currentLeader <$> RWS.get
+        myLeader <- currentLeader <$> get
         Trace.trace "Not leader" $ return ()
-        RWS.tell [Reply sender $ Left $ Lib.NotLeader myLeader]
+        tell [Reply sender $ Left $ Lib.NotLeader myLeader]
 
-laterTermObserved :: Lib.Term -> ProtoStateMachine
+laterTermObserved :: Lib.Term -> ProtoStateMachine ()
 laterTermObserved laterTerm = do
-    thisTerm <- currentTerm <$> RWS.get
+    thisTerm <- currentTerm <$> get
     Trace.trace ("Later term observed: " ++ show laterTerm ++ " > " ++ show thisTerm) $ return ()
-    prevTick <- prevTickTime <$> RWS.get
-    RWS.modify $ \st -> st { currentTerm = laterTerm, votedFor = Nothing }
+    prevTick <- prevTickTime <$> get
+    modify $ \st -> st { currentTerm = laterTerm, votedFor = Nothing }
     Trace.trace "stepDownIfCandidateOrLeader " $ return ()
-    RWS.modify $ \st -> st {
-        role = Follower $ FollowerState {
+    modify $ \st -> st {
+        currentRole = Follower $ FollowerState {
             lastLeaderHeartbeat = prevTick
         }
     }
 
-getPrevLogTermIdx :: RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState (Lib.Term, Lib.LogIdx)
+getPrevLogTermIdx :: ProtoStateMachine (Lib.Term, Lib.LogIdx)
 getPrevLogTermIdx = do
-    myLog <- logEntries <$> RWS.get
+    myLog <- logEntries <$> get
     return $ maybe (0, 0) (\(idx, it) -> (idx, Lib.logTerm it)) $ Map.lookupMax myLog
 
 
 
-getMajority :: RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState Int
+getMajority :: ProtoStateMachine Int
 getMajority = do
-    memberCount <- succ . length <$> RWS.asks peerNames
+    memberCount <- succ . length <$> asks peerNames
     return $ succ (memberCount `div` 2)
 
-processPeerRequestMessage :: PeerID -> Lib.PeerRequest -> ProtoStateMachine
+processPeerRequestMessage :: PeerID -> Lib.PeerRequest -> ProtoStateMachine ()
 processPeerRequestMessage sender (Lib.RequestVote candidateTerm candidateName candidateIdx) = do
-    thisTerm <- currentTerm <$> RWS.get
-    vote <- votedFor <$> RWS.get
+    thisTerm <- currentTerm <$> get
+    vote <- votedFor <$> get
     (_prevTerm, logIdx) <- getPrevLogTermIdx
     case () of
         _ | candidateTerm < thisTerm -> do
@@ -415,22 +420,24 @@ processPeerRequestMessage sender (Lib.RequestVote candidateTerm candidateName ca
 
     return ()
     {-
-    RWS.tell [PeerReply sender $ Lib.ThatsNiceDear n]
+    tell [PeerReply sender $ Lib.ThatsNiceDear n]
     -}
 
     where
-        refuseVote thisTerm = RWS.tell [PeerReply sender $ Lib.VoteResult thisTerm False]
+        refuseVote :: Lib.Term -> ProtoStateMachine ()
+        refuseVote thisTerm = tell [PeerReply sender $ Lib.VoteResult thisTerm False]
+        grantVote :: Lib.Term -> ProtoStateMachine ()
         grantVote thisTerm = do
-            RWS.modify $ \st -> st { votedFor = Just candidateName }
-            RWS.tell [PeerReply sender $ Lib.VoteResult thisTerm True]
+            modify $ \st -> st { votedFor = Just candidateName }
+            tell [PeerReply sender $ Lib.VoteResult thisTerm True]
 
 processPeerRequestMessage sender
     _msg@(Lib.AppendEntries (Lib.AppendEntriesReq leaderTerm leaderName prevTerm prevIdx newEntries)) = do
-    -- prevTick <- prevTickTime <$> RWS.get
+    -- prevTick <- prevTickTime <$> get
     Trace.trace ("Append Entries: " ++ show _msg) $ return ()
 
-    thisTerm <- currentTerm <$> RWS.get
-    -- myLog <- logEntries <$> RWS.get
+    thisTerm <- currentTerm <$> get
+    -- myLog <- logEntries <$> get
     -- let logIdx = maybe (0, 0) fst $ Map.lookupMax myLog
     if leaderTerm < thisTerm
     then do
@@ -443,8 +450,8 @@ processPeerRequestMessage sender
         then laterTermObserved leaderTerm
         else
         do
-            state <- role <$> RWS.get
-            case state of
+            role <- currentRole <$> get
+            case role of
                 Follower follower -> do
                     whenFollower thisTerm follower
                 Candidate _st -> do
@@ -453,38 +460,40 @@ processPeerRequestMessage sender
                     error ("appendEntries recieved when leader? " ++ show _msg)
 
     where
-        refuseAppendEntries thisTerm = RWS.tell [PeerReply sender $ Lib.AppendResult thisTerm False]
-        ackAppendEntries thisTerm = RWS.tell [PeerReply sender $ Lib.AppendResult thisTerm True]
+        refuseAppendEntries :: Lib.Term -> ProtoStateMachine ()
+        refuseAppendEntries thisTerm = tell [PeerReply sender $ Lib.AppendResult thisTerm False]
+        ackAppendEntries :: Lib.Term -> ProtoStateMachine ()
+        ackAppendEntries thisTerm = tell [PeerReply sender $ Lib.AppendResult thisTerm True]
         whenFollower thisTerm follower = do
-            entries <- logEntries <$> RWS.get
+            entries <- logEntries <$> get
             let prevItem = Map.lookup prevIdx entries
             if maybe False ((== prevTerm) . Lib.logTerm) prevItem
             then do
                 Trace.trace ("Refusing as prev item was: " ++ show prevItem) $ refuseAppendEntries thisTerm
             else do
-                prevTick <- prevTickTime <$> RWS.get
+                prevTick <- prevTickTime <$> get
                 let idx = succ prevIdx
                 let (entries', _)  = Map.split idx entries
                 let entries'' = Map.union entries' newEntries
                 let follower' = follower {
                     lastLeaderHeartbeat = prevTick
                 }
-                RWS.modify $ \st -> st {
+                modify $ \st -> st {
                     logEntries = entries'',
-                    role = Follower follower',
+                    currentRole = Follower follower',
                     currentLeader = Just leaderName
                 }
                 ackAppendEntries thisTerm
                 Trace.trace "Someething something apply committed entries" $ return ()
 
-resetElectionTimeout :: ProtoStateMachine
+resetElectionTimeout :: ProtoStateMachine ()
 resetElectionTimeout = Trace.trace ("Reset election timeout?") $ return ()
 
-processPeerResponseMessage :: Lib.PeerName -> Lib.PeerResponse -> ProtoStateMachine
+processPeerResponseMessage :: Lib.PeerName -> Lib.PeerResponse -> ProtoStateMachine ()
 processPeerResponseMessage _sender _msg@(Lib.VoteResult _term granted) = do
     Trace.trace ("processPeerResponseMessage: " ++ show _msg) $ return ()
-    state <- role <$> RWS.get
-    case state of
+    role <- currentRole <$> get
+    case role of
         Follower _ -> do
             Trace.trace ("vote recieved when follower? " ++ show _msg) $ return ()
         Candidate st -> do
@@ -509,19 +518,19 @@ processPeerResponseMessage _sender _msg@(Lib.VoteResult _term granted) = do
                 then Leader $ LeaderState Map.empty Map.empty Nothing
                 else Candidate newCandidate
 
-            RWS.modify $ \st -> st {
-                role = newRole
+            modify $ \st -> st {
+                currentRole = newRole
             }
         else
             return ()
 
 processPeerResponseMessage sender _msg@(Lib.AppendResult _term granted) = do
     Trace.trace ("processPeerResponseMessage: " ++ show _msg) $ return ()
-    state <- role <$> RWS.get
-    case state of
+    role <- currentRole <$> get
+    case role of
         Leader leader -> do
             leader' <- whenLeader leader
-            RWS.modify $ \st -> st { role = Leader $ leader' }
+            modify $ \st -> st { currentRole = Leader $ leader' }
         _st -> do
             Trace.trace ("append response recieved when non leader? " ++ show _msg) $ return ()
     where
@@ -554,10 +563,10 @@ processPeerResponseMessage sender _msg@(Lib.AppendResult _term granted) = do
 
 
 
-processTick :: () -> Tick -> ProtoStateMachine
+processTick :: () -> Tick -> ProtoStateMachine ()
 processTick () (Tick t) = do
-    state <- role <$> RWS.get
-    case state of
+    role <- currentRole <$> get
+    case role of
         Follower st -> do
             whenFollower st
         Candidate st -> do
@@ -565,10 +574,10 @@ processTick () (Tick t) = do
         Leader st -> do
             whenLeader st
 
-    -- toSend <- pending <$> RWS.get
-    -- RWS.modify $ \st -> st { pending = [] }
-    -- RWS.tell toSend
-    RWS.modify $ \st -> st { prevTickTime = t }
+    -- toSend <- pending <$> get
+    -- modify $ \st -> st { pending = [] }
+    -- tell toSend
+    modify $ \st -> st { prevTickTime = t }
     return ()
 
     where
@@ -578,18 +587,18 @@ processTick () (Tick t) = do
         else return ()
 
     transitionToCandidate = do
-        myName <- RWS.asks selfId
-        RWS.modify $ \st -> st {
-            role = Candidate $ CandidateState t [myName],
+        myName <- asks selfId
+        modify $ \st -> st {
+            currentRole = Candidate $ CandidateState t [myName],
             currentTerm = currentTerm st + 1,
             votedFor = Just myName
         }
-        peers <- RWS.asks peerNames
-        myId <- RWS.asks selfId
-        thisTerm <- currentTerm <$> RWS.get
+        peers <- asks peerNames
+        myId <- asks selfId
+        thisTerm <- currentTerm <$> get
         (_prevTerm, prevIdx) <- getPrevLogTermIdx
         let req = Lib.RequestVote thisTerm myId prevIdx
-        RWS.tell $ map (\p -> PeerRequest p req) peers
+        tell $ map (\p -> PeerRequest p req) peers
         Trace.trace ("transitionToCandidate new term: " ++ show thisTerm) $ return ()
 
     whenCandidate candidate = do
@@ -602,27 +611,27 @@ processTick () (Tick t) = do
 
     whenLeader leader = do
         Trace.trace ("Leader Tick") $ return ()
-        peers <- RWS.asks peerNames
+        peers <- asks peerNames
         let lastSent = followerLastSent leader
         let peerPrevIxes = followerPrevIdx leader
         peerSentIxes <- foldM (updatePeer peerPrevIxes) lastSent peers
 
-        RWS.modify $ \st -> st {
-            role = Leader $ leader { followerLastSent = peerSentIxes }
+        modify $ \st -> st {
+            currentRole = Leader $ leader { followerLastSent = peerSentIxes }
         }
     updatePeer :: Map.Map Lib.PeerName Lib.LogIdx
                -> Map.Map Lib.PeerName Lib.LogIdx
                -> Lib.PeerName
-               -> RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState (Map.Map Lib.PeerName Lib.LogIdx)
+               -> ProtoStateMachine (Map.Map Lib.PeerName Lib.LogIdx)
     updatePeer peerPrevIxes lastSentTo peer = do
-        thisTerm <- currentTerm <$> RWS.get
-        myId <- RWS.asks selfId
+        thisTerm <- currentTerm <$> get
+        myId <- asks selfId
         (prevTerm, prevIdx) <- getPrevLogTermIdx
         let peerIdx = maybe prevIdx id $ Map.lookup peer peerPrevIxes
-        entries <- logEntries <$> RWS.get
+        entries <- logEntries <$> get
         -- Send everything _after_ their previous index
         let toSend = snd $ Map.split peerIdx entries
         let req = Lib.AppendEntries $ Lib.AppendEntriesReq thisTerm myId prevTerm prevIdx toSend
-        RWS.tell $ [PeerRequest peer req]
+        tell $ [PeerRequest peer req]
         let peerIdx' = maybe peerIdx fst $ Map.lookupMax toSend
         return $ Map.insert peer peerIdx' lastSentTo
