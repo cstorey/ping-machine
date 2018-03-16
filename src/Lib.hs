@@ -9,7 +9,7 @@ module Lib
     , ClientResponse
     , PeerRequest(..)
     , PeerResponse(..)
-    , LogIdx
+    , LogIdx(..)
     , LogEntry(..)
     , PeerName(..)
     , Term
@@ -41,7 +41,7 @@ type ClientResponse = Either ClientError ClientResult
 newtype Term = Term Int deriving (Show, Eq, Ord, Num, Generic, Enum)
 instance Binary.Binary Term
 
-newtype LogIdx = LogIdx Int deriving (Show, Eq, Ord, Num, Generic, Enum)
+newtype LogIdx = LogIdx { unLogIdx :: Int } deriving (Show, Eq, Ord, Num, Generic, Enum)
 instance Binary.Binary LogIdx
 
 data LogEntry = LogEntry {

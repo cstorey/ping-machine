@@ -318,12 +318,12 @@ runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePee
         do
             env <- STM.atomically protocolEnv
             putStrLn $ "Env: " ++ show env
-        (st', outputs) <- STM.atomically $ do
+        (_st', outputs) <- STM.atomically $ do
             outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
             sendMessages clients peerOuts responsePeers outputs
             st' <- STM.readTVar stateRef
             return (st', outputs)
-        putStrLn $ "state now: " ++ show st'
+        -- putStrLn $ "state now: " ++ show st'
         putStrLn $ "sent: " ++ show outputs
 
 processMessageSTM :: STM.TVar RaftState
@@ -379,7 +379,8 @@ processClientRequestMessage sender command = do
         Leader leader -> do
             idx <- appendToLog command
             leader' <- recordPendingClientRequest idx leader
-            modify $ \st -> st { currentRole = Leader leader' }
+            leader'' <- replicatePendingEntriesToFollowers leader'
+            modify $ \st -> st { currentRole = Leader leader'' }
         _ -> do
             refuseClientRequest
 
@@ -602,7 +603,7 @@ processPeerResponseMessage sender _msg@(Lib.AppendResult _term granted) = do
                     }
 
                 else do
-                    let toTry = pred sentIdx
+                    let toTry = Lib.LogIdx . (`div` 2) . Lib.unLogIdx $ sentIdx
                     let lastSent' = Map.insert sender toTry $ followerLastSent leader
                     Trace.trace ("Retry peer " ++ show sender ++ " at : " ++ show toTry) $ return ()
                     return leader {
@@ -683,16 +684,23 @@ processTick () (Tick t) = do
         else return ()
 
     whenLeader leader = do
-        Trace.trace ("Leader Tick") $ return ()
-        peers <- asks peerNames
-        let lastSent = followerLastSent leader
-        let peerPrevIxes = followerPrevIdx leader
-        peerSentIxes <- foldM (updatePeer peerPrevIxes) lastSent peers
-
+        leader' <- replicatePendingEntriesToFollowers leader
         modify $ \st -> st {
-            currentRole = Leader $ leader { followerLastSent = peerSentIxes }
+            currentRole = Leader $ leader'
         }
 
+
+replicatePendingEntriesToFollowers :: LeaderState -> ProtoStateMachine LeaderState
+replicatePendingEntriesToFollowers leader = do
+    Trace.trace ("Leader Tick") $ return ()
+    peers <- asks peerNames
+    let lastSent = followerLastSent leader
+    let peerPrevIxes = followerPrevIdx leader
+    peerSentIxes <- foldM (updatePeer peerPrevIxes) lastSent peers
+
+    return $ leader { followerLastSent = peerSentIxes }
+
+    where
     updatePeer :: Map.Map Lib.PeerName Lib.LogIdx
                -> Map.Map Lib.PeerName Lib.LogIdx
                -> Lib.PeerName

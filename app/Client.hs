@@ -50,5 +50,5 @@ go is os = do
     putStr "Received: "
     putStrLn $ show msg
     case msg of
-        -- Just (Right _) -> go is os
+        Just (Right _) -> go is os
         _ -> return ()
