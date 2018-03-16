@@ -169,7 +169,9 @@ runOutgoing seedPeers peers peerRespQ = do
 connect :: S.AddrInfo -> IO S.Socket
 connect addr = do
     sock <- S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)
+    Trace.trace ("Connecting to " ++ show addr) $ return ()
     (S.connect sock $ S.addrAddress addr) `E.onException` S.close sock
+    Trace.trace ("Connected to " ++ show addr) $ return ()
     return sock
 
 runPeer :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp) => RequestsInQ Lib.PeerName req -> Lib.PeerName -> ResponsesOutQ resp -> IO ()
@@ -177,7 +179,9 @@ runPeer fromPeerQ name toPeerQ = do
     addrInfo <- resolve $ Lib.unPeerName name
     (is, os) <- streamsOf =<< connect addrInfo
 
+    Trace.trace ("Talking to peer " ++ show name) $ return ()
     processClientRequests fromPeerQ name toPeerQ (is, os)
+    Trace.trace ("Finished with peer " ++ show name) $ return ()
 
 runListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid, Ord xid)
             => IO xid
@@ -619,7 +623,9 @@ processTick () (Tick t) = do
 
     where
     whenFollower follower = do
-        if (t - lastLeaderHeartbeat follower) > timeout
+        let elapsed = (t - lastLeaderHeartbeat follower)
+        Trace.trace ("Elapsed: " ++ show elapsed ) $ return ()
+        if elapsed > timeout
         then Trace.trace "Election timeout elapsed" $ transitionToCandidate
         else return ()
 
