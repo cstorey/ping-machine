@@ -94,8 +94,8 @@ newtype ProtoStateMachine a = ProtoStateMachine {
 oneSecond :: Time
 oneSecond = 1
 
-oneSecondNS :: Int
-oneSecondNS = 1000000000
+oneSecondMicroSeconds :: Int
+oneSecondMicroSeconds = 1000000
 
 timeout :: Time
 timeout = oneSecond * 3
@@ -121,11 +121,11 @@ main = S.withSocketsDo $ do
     -- for each known peer, attempt to connect, then relay messages to/from
     -- peers.
     let race = Async.race_
-    (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ) `race`
-        (runListener (PeerID <$> nextId ids) peerListenAddr responsesToPeers peerReqInQ) `race`
-        (runOutgoing (Lib.PeerName <$> peerPorts) requestToPeers peerRespQ) `race`
-        (runTicker ticks) `race`
-        (runModel myName clientReqQ peerReqInQ peerRespQ clients ticks requestToPeers responsesToPeers)
+    (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ)
+        `race` (runListener (PeerID <$> nextId ids) peerListenAddr responsesToPeers peerReqInQ)
+        `race` (runOutgoing (Lib.PeerName <$> peerPorts) requestToPeers peerRespQ)
+        `race` (runTicker ticks)
+        `race` (runModel myName clientReqQ peerReqInQ peerRespQ clients ticks requestToPeers responsesToPeers)
 
 nextId :: STM.TVar Int -> IO Int
 nextId ids = STM.atomically $ do
@@ -145,13 +145,16 @@ runOutgoing seedPeers peers peerRespQ = do
 
     void $ forever $ do
         runningProcesses <- Map.elems <$> STM.readTVarIO processes
-        forM_ (seedPeers \\ runningProcesses) $ \name -> do
+        let toStart = (seedPeers \\ runningProcesses)
+        putStrLn $ "To start: " ++ show toStart
+        forM_ toStart $ \name -> do
             q <- STM.newTQueueIO
+            putStrLn $ "Starting: " ++ show name
             a <- Async.async $ runPeer peerRespQ name q
             STM.atomically $ do
                 STM.modifyTVar peers $ Map.insert name q
                 STM.modifyTVar processes $ Map.insert a name
-            putStrLn $ "Starting: " ++ show name
+
         do
             procNames <- Map.elems <$> STM.readTVarIO processes
             putStrLn $ "procs:" ++ show procNames
@@ -163,20 +166,25 @@ runOutgoing seedPeers peers peerRespQ = do
             STM.writeTVar processes $ Map.delete a procs
             return (namep, retOrError)
 
-        putStrLn $ "runOutgoing : " ++ show (peerNamep, ret)
-        C.threadDelay $ oneSecondNS
+        putStrLn $ "runOutgoing failed process: " ++ show (peerNamep, ret)
+        C.threadDelay $ oneSecondMicroSeconds
+        putStrLn $ "runOutgoing : restarting"
 
 connect :: S.AddrInfo -> IO S.Socket
 connect addr = do
     sock <- S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)
-    Trace.trace ("Connecting to " ++ show addr) $ return ()
-    (S.connect sock $ S.addrAddress addr) `E.onException` S.close sock
-    Trace.trace ("Connected to " ++ show addr) $ return ()
+    Trace.trace ("Connecting " ++ show sock ++ " to " ++ show addr) $ return ()
+    (S.connect sock $ S.addrAddress addr) `E.onException` do
+        Trace.trace ("Failed " ++ show sock ++ " to "  ++ show addr) $ return ()
+        S.close sock
+    Trace.trace ("Connected " ++ show sock ++ " to "  ++ show addr) $ return ()
     return sock
 
 runPeer :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp) => RequestsInQ Lib.PeerName req -> Lib.PeerName -> ResponsesOutQ resp -> IO ()
 runPeer fromPeerQ name toPeerQ = do
+    Trace.trace ("lookup peer " ++ show name) $ return ()
     addrInfo <- resolve $ Lib.unPeerName name
+    Trace.trace ("initiate open " ++ show name) $ return ()
     (is, os) <- streamsOf =<< connect addrInfo
 
     Trace.trace ("Talking to peer " ++ show name) $ return ()
@@ -387,15 +395,30 @@ processClientRequestMessage sender command = do
 laterTermObserved :: Lib.Term -> ProtoStateMachine ()
 laterTermObserved laterTerm = do
     thisTerm <- currentTerm <$> get
+    formerRole <- currentRole <$> get
     Trace.trace ("Later term observed: " ++ show laterTerm ++ " > " ++ show thisTerm) $ return ()
     prevTick <- prevTickTime <$> get
-    modify $ \st -> st { currentTerm = laterTerm, votedFor = Nothing }
-    Trace.trace "stepDownIfCandidateOrLeader " $ return ()
+
+    case formerRole of
+        Leader leader -> whenLeader leader
+        _ -> return ()
+
     modify $ \st -> st {
         currentRole = Follower $ FollowerState {
             lastLeaderHeartbeat = prevTick
-        }
+        },
+        currentTerm = laterTerm,
+        votedFor = Nothing
     }
+
+    where
+    whenLeader :: LeaderState -> ProtoStateMachine ()
+    whenLeader leader = do
+        let pending = pendingClientRequests leader
+        Trace.trace ("Nacking requests: " ++ show pending) $ return ()
+        forM_ (Map.toList pending) $ \(_, clid) -> do
+            -- We should really actually run a state machine here. But ...
+            tell [Reply clid $ Left $ Lib.NotLeader $ Nothing]
 
 getPrevLogTermIdx :: ProtoStateMachine (Lib.Term, Lib.LogIdx)
 getPrevLogTermIdx = do
@@ -420,11 +443,11 @@ processPeerRequestMessage sender (Lib.RequestVote candidateTerm candidateName ca
             refuseVote thisTerm
         _ | candidateTerm > thisTerm -> do
             laterTermObserved candidateTerm
-            Trace.trace ("Granting vote") $ grantVote thisTerm
+            Trace.trace ("Granting vote") $ grantVote candidateTerm
             -- Reply No?
         _ | Maybe.isNothing vote && candidateIdx >= logIdx -> do
             Trace.trace ("Granting vote") $ return ()
-            grantVote thisTerm
+            grantVote candidateTerm
             -- Already
         _ -> do
             Trace.trace ("Already voted for " ++ show vote) $ return ()
@@ -476,7 +499,13 @@ processPeerRequestMessage sender
         refuseAppendEntries thisTerm = tell [PeerReply sender $ Lib.AppendResult thisTerm False]
         ackAppendEntries :: Lib.Term -> ProtoStateMachine ()
         ackAppendEntries thisTerm = tell [PeerReply sender $ Lib.AppendResult thisTerm True]
+
         whenFollower thisTerm follower = do
+
+            prevTick <- prevTickTime <$> get
+            let follower' = follower { lastLeaderHeartbeat = prevTick }
+            modify $ \st -> st { currentRole = Follower follower' }
+
             (_prevTerm, logHeadIdx) <- getPrevLogTermIdx
             entries <- logEntries <$> get
 
@@ -490,50 +519,50 @@ processPeerRequestMessage sender
                     Trace.trace ("Refusing as prevIdx index: " ++ show prevIdx ++ " ahead of our " ++ show logHeadIdx) $
                         refuseAppendEntries thisTerm
                 _ -> do
-                    prevTick <- prevTickTime <$> get
                     let idx = succ prevIdx
                     let (entries', _)  = Map.split idx entries
                     let entries'' = Map.union entries' newEntries
-                    let follower' = follower {
-                        lastLeaderHeartbeat = prevTick
-                    }
                     modify $ \st -> st {
                         logEntries = entries'',
-                        currentRole = Follower follower',
                         currentLeader = Just leaderName
                     }
                     ackAppendEntries thisTerm
-                    Trace.trace "Someething something apply committed entries" $ return ()
 
 resetElectionTimeout :: ProtoStateMachine ()
 resetElectionTimeout = Trace.trace ("Reset election timeout?") $ return ()
 
 processPeerResponseMessage :: Lib.PeerName -> Lib.PeerResponse -> ProtoStateMachine ()
-processPeerResponseMessage _sender _msg@(Lib.VoteResult _term granted) = do
+processPeerResponseMessage _sender _msg@(Lib.VoteResult peerTerm granted) = do
     Trace.trace ("processPeerResponseMessage: " ++ show _msg) $ return ()
     role <- currentRole <$> get
+    myTerm <- currentTerm <$> get
+
     case role of
-        Follower _ -> do
-            Trace.trace ("vote recieved when follower? " ++ show _msg) $ return ()
+        _ | peerTerm > myTerm -> laterTermObserved peerTerm
+        _ | peerTerm < myTerm -> Trace.trace ("Ignoring vote for previous term") $ return ()
         Candidate st -> do
-            whenCandidate st
-        Leader _st -> do
-            Trace.trace ("vote recieved when leader? " ++ show _msg) $ return ()
+            whenCandidate myTerm st
+        _ -> do
+            Trace.trace ("vote recieved when non candidate?") $ return ()
     where
-    whenCandidate candidate = do
+    whenCandidate myTerm candidate = do
         if granted
         then do
             let newCandidate = candidate {
                 votesForMe = _sender : votesForMe candidate
             }
 
-            let currentVotes = length $ votesForMe newCandidate
+            let currentVotes = votesForMe newCandidate
 
             neededVotes <- getMajority
 
-            Trace.trace ("needed: " ++ show neededVotes ++ " have: " ++ show currentVotes) $ return ()
+            Trace.trace ("In term: " ++ show myTerm ++
+                " Vote ack for term: " ++ show peerTerm ++
+                " needed: " ++ show neededVotes ++
+                " have: " ++ show currentVotes
+                ) $ return ()
 
-            let newRole = if currentVotes >= neededVotes
+            let newRole = if length currentVotes >= neededVotes
                 then Leader $ LeaderState Map.empty Map.empty Nothing Map.empty
                 else Candidate newCandidate
 
@@ -549,7 +578,6 @@ processPeerResponseMessage sender _msg@(Lib.AppendResult _term granted) = do
     case role of
         Leader leader -> do
             leader' <- whenLeader leader
-            Trace.trace ("append response granted: " ++ show leader') $ return ()
             leader'' <- maybe (return leader') (ackPendingClientResponses leader' ) $ committed leader'
 
             modify $ \st -> st { currentRole = Leader $ leader'' }
@@ -574,13 +602,13 @@ processPeerResponseMessage sender _msg@(Lib.AppendResult _term granted) = do
                     }
 
                 else do
-                    let lastSent' = Map.insert sender (pred sentIdx) $ followerLastSent leader
+                    let toTry = pred sentIdx
+                    let lastSent' = Map.insert sender toTry $ followerLastSent leader
+                    Trace.trace ("Retry peer " ++ show sender ++ " at : " ++ show toTry) $ return ()
                     return leader {
                         followerLastSent = lastSent'
                     }
             _ -> Trace.trace ("Response to an unsent message?") $ return leader
-
-
 
     findCommittedIndex followerPrevIdx' = do
         majority <- getMajority
@@ -588,12 +616,14 @@ processPeerResponseMessage sender _msg@(Lib.AppendResult _term granted) = do
         -- So first derive the acked idxes in descending order
         (_, myIdx ) <- getPrevLogTermIdx
         let known = List.sortOn (0 -) $ myIdx : Map.elems followerPrevIdx'
+        Trace.trace ("Known follower indexes: " ++ show known) $ return ()
         return $ Maybe.listToMaybe $ List.drop (pred majority) known
 
     ackPendingClientResponses :: LeaderState -> Lib.LogIdx -> ProtoStateMachine LeaderState
     ackPendingClientResponses leader idx = do
         let pending = pendingClientRequests leader
         let (canRespond, unCommitted) = Map.spanAntitone (>= idx) pending
+        Trace.trace ("committed index: " ++ show idx ++ " pending: " ++ show canRespond) $ return ()
 
         Trace.trace ("Responding to requests: " ++ show canRespond) $ return ()
         forM_ (Map.toList canRespond) $ \(reqIdx, clid) -> do
@@ -662,10 +692,12 @@ processTick () (Tick t) = do
         modify $ \st -> st {
             currentRole = Leader $ leader { followerLastSent = peerSentIxes }
         }
+
     updatePeer :: Map.Map Lib.PeerName Lib.LogIdx
                -> Map.Map Lib.PeerName Lib.LogIdx
                -> Lib.PeerName
                -> ProtoStateMachine (Map.Map Lib.PeerName Lib.LogIdx)
+
     updatePeer peerPrevIxes lastSentTo peer = do
         thisTerm <- currentTerm <$> get
         myId <- asks selfId
