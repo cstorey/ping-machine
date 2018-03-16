@@ -3,11 +3,12 @@
 module Lib
     (
       ClientRequest(..)
-    , ClientResponse(..)
+    , ClientResult(..)
+    , ClientError(..)
+    , ClientResponse
     , PeerRequest(..)
     , PeerResponse(..)
     , LogIdx
-    , LogValue
     , LogEntry(..)
     , PeerName(..)
     , Term
@@ -16,24 +17,31 @@ module Lib
 
 import GHC.Generics
 import qualified Data.Binary as Binary
+import qualified Data.Map as Map
 
 data ClientRequest =
     Bing
   | Ping
-  deriving (Show, Generic)
+  deriving (Eq, Ord, Show, Generic)
 instance Binary.Binary ClientRequest
 
-data ClientResponse =
+data ClientResult =
     Bong Int
+  deriving (Eq, Ord, Show, Generic)
+instance Binary.Binary ClientResult
+
+data ClientError =
+    NotLeader (Maybe PeerName)
   deriving (Show, Generic)
-instance Binary.Binary ClientResponse
+instance Binary.Binary ClientError
+
+type ClientResponse = Either ClientError ClientResult
 
 type Term = Int
 type LogIdx = Int
-type LogValue = Int
 data LogEntry = LogEntry {
   logTerm :: Term
-, logValue :: LogValue
+, logValue :: ClientRequest
 } deriving (Show, Eq, Ord, Generic)
 
 instance Binary.Binary LogEntry
@@ -48,7 +56,7 @@ data AppendEntriesReq = AppendEntriesReq {
 , aeLeaderName :: PeerName
 , aePrevTerm :: Term
 , aePrevIdx :: LogIdx
-, aeNewEntries :: [LogEntry]
+, aeNewEntries :: Map.Map LogIdx LogEntry
 } deriving (Show, Eq, Ord, Generic)
 instance Binary.Binary AppendEntriesReq
 
@@ -60,6 +68,7 @@ instance Binary.Binary PeerRequest
 
 data PeerResponse =
     VoteResult Term Bool
+  | AppendResult Term Bool
   deriving (Show, Generic)
 instance Binary.Binary PeerResponse
 
