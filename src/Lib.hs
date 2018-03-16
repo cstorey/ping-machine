@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 module Lib
     (
@@ -26,7 +27,7 @@ data ClientRequest =
 instance Binary.Binary ClientRequest
 
 data ClientResult =
-    Bong Int
+    Bong String
   deriving (Eq, Ord, Show, Generic)
 instance Binary.Binary ClientResult
 
@@ -37,8 +38,12 @@ instance Binary.Binary ClientError
 
 type ClientResponse = Either ClientError ClientResult
 
-type Term = Int
-type LogIdx = Int
+newtype Term = Term Int deriving (Show, Eq, Ord, Num, Generic, Enum)
+instance Binary.Binary Term
+
+newtype LogIdx = LogIdx Int deriving (Show, Eq, Ord, Num, Generic, Enum)
+instance Binary.Binary LogIdx
+
 data LogEntry = LogEntry {
   logTerm :: Term
 , logValue :: ClientRequest

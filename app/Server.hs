@@ -69,17 +69,18 @@ data LeaderState = LeaderState {
     followerPrevIdx :: Map.Map Lib.PeerName Lib.LogIdx
 ,   followerLastSent :: Map.Map Lib.PeerName Lib.LogIdx
 ,   committed :: Maybe Lib.LogIdx
+,   pendingClientRequests :: Map.Map Lib.LogIdx ClientID
 } deriving (Show)
 
-data RaftState =
+data RaftRole =
     Follower FollowerState
   | Candidate CandidateState
   | Leader LeaderState
     deriving (Show)
 
-data ProtocolState = ProtocolState {
-    currentRole :: RaftState
-,   currentTerm :: Int
+data RaftState = RaftState {
+    currentRole :: RaftRole
+,   currentTerm :: Lib.Term
 ,   logEntries :: Map.Map Lib.LogIdx Lib.LogEntry
 ,   votedFor :: Maybe Lib.PeerName
 ,   prevTickTime :: Time
@@ -87,8 +88,8 @@ data ProtocolState = ProtocolState {
 } deriving (Show)
 
 newtype ProtoStateMachine a = ProtoStateMachine {
-    runProto :: RWS.RWS ProtocolEnv [ProcessorMessage] ProtocolState a
-} deriving (Monad, Applicative, Functor, MonadState ProtocolState, MonadWriter [ProcessorMessage], MonadReader ProtocolEnv)
+    runProto :: RWS.RWS ProtocolEnv [ProcessorMessage] RaftState a
+} deriving (Monad, Applicative, Functor, MonadState RaftState, MonadWriter [ProcessorMessage], MonadReader ProtocolEnv)
 
 oneSecond :: Time
 oneSecond = 1
@@ -279,7 +280,7 @@ runTicker ticks = void $ forever $ do
 --- Model bits
 
 
-newFollower :: RaftState
+newFollower :: RaftRole
 newFollower = Follower $ FollowerState 0
 
 runModel :: Lib.PeerName
@@ -292,7 +293,7 @@ runModel :: Lib.PeerName
             -> STMRespChanMap PeerID Lib.PeerResponse
             -> IO ()
 runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePeers = do
-    stateRef <- STM.atomically $ STM.newTVar $ ProtocolState newFollower 0 Map.empty Nothing 0 Nothing
+    stateRef <- STM.atomically $ STM.newTVar $ RaftState newFollower 0 Map.empty Nothing 0 Nothing
 
     let protocolEnv = ProtocolEnv myName <$> (Map.keys <$> STM.readTVar peerOuts)
     let processClientMessage = processMessageSTM stateRef protocolEnv modelQ processClientRequestMessage
@@ -313,7 +314,7 @@ runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePee
         putStrLn $ "state now: " ++ show st'
         putStrLn $ "sent: " ++ show outputs
 
-processMessageSTM :: STM.TVar ProtocolState
+processMessageSTM :: STM.TVar RaftState
                   -> STM.STM ProtocolEnv
                   -> RequestsInQ xid req
                   -> (xid -> req -> ProtoStateMachine ())
@@ -348,21 +349,25 @@ sendMessages clients peers responsePeers toSend = do
                 Nothing -> error "what?"
 
 
-appendToLog :: Lib.ClientRequest -> ProtoStateMachine ()
+appendToLog :: Lib.ClientRequest -> ProtoStateMachine Lib.LogIdx
 appendToLog command = do
     thisTerm <- currentTerm <$> get
     let entry = Lib.LogEntry thisTerm command
     (_, prevIdx) <- getPrevLogTermIdx
+    let idx = succ prevIdx
     modify $ \st -> st {
-        logEntries = Map.insert (succ prevIdx) entry $ logEntries st
+        logEntries = Map.insert idx entry $ logEntries st
     }
+    return idx
 
 processClientRequestMessage :: ClientID -> Lib.ClientRequest -> ProtoStateMachine ()
 processClientRequestMessage sender command = do
     role <- currentRole <$> get
     case role of
-        Leader _ -> do
-            appendToLog command
+        Leader leader -> do
+            idx <- appendToLog command
+            leader' <- recordPendingClientRequest idx leader
+            modify $ \st -> st { currentRole = Leader leader' }
         _ -> do
             refuseClientRequest
 
@@ -371,6 +376,9 @@ processClientRequestMessage sender command = do
         myLeader <- currentLeader <$> get
         Trace.trace "Not leader" $ return ()
         tell [Reply sender $ Left $ Lib.NotLeader myLeader]
+
+    recordPendingClientRequest idx leader = do
+        return $ leader { pendingClientRequests = Map.insert idx sender $ pendingClientRequests leader}
 
 laterTermObserved :: Lib.Term -> ProtoStateMachine ()
 laterTermObserved laterTerm = do
@@ -388,7 +396,7 @@ laterTermObserved laterTerm = do
 getPrevLogTermIdx :: ProtoStateMachine (Lib.Term, Lib.LogIdx)
 getPrevLogTermIdx = do
     myLog <- logEntries <$> get
-    return $ maybe (0, 0) (\(idx, it) -> (idx, Lib.logTerm it)) $ Map.lookupMax myLog
+    return $ maybe (0, 0) (\(idx, it) -> (Lib.logTerm it, idx)) $ Map.lookupMax myLog
 
 
 
@@ -465,26 +473,33 @@ processPeerRequestMessage sender
         ackAppendEntries :: Lib.Term -> ProtoStateMachine ()
         ackAppendEntries thisTerm = tell [PeerReply sender $ Lib.AppendResult thisTerm True]
         whenFollower thisTerm follower = do
+            (_prevTerm, logHeadIdx) <- getPrevLogTermIdx
             entries <- logEntries <$> get
-            let prevItem = Map.lookup prevIdx entries
-            if maybe False ((== prevTerm) . Lib.logTerm) prevItem
-            then do
-                Trace.trace ("Refusing as prev item was: " ++ show prevItem) $ refuseAppendEntries thisTerm
-            else do
-                prevTick <- prevTickTime <$> get
-                let idx = succ prevIdx
-                let (entries', _)  = Map.split idx entries
-                let entries'' = Map.union entries' newEntries
-                let follower' = follower {
-                    lastLeaderHeartbeat = prevTick
-                }
-                modify $ \st -> st {
-                    logEntries = entries'',
-                    currentRole = Follower follower',
-                    currentLeader = Just leaderName
-                }
-                ackAppendEntries thisTerm
-                Trace.trace "Someething something apply committed entries" $ return ()
+
+            let myEntry = Map.lookup prevIdx entries
+            case Lib.logTerm <$> myEntry of
+                Just n | n /= prevTerm -> do
+                    Trace.trace ("Refusing as prev item was: " ++ show myEntry ++ " wanted term " ++ show prevTerm) $
+                        refuseAppendEntries thisTerm
+                -- We need to refuse here iff it's ahead of our log
+                Nothing | prevIdx > logHeadIdx -> do
+                    Trace.trace ("Refusing as prevIdx index: " ++ show prevIdx ++ " ahead of our " ++ show logHeadIdx) $
+                        refuseAppendEntries thisTerm
+                _ -> do
+                    prevTick <- prevTickTime <$> get
+                    let idx = succ prevIdx
+                    let (entries', _)  = Map.split idx entries
+                    let entries'' = Map.union entries' newEntries
+                    let follower' = follower {
+                        lastLeaderHeartbeat = prevTick
+                    }
+                    modify $ \st -> st {
+                        logEntries = entries'',
+                        currentRole = Follower follower',
+                        currentLeader = Just leaderName
+                    }
+                    ackAppendEntries thisTerm
+                    Trace.trace "Someething something apply committed entries" $ return ()
 
 resetElectionTimeout :: ProtoStateMachine ()
 resetElectionTimeout = Trace.trace ("Reset election timeout?") $ return ()
@@ -515,7 +530,7 @@ processPeerResponseMessage _sender _msg@(Lib.VoteResult _term granted) = do
             Trace.trace ("needed: " ++ show neededVotes ++ " have: " ++ show currentVotes) $ return ()
 
             let newRole = if currentVotes >= neededVotes
-                then Leader $ LeaderState Map.empty Map.empty Nothing
+                then Leader $ LeaderState Map.empty Map.empty Nothing Map.empty
                 else Candidate newCandidate
 
             modify $ \st -> st {
@@ -530,36 +545,58 @@ processPeerResponseMessage sender _msg@(Lib.AppendResult _term granted) = do
     case role of
         Leader leader -> do
             leader' <- whenLeader leader
-            modify $ \st -> st { currentRole = Leader $ leader' }
+            Trace.trace ("append response granted: " ++ show leader') $ return ()
+            leader'' <- maybe (return leader') (ackPendingClientResponses leader' ) $ committed leader'
+
+            modify $ \st -> st { currentRole = Leader $ leader'' }
         _st -> do
             Trace.trace ("append response recieved when non leader? " ++ show _msg) $ return ()
     where
     whenLeader leader = do
-        if granted
-        then do
-            let lastSent = followerLastSent leader
-            case Map.lookup sender lastSent of
-                Just sentIdx -> do
+        let lastSent = followerLastSent leader
+        case Map.lookup sender lastSent of
+            Just sentIdx -> do
+                if granted
+                then do
                     let followerPrevIdx' = Map.insert sender sentIdx $ followerPrevIdx leader
+                    committedIdx <- findCommittedIndex followerPrevIdx'
 
-                    majority <- getMajority
+                    Trace.trace ("committed index should be: " ++ show committedIdx) $ return ()
 
-                    -- Find items acked by a ajority of servers.
-                    -- So first derive the acked idxes in descending order
-                    (_, myIdx ) <- getPrevLogTermIdx
-                    let known = List.sortOn (0 -) $ myIdx : Map.elems followerPrevIdx'
-                    let committedIdx = Maybe.listToMaybe $ List.drop (pred majority) known
-
-                    let leader' = leader {
+                    return leader {
                         followerPrevIdx = followerPrevIdx'
                     ,   followerLastSent = Map.delete sender lastSent
                     ,   committed = committedIdx
                     }
-                    Trace.trace ("commited index should be: " ++ show committedIdx) return ()
-                    Trace.trace ("append response granted: " ++ show leader') return leader'
-                _ -> Trace.trace ("Response to an unset message?") $ return leader
-        else
-            error $ "AppendResult failed! " ++ show leader
+
+                else do
+                    let lastSent' = Map.insert sender (pred sentIdx) $ followerLastSent leader
+                    return leader {
+                        followerLastSent = lastSent'
+                    }
+            _ -> Trace.trace ("Response to an unsent message?") $ return leader
+
+
+
+    findCommittedIndex followerPrevIdx' = do
+        majority <- getMajority
+        -- Find items acked by a ajority of servers.
+        -- So first derive the acked idxes in descending order
+        (_, myIdx ) <- getPrevLogTermIdx
+        let known = List.sortOn (0 -) $ myIdx : Map.elems followerPrevIdx'
+        return $ Maybe.listToMaybe $ List.drop (pred majority) known
+
+    ackPendingClientResponses :: LeaderState -> Lib.LogIdx -> ProtoStateMachine LeaderState
+    ackPendingClientResponses leader idx = do
+        let pending = pendingClientRequests leader
+        let (canRespond, unCommitted) = Map.spanAntitone (>= idx) pending
+
+        Trace.trace ("Responding to requests: " ++ show canRespond) $ return ()
+        forM_ (Map.toList canRespond) $ \(reqIdx, clid) -> do
+            -- We should really actually run a state machine here. But ...
+            tell [Reply clid $ Right $ Lib.Bong $ show reqIdx]
+
+        return $ leader { pendingClientRequests = unCommitted }
 
 
 
