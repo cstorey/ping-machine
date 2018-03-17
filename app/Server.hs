@@ -323,7 +323,7 @@ runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePee
             sendMessages clients peerOuts responsePeers outputs
             st' <- STM.readTVar stateRef
             return (st', outputs)
-        -- putStrLn $ "state now: " ++ show st'
+        putStrLn $ "state now: " ++ show _st'
         putStrLn $ "sent: " ++ show outputs
 
 processMessageSTM :: STM.TVar RaftState
@@ -710,11 +710,12 @@ replicatePendingEntriesToFollowers leader = do
         thisTerm <- currentTerm <$> get
         myId <- asks selfId
         (prevTerm, prevIdx) <- getPrevLogTermIdx
-        let peerIdx = maybe prevIdx id $ Map.lookup peer peerPrevIxes
+        let peerPrevIdx = maybe prevIdx id $ Map.lookup peer peerPrevIxes
         entries <- logEntries <$> get
+        let peerPrevTerm = maybe prevTerm Lib.logTerm $ Map.lookup peerPrevIdx entries
         -- Send everything _after_ their previous index
-        let toSend = snd $ Map.split peerIdx entries
-        let req = Lib.AppendEntries $ Lib.AppendEntriesReq thisTerm myId prevTerm prevIdx toSend
+        let toSend = snd $ Map.split peerPrevIdx entries
+        let req = Lib.AppendEntries $ Lib.AppendEntriesReq thisTerm myId peerPrevTerm peerPrevIdx toSend
         tell $ [PeerRequest peer req]
-        let peerIdx' = maybe peerIdx fst $ Map.lookupMax toSend
+        let peerIdx' = maybe peerPrevIdx fst $ Map.lookupMax toSend
         return $ Map.insert peer peerIdx' lastSentTo
