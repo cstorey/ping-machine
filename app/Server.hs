@@ -623,7 +623,7 @@ processPeerResponseMessage sender _msg@(Lib.AppendResult _term granted) = do
     ackPendingClientResponses :: LeaderState -> Lib.LogIdx -> ProtoStateMachine LeaderState
     ackPendingClientResponses leader idx = do
         let pending = pendingClientRequests leader
-        let (canRespond, unCommitted) = Map.spanAntitone (>= idx) pending
+        let (canRespond, unCommitted) = Map.spanAntitone (<= idx) pending
         Trace.trace ("committed index: " ++ show idx ++ " pending: " ++ show canRespond) $ return ()
 
         Trace.trace ("Responding to requests: " ++ show canRespond) $ return ()
