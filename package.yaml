@@ -41,7 +41,7 @@ library:
 executables:
   stuff-server:
     main:                Server.hs
-    source-dirs:         app
+    source-dirs:         server
     ghc-options:
     - -threaded
     - -rtsopts
@@ -51,7 +51,7 @@ executables:
     - stuff-hs
   stuff-client:
     main:                Client.hs
-    source-dirs:         app
+    source-dirs:         client
     ghc-options:
     - -threaded
     - -rtsopts
