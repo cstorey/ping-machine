@@ -267,14 +267,14 @@ processClientRequests outQ clientId inQ (is, os) = do
         it <- Streams.read is
         case it of
             Just msg -> do
-                putStrLn $ "<- " ++ show clientId ++ ":" ++ show msg
+                when False $ putStrLn $ "<- " ++ show clientId ++ ":" ++ show msg
                 STM.atomically $ STM.writeTQueue outQ $ (senderId, Just (msg))
                 reader_ senderId writerQ
             Nothing -> STM.atomically $ STM.writeTQueue writerQ Nothing
 
     writer_ sender =  do
         msg <- STM.atomically $ STM.readTQueue sender
-        putStrLn $ "-> " ++ show clientId ++ ":" ++ show msg
+        when False $ putStrLn $ "-> " ++ show clientId ++ ":" ++ show msg
         Streams.write msg os
         maybe (return ()) (const $ writer_ sender) msg
 
@@ -315,7 +315,7 @@ runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePee
 
 
     forever $ do
-        do
+        when False $ do
             env <- STM.atomically protocolEnv
             putStrLn $ "Env: " ++ show env
         (_st', outputs) <- STM.atomically $ do
@@ -323,8 +323,8 @@ runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePee
             sendMessages clients peerOuts responsePeers outputs
             st' <- STM.readTVar stateRef
             return (st', outputs)
-        putStrLn $ "state now: " ++ show _st'
-        putStrLn $ "sent: " ++ show outputs
+        when False $ putStrLn $ "state now: " ++ show _st'
+        when False $ putStrLn $ "sent: " ++ show outputs
 
 processMessageSTM :: STM.TVar RaftState
                   -> STM.STM ProtocolEnv
