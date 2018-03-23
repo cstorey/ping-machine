@@ -1,6 +1,5 @@
 module Stuff.Network
-( runListener
-, runOutgoing
+( runOutgoing
 , runReqRespListener
 , resolve
 )
@@ -83,15 +82,6 @@ runPeer fromPeerQ name toPeerQ = do
     processClientRequests fromPeerQ name toPeerQ (is, os)
     Trace.trace ("Finished with peer " ++ show name) $ return ()
 
-runListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid, Ord xid)
-            => IO xid
-            -> S.AddrInfo
-            -> STM.TVar (Map.Map xid (ResponsesOutQ resp))
-            -> RequestsInQ xid req
-            -> IO ()
-runListener newId addr clients reqs =
-    E.bracket (listenFor addr) S.close (runAcceptor newId $ handleConn clients reqs)
-
 resolve :: S.ServiceName -> IO S.AddrInfo
 resolve port = do
     let hints = S.defaultHints {
@@ -129,20 +119,6 @@ runAcceptor newId handler listener = go
             n <- newId
             void $ C.forkIO $ do
                 E.bracket (streamsOf client) (const $ S.close client) (handler n)
-
-handleConn :: (Show req, Show resp, Show xid, Ord xid)
-            => STM.TVar (Map.Map xid (ResponsesOutQ resp))
-            -> RequestsInQ xid req
-            -> xid
-            -> (Streams.InputStream req, Streams.OutputStream resp)
-            -> IO ()
-
-handleConn clients modelQ clientId (is,os) = do
-    q <- STM.atomically $ do
-        q <- STM.newTQueue
-        STM.modifyTVar clients $ Map.insert clientId q
-        return q
-    processClientRequests modelQ clientId q (is, os)
 
 processClientRequests :: (Show xid, Show req, Show resp) =>
        RequestsInQ xid req
