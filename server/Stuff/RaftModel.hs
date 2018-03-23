@@ -1,8 +1,9 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
-module Stuff.RaftModel (
-    runModel
+module Stuff.RaftModel
+( runModel
+, nextIdSTM
 )
 where
 
@@ -18,11 +19,15 @@ import qualified Debug.Trace as Trace
 import Control.Applicative ((<|>))
 import qualified Data.Maybe as Maybe
 import qualified Data.List as List
+import qualified System.IO.Unsafe
 import Control.Monad
 
 import Stuff.Types
 
-data ProcessorMessage = Reply ClientID Lib.ClientResponse
+newtype IdFor a = IdFor Int
+    deriving (Show, Eq, Ord)
+
+data ProcessorMessage = Reply (IdFor Lib.ClientResponse) Lib.ClientResponse
     | PeerRequest Lib.PeerName Lib.PeerRequest
     | PeerReply PeerID Lib.PeerResponse
     deriving (Show)
@@ -35,15 +40,17 @@ data ProtocolEnv = ProtocolEnv {
 data FollowerState = FollowerState {
     lastLeaderHeartbeat :: Time
 } deriving (Show)
+
 data CandidateState = CandidateState {
     requestVoteSentAt :: Time
 ,   votesForMe :: [Lib.PeerName]
 } deriving (Show)
+
 data LeaderState = LeaderState {
     followerPrevIdx :: Map.Map Lib.PeerName Lib.LogIdx
 ,   followerLastSent :: Map.Map Lib.PeerName Lib.LogIdx
 ,   committed :: Maybe Lib.LogIdx
-,   pendingClientRequests :: Map.Map Lib.LogIdx ClientID
+,   pendingClientRequests :: Map.Map Lib.LogIdx (IdFor Lib.ClientResponse)
 } deriving (Show)
 
 data RaftRole =
@@ -74,20 +81,30 @@ timeout = oneSecond * 3
 newFollower :: RaftRole
 newFollower = Follower $ FollowerState 0
 
+nextIds :: STM.TVar Int
+nextIds = System.IO.Unsafe.unsafePerformIO $ STM.newTVarIO 0
+{-# NOINLINE nextIds #-}
+
+nextIdSTM :: STM.STM Int
+nextIdSTM = do
+    n <- STM.readTVar nextIds
+    STM.writeTVar nextIds (succ n)
+    return n
+
 runModel :: Lib.PeerName
-            -> RequestsInQ ClientID Lib.ClientRequest
+            -> RequestsQ Lib.ClientRequest Lib.ClientResponse
             -> RequestsInQ PeerID Lib.PeerRequest
             -> RequestsInQ Lib.PeerName Lib.PeerResponse
-            -> STMRespChanMap ClientID Lib.ClientResponse
             -> RequestsInQ () Tick
             -> STMRespChanMap Lib.PeerName Lib.PeerRequest
             -> STMRespChanMap PeerID Lib.PeerResponse
             -> IO ()
-runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePeers = do
+runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts responsePeers = do
     stateRef <- STM.atomically $ STM.newTVar $ RaftState newFollower 0 Map.empty Nothing 0 Nothing
+    pendingClientResponses <- STM.atomically $ STM.newTVar $ Map.empty
 
     let protocolEnv = ProtocolEnv myName <$> (Map.keys <$> STM.readTVar peerOuts)
-    let processClientMessage = processMessageSTM stateRef protocolEnv modelQ processClientRequestMessage
+    let processClientMessage = processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
     let processTickMessage = processMessageSTM stateRef protocolEnv ticks processTick
     let processPeerRequest = processMessageSTM stateRef protocolEnv peerReqInQ processPeerRequestMessage
     let processPeerResponse = processMessageSTM stateRef protocolEnv peerRespInQ processPeerResponseMessage
@@ -99,7 +116,7 @@ runModel myName modelQ peerReqInQ peerRespInQ clients ticks peerOuts responsePee
             putStrLn $ "Env: " ++ show env
         (_st', outputs) <- STM.atomically $ do
             outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
-            sendMessages clients peerOuts responsePeers outputs
+            sendMessages pendingClientResponses peerOuts responsePeers outputs
             st' <- STM.readTVar stateRef
             return (st', outputs)
         when False $ putStrLn $ "state now: " ++ show _st'
@@ -121,15 +138,37 @@ processMessageSTM stateRef envSTM reqQ process = do
             return toSend
         Nothing -> return []
 
-sendMessages :: STMRespChanMap ClientID Lib.ClientResponse
+processReqRespMessageSTM :: STM.TVar RaftState
+                  -> STM.STM ProtocolEnv
+                  -> STM.TVar (Map.Map (IdFor resp) (STM.TMVar resp))
+                  -> RequestsQ req resp
+                  -> (req -> IdFor resp -> ProtoStateMachine ())
+                  -> STM.STM [ProcessorMessage]
+processReqRespMessageSTM stateRef envSTM pendingResponses reqQ process = do
+  (msg, pendingResponse) <- STM.readTQueue reqQ
+  reqId <- IdFor <$> nextIdSTM
+  STM.modifyTVar pendingResponses $ Map.insert reqId pendingResponse
+
+  s <- STM.readTVar stateRef
+  env <- envSTM
+  let ((), s', toSend) = RWS.runRWS (runProto $ process msg reqId) env s
+  STM.writeTVar stateRef s'
+  return toSend
+
+sendMessages :: STM.TVar (Map.Map (IdFor Lib.ClientResponse) (STM.TMVar Lib.ClientResponse))
              -> STMRespChanMap Lib.PeerName Lib.PeerRequest
              -> STMRespChanMap PeerID Lib.PeerResponse
              -> [ProcessorMessage]
              -> STM.STM ()
-sendMessages clients peers responsePeers toSend = do
+sendMessages pendingClientResponses peers responsePeers toSend = do
             forM_ toSend $ \msg' -> do
                 case msg' of
-                    Reply clientId reply -> sendTo clients clientId reply
+                    Reply respId reply -> do
+                      mvarp <- Map.lookup respId <$> STM.readTVar pendingClientResponses
+                      case mvarp of
+                          Just mvar -> STM.putTMVar mvar reply
+                          Nothing -> error $ "No mvar for response id " ++ show respId ++ " : " ++ show reply
+
                     PeerRequest peerName req -> sendTo peers peerName req
                     PeerReply peerId req -> sendTo responsePeers peerId req
     where
@@ -151,8 +190,8 @@ appendToLog command = do
     }
     return idx
 
-processClientRequestMessage :: ClientID -> Lib.ClientRequest -> ProtoStateMachine ()
-processClientRequestMessage sender command = do
+processClientReqRespMessage :: Lib.ClientRequest -> IdFor Lib.ClientResponse -> ProtoStateMachine ()
+processClientReqRespMessage command pendingResponse = do
     role <- currentRole <$> get
     case role of
         Leader leader -> do
@@ -167,10 +206,11 @@ processClientRequestMessage sender command = do
     refuseClientRequest = do
         myLeader <- currentLeader <$> get
         Trace.trace "Not leader" $ return ()
-        tell [Reply sender $ Left $ Lib.NotLeader myLeader]
+        tell [Reply pendingResponse $ Left $ Lib.NotLeader myLeader]
 
     recordPendingClientRequest idx leader = do
-        return $ leader { pendingClientRequests = Map.insert idx sender $ pendingClientRequests leader}
+        return $ leader { pendingClientRequests = Map.insert idx pendingResponse $ pendingClientRequests leader}
+
 
 laterTermObserved :: Lib.Term -> ProtoStateMachine ()
 laterTermObserved laterTerm = do

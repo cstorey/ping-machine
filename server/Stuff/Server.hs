@@ -28,12 +28,10 @@ main = S.withSocketsDo $ do
     let myName = Lib.PeerName peerPort
     clientAddr <- resolve clientPort
     peerListenAddr <- resolve peerPort
-    ids <- STM.atomically $ STM.newTVar 0
-    clientReqQ <- STM.atomically STM.newTQueue:: IO (STM.TQueue (ClientID,Maybe Lib.ClientRequest))
+    clientReqQ <- STM.atomically STM.newTQueue:: IO (RequestsQ Lib.ClientRequest Lib.ClientResponse)
     peerReqInQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerID,Maybe Lib.PeerRequest))
     peerRespQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (Lib.PeerName,Maybe Lib.PeerResponse))
     ticks <- STM.atomically STM.newTQueue :: IO (STM.TQueue ((),Maybe Tick))
-    clients <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map ClientID (ResponsesOutQ Lib.ClientResponse)))
     requestToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map Lib.PeerName (ResponsesOutQ Lib.PeerRequest)))
     responsesToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map PeerID (ResponsesOutQ Lib.PeerResponse)))
     -- We also need to start a peer manager. This will start a single process
@@ -41,17 +39,14 @@ main = S.withSocketsDo $ do
     -- peers.
     let race = Async.race_
     withTicker ticks $ \ticker ->
-        (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ)
-            `race` (runListener (PeerID <$> nextId ids) peerListenAddr responsesToPeers peerReqInQ)
+        (runReqRespListener (ClientID <$> nextId) clientAddr clientReqQ)
+            `race` (runListener (PeerID <$> nextId) peerListenAddr responsesToPeers peerReqInQ)
             `race` (runOutgoing (Lib.PeerName <$> peerPorts) requestToPeers peerRespQ)
             `race` (Async.wait $ waiter ticker)
-            `race` (runModel myName clientReqQ peerReqInQ peerRespQ clients ticks requestToPeers responsesToPeers)
+            `race` (runModel myName clientReqQ peerReqInQ peerRespQ ticks requestToPeers responsesToPeers)
 
-nextId :: STM.TVar Int -> IO Int
-nextId ids = STM.atomically $ do
-    n <- STM.readTVar ids
-    STM.writeTVar ids (n+1)
-    return n
+nextId :: IO Int
+nextId = STM.atomically nextIdSTM
 
 data Ticker = Ticker {
     waiter :: Async.Async ()

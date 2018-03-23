@@ -1,4 +1,10 @@
-module Stuff.Network where
+module Stuff.Network
+( runListener
+, runOutgoing
+, runReqRespListener
+, resolve
+)
+where
 
 import qualified Lib
 
@@ -164,3 +170,56 @@ processClientRequests outQ clientId inQ (is, os) = do
         Streams.write msg os
         maybe (return ()) (const $ writer_ sender) msg
 
+
+runReqRespListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid)
+    => IO xid
+    -> S.AddrInfo
+    -> RequestsQ req resp
+    -> IO ()
+runReqRespListener newId addr reqs =
+    E.bracket (listenFor addr) S.close (runAcceptor newId $ handleReqRespConn reqs)
+
+handleReqRespConn :: (Show req, Show resp, Show xid)
+            => RequestsQ req resp
+            -> xid
+            -> (Streams.InputStream req, Streams.OutputStream resp)
+            -> IO ()
+
+handleReqRespConn modelQ clientId (is,os) = do
+    processReqRespConn modelQ clientId (is, os)
+
+processReqRespConn :: (Show xid, Show req, Show resp) =>
+       RequestsQ req resp
+    -> xid
+    -> (Streams.InputStream req, Streams.OutputStream resp)
+    -> IO ()
+
+processReqRespConn outQ clientId (is, os) = do
+    pendingResponses <- STM.newTQueueIO :: IO (STM.TQueue (Maybe (STM.TMVar resp)))
+    Async.concurrently_ (reader_ clientId pendingResponses) (writer_ pendingResponses)
+    putStrLn $ "Done: " ++ show clientId
+    where
+    reader_ senderId pendingResponses = do
+        it <- Streams.read is
+        case it of
+            Just msg -> do
+                when False $ putStrLn $ "<- " ++ show clientId ++ ":" ++ show msg
+                STM.atomically $ do
+                  respVar <- STM.newEmptyTMVar
+                  STM.writeTQueue outQ (msg, respVar)
+                  STM.writeTQueue pendingResponses $ Just respVar
+                reader_ senderId pendingResponses
+            Nothing -> STM.atomically $ STM.writeTQueue pendingResponses Nothing
+
+    -- writer_ :: STM.TQueue (Maybe (STM.TMVar _)) -> IO ()
+    writer_ pendingResponses =  do
+        msg <- STM.atomically $ do
+          respp <- STM.readTQueue pendingResponses
+          msg <- case respp of
+            Just respVar -> fmap Just $ STM.takeTMVar respVar
+            Nothing -> return Nothing
+          -- msg <- maybe (return Nothing) (Just <$> STM.readTMVar) respp
+          return msg
+        when False $ putStrLn $ "-> " ++ show clientId ++ ":" ++ show msg
+        Streams.write msg os
+        maybe (return ()) (const $ writer_ pendingResponses) msg

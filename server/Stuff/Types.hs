@@ -2,6 +2,7 @@ module Stuff.Types
 ( ResponsesOutQ
 , RequestsInQ
 , RequestsOutQ
+, RequestsQ
 , ClientID(..)
 , PeerID(..)
 , STMRespChanMap
@@ -16,6 +17,8 @@ import qualified Data.Map as Map
 type ResponsesOutQ resp =  STM.TQueue (Maybe resp)
 type RequestsInQ sender req =  STM.TQueue (sender, Maybe req)
 type RequestsOutQ req =  STM.TQueue (Maybe req)
+
+type RequestsQ req resp =  STM.TQueue (req, STM.TMVar resp)
 
 newtype ClientID = ClientID Int
     deriving (Show, Eq, Ord)
