@@ -40,17 +40,25 @@ main = S.withSocketsDo $ do
     -- for each known peer, attempt to connect, then relay messages to/from
     -- peers.
     let race = Async.race_
-    (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ)
-        `race` (runListener (PeerID <$> nextId ids) peerListenAddr responsesToPeers peerReqInQ)
-        `race` (runOutgoing (Lib.PeerName <$> peerPorts) requestToPeers peerRespQ)
-        `race` (runTicker ticks)
-        `race` (runModel myName clientReqQ peerReqInQ peerRespQ clients ticks requestToPeers responsesToPeers)
+    withTicker ticks $ \ticker ->
+        (runListener (ClientID <$> nextId ids) clientAddr clients clientReqQ)
+            `race` (runListener (PeerID <$> nextId ids) peerListenAddr responsesToPeers peerReqInQ)
+            `race` (runOutgoing (Lib.PeerName <$> peerPorts) requestToPeers peerRespQ)
+            `race` (Async.wait $ waiter ticker)
+            `race` (runModel myName clientReqQ peerReqInQ peerRespQ clients ticks requestToPeers responsesToPeers)
 
 nextId :: STM.TVar Int -> IO Int
 nextId ids = STM.atomically $ do
     n <- STM.readTVar ids
     STM.writeTVar ids (n+1)
     return n
+
+data Ticker = Ticker {
+    waiter :: Async.Async ()
+}
+
+withTicker :: STM.TQueue ((), Maybe Tick) -> (Ticker  -> IO a) -> IO a
+withTicker ticks f = Async.withAsync (runTicker ticks) $ \ticker -> f $ Ticker ticker
 
 runTicker :: STM.TQueue ((), Maybe Tick) -> IO ()
 runTicker ticks = void $ forever $ do
