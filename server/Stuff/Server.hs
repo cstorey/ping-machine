@@ -29,21 +29,20 @@ main = S.withSocketsDo $ do
     clientAddr <- resolve clientPort
     peerListenAddr <- resolve peerPort
     clientReqQ <- STM.atomically STM.newTQueue:: IO (RequestsQ Lib.ClientRequest Lib.ClientResponse)
-    peerReqInQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (PeerID,Maybe Lib.PeerRequest))
+    peerReqInQ <- STM.atomically STM.newTQueue :: IO (RequestsQ Lib.PeerRequest Lib.PeerResponse)
     peerRespQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (Lib.PeerName,Maybe Lib.PeerResponse))
     ticks <- STM.atomically STM.newTQueue :: IO (STM.TQueue ((),Maybe Tick))
     requestToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map Lib.PeerName (ResponsesOutQ Lib.PeerRequest)))
-    responsesToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map PeerID (ResponsesOutQ Lib.PeerResponse)))
     -- We also need to start a peer manager. This will start a single process
     -- for each known peer, attempt to connect, then relay messages to/from
     -- peers.
     let race = Async.race_
     withTicker ticks $ \ticker ->
         (runReqRespListener (ClientID <$> nextId) clientAddr clientReqQ)
-            `race` (runListener (PeerID <$> nextId) peerListenAddr responsesToPeers peerReqInQ)
+            `race` (runReqRespListener (PeerID <$> nextId) peerListenAddr peerReqInQ)
             `race` (runOutgoing (Lib.PeerName <$> peerPorts) requestToPeers peerRespQ)
             `race` (Async.wait $ waiter ticker)
-            `race` (runModel myName clientReqQ peerReqInQ peerRespQ ticks requestToPeers responsesToPeers)
+            `race` (runModel myName clientReqQ peerReqInQ peerRespQ ticks requestToPeers )
 
 nextId :: IO Int
 nextId = STM.atomically nextIdSTM

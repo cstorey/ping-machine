@@ -29,8 +29,10 @@ newtype IdFor a = IdFor Int
 
 data ProcessorMessage = Reply (IdFor Lib.ClientResponse) Lib.ClientResponse
     | PeerRequest Lib.PeerName Lib.PeerRequest
-    | PeerReply PeerID Lib.PeerResponse
+    | PeerReply (IdFor Lib.PeerResponse) Lib.PeerResponse
     deriving (Show)
+
+type STMPendingRespMap resp = STM.TVar (Map.Map (IdFor resp) (STM.TMVar resp))
 
 data ProtocolEnv = ProtocolEnv {
     selfId :: Lib.PeerName,
@@ -93,20 +95,20 @@ nextIdSTM = do
 
 runModel :: Lib.PeerName
             -> RequestsQ Lib.ClientRequest Lib.ClientResponse
-            -> RequestsInQ PeerID Lib.PeerRequest
+            -> RequestsQ Lib.PeerRequest Lib.PeerResponse
             -> RequestsInQ Lib.PeerName Lib.PeerResponse
             -> RequestsInQ () Tick
             -> STMRespChanMap Lib.PeerName Lib.PeerRequest
-            -> STMRespChanMap PeerID Lib.PeerResponse
             -> IO ()
-runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts responsePeers = do
+runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
     stateRef <- STM.atomically $ STM.newTVar $ RaftState newFollower 0 Map.empty Nothing 0 Nothing
     pendingClientResponses <- STM.atomically $ STM.newTVar $ Map.empty
+    pendingPeerResponses <- STM.atomically $ STM.newTVar $ Map.empty
 
     let protocolEnv = ProtocolEnv myName <$> (Map.keys <$> STM.readTVar peerOuts)
     let processClientMessage = processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
+    let processPeerRequest = processReqRespMessageSTM stateRef protocolEnv pendingPeerResponses peerReqInQ processPeerRequestMessage
     let processTickMessage = processMessageSTM stateRef protocolEnv ticks processTick
-    let processPeerRequest = processMessageSTM stateRef protocolEnv peerReqInQ processPeerRequestMessage
     let processPeerResponse = processMessageSTM stateRef protocolEnv peerRespInQ processPeerResponseMessage
 
 
@@ -116,7 +118,7 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts responsePeers = do
             putStrLn $ "Env: " ++ show env
         (_st', outputs) <- STM.atomically $ do
             outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
-            sendMessages pendingClientResponses peerOuts responsePeers outputs
+            sendMessages pendingClientResponses peerOuts pendingPeerResponses outputs
             st' <- STM.readTVar stateRef
             return (st', outputs)
         when False $ putStrLn $ "state now: " ++ show _st'
@@ -140,7 +142,7 @@ processMessageSTM stateRef envSTM reqQ process = do
 
 processReqRespMessageSTM :: STM.TVar RaftState
                   -> STM.STM ProtocolEnv
-                  -> STM.TVar (Map.Map (IdFor resp) (STM.TMVar resp))
+                  -> STMPendingRespMap resp
                   -> RequestsQ req resp
                   -> (req -> IdFor resp -> ProtoStateMachine ())
                   -> STM.STM [ProcessorMessage]
@@ -155,29 +157,29 @@ processReqRespMessageSTM stateRef envSTM pendingResponses reqQ process = do
   STM.writeTVar stateRef s'
   return toSend
 
-sendMessages :: STM.TVar (Map.Map (IdFor Lib.ClientResponse) (STM.TMVar Lib.ClientResponse))
+sendMessages :: STMPendingRespMap Lib.ClientResponse
              -> STMRespChanMap Lib.PeerName Lib.PeerRequest
-             -> STMRespChanMap PeerID Lib.PeerResponse
+             -> STMPendingRespMap Lib.PeerResponse
              -> [ProcessorMessage]
              -> STM.STM ()
-sendMessages pendingClientResponses peers responsePeers toSend = do
+sendMessages pendingClientResponses peers pendingPeerResponses toSend = do
             forM_ toSend $ \msg' -> do
                 case msg' of
-                    Reply respId reply -> do
-                      mvarp <- Map.lookup respId <$> STM.readTVar pendingClientResponses
-                      case mvarp of
-                          Just mvar -> STM.putTMVar mvar reply
-                          Nothing -> error $ "No mvar for response id " ++ show respId ++ " : " ++ show reply
-
+                    Reply respId reply -> sendPendingReply pendingClientResponses respId reply
                     PeerRequest peerName req -> sendTo peers peerName req
-                    PeerReply peerId req -> sendTo responsePeers peerId req
+                    PeerReply respId reply -> sendPendingReply pendingPeerResponses respId reply
     where
         sendTo mapping xid msg = do
             queuep <- Map.lookup xid <$> STM.readTVar mapping
             case queuep of
                 Just q -> STM.writeTQueue q $ Just msg
                 Nothing -> error "what?"
-
+        sendPendingReply mapping respId reply = do
+          mvarp <- Map.lookup respId <$> STM.readTVar mapping
+          STM.modifyTVar mapping $ Map.delete respId
+          case mvarp of
+              Just mvar -> STM.putTMVar mvar reply
+              Nothing -> error $ "No mvar for response id " ++ show respId ++ " : " ++ show reply
 
 appendToLog :: Lib.ClientRequest -> ProtoStateMachine Lib.LogIdx
 appendToLog command = do
@@ -252,8 +254,8 @@ getMajority = do
     memberCount <- succ . length <$> asks peerNames
     return $ succ (memberCount `div` 2)
 
-processPeerRequestMessage :: PeerID -> Lib.PeerRequest -> ProtoStateMachine ()
-processPeerRequestMessage sender (Lib.RequestVote candidateTerm candidateName candidateIdx) = do
+processPeerRequestMessage :: Lib.PeerRequest -> IdFor Lib.PeerResponse -> ProtoStateMachine ()
+processPeerRequestMessage (Lib.RequestVote candidateTerm candidateName candidateIdx) sender = do
     thisTerm <- currentTerm <$> get
     vote <- votedFor <$> get
     (_prevTerm, logIdx) <- getPrevLogTermIdx
@@ -286,8 +288,8 @@ processPeerRequestMessage sender (Lib.RequestVote candidateTerm candidateName ca
             modify $ \st -> st { votedFor = Just candidateName }
             tell [PeerReply sender $ Lib.VoteResult thisTerm True]
 
-processPeerRequestMessage sender
-    _msg@(Lib.AppendEntries (Lib.AppendEntriesReq leaderTerm leaderName prevTerm prevIdx newEntries)) = do
+processPeerRequestMessage
+    _msg@(Lib.AppendEntries (Lib.AppendEntriesReq leaderTerm leaderName prevTerm prevIdx newEntries)) reqId = do
     -- prevTick <- prevTickTime <$> get
     Trace.trace ("Append Entries: " ++ show _msg) $ return ()
 
@@ -316,9 +318,9 @@ processPeerRequestMessage sender
 
     where
         refuseAppendEntries :: Lib.Term -> ProtoStateMachine ()
-        refuseAppendEntries thisTerm = tell [PeerReply sender $ Lib.AppendResult thisTerm False]
+        refuseAppendEntries thisTerm = tell [PeerReply reqId $ Lib.AppendResult thisTerm False]
         ackAppendEntries :: Lib.Term -> ProtoStateMachine ()
-        ackAppendEntries thisTerm = tell [PeerReply sender $ Lib.AppendResult thisTerm True]
+        ackAppendEntries thisTerm = tell [PeerReply reqId $ Lib.AppendResult thisTerm True]
 
         whenFollower thisTerm follower = do
 
