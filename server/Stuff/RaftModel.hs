@@ -27,10 +27,74 @@ import Stuff.Types
 newtype IdFor a = IdFor Int
     deriving (Show, Eq, Ord)
 
+{-
+
+Suspicions
+We need to be able to inform the model when a response has landed. We used to do this via the
+processPeerResponseMessage function. However, what we need to be able to do is:
+a) Send a message to the peer,
+b) Handle the response.
+
+So, whenever the model needs to send a message to a peer, we should:
+* Create a new response mvar
+* Send the request + mvar to the outgoing peer bits
+* push the respose mvar onto the back of a per peer dequeue
+
+And then on each iteration, we have a per peer stm action, that:
+* Takes the value of the head of the per peer mvar queue
+* Drops it from the queue
+* Injects the response into the model.
+
+
+On the other hand, for each request, we kinda need to know what the response
+is _to_, so for AppendEntries, what it's acking. So, like, maybe we need to
+stash a continuation for the rest of the workflow instead? No? ...
+
+Maybe we should reconsider what we're doing After all.
+
+At each point in time, we should keep a note of the outgoing requests we've
+made, along with the last offset . 
+* Receive AppendEntries response.
+* Update acked offset _for that follower_
+* Then derive the committed offset from a quorum of items.
+
+So, what we need do is update the acked offset for the follower with
+max(oldOffset, acked) So we need to route the response to a per follower
+widget. Queue? Sub-process (ie: alternative case for STM)
+
+---
+
+Alternatively, use a callback type approach? 
+
+Ie: schedule an action to be run once a rpc has completed? Eg:
+
+sendRequestVoteRpc ... $ \case
+  Granted -> do
+    ...
+  Rejected peerTerm -> do
+    ...
+
+-}
+
+type Receiver a = a -> ProtoStateMachine ()
+
+-- Maybe generalise Receiver to some contrafunctor?
 data ProcessorMessage = Reply (IdFor Lib.ClientResponse) Lib.ClientResponse
-    | PeerRequest Lib.PeerName Lib.PeerRequest
     | PeerReply (IdFor Lib.PeerResponse) Lib.PeerResponse
+    | PeerRequest Lib.PeerName Lib.PeerRequest (Receiver Lib.PeerResponse)
+
+instance Show ProcessorMessage where
+  show (Reply reqid resp) = "Reply " ++ show reqid ++ " " ++ show resp
+  show (PeerReply reqid resp) = "PeerReply " ++ show reqid ++ " " ++ show resp
+  show (PeerRequest name req _) = "PeerRequest " ++ show name ++ " " ++ show req ++ " #<action>"
+
+{- 
+data ProcessorMessage = Reply (IdFor Lib.ClientResponse) Lib.ClientResponse
+    | PeerReply (IdFor Lib.PeerResponse) Lib.PeerResponse
+    | RequestVote Lib.Term Lib.PeerName Lib.LogIdx Lib.PeerName (Receiver Lib.VoteResult)
+    | RequestAppend Lib.PeerName Lib.AppendEntriesReq (Receiver Lib.AppendResult)
     deriving (Show)
+-}
 
 type STMPendingRespMap resp = STM.TVar (Map.Map (IdFor resp) (STM.TMVar resp))
 
@@ -98,12 +162,17 @@ runModel :: Lib.PeerName
             -> RequestsQ Lib.PeerRequest Lib.PeerResponse
             -> RequestsInQ Lib.PeerName Lib.PeerResponse
             -> RequestsInQ () Tick
-            -> STMRespChanMap Lib.PeerName Lib.PeerRequest
+            -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse
             -> IO ()
 runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
     stateRef <- STM.atomically $ STM.newTVar $ RaftState newFollower 0 Map.empty Nothing 0 Nothing
+    -- incoming requests _from_ clients
     pendingClientResponses <- STM.atomically $ STM.newTVar $ Map.empty
+    -- requests _from_ peers that are due a response
+    -- map of ids of requests from peer to their pending responses.
     pendingPeerResponses <- STM.atomically $ STM.newTVar $ Map.empty
+    -- Responses that we are awaiting _from_ peers.
+    outstandingRequestsToPeers <- STM.atomically $ STM.newTVar $ Map.empty
 
     let protocolEnv = ProtocolEnv myName <$> (Map.keys <$> STM.readTVar peerOuts)
     let processClientMessage = processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
@@ -118,7 +187,7 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
             putStrLn $ "Env: " ++ show env
         (_st', outputs) <- STM.atomically $ do
             outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
-            sendMessages pendingClientResponses peerOuts pendingPeerResponses outputs
+            sendMessages pendingClientResponses peerOuts outstandingRequestsToPeers pendingPeerResponses outputs
             st' <- STM.readTVar stateRef
             return (st', outputs)
         when False $ putStrLn $ "state now: " ++ show _st'
@@ -158,28 +227,37 @@ processReqRespMessageSTM stateRef envSTM pendingResponses reqQ process = do
   return toSend
 
 sendMessages :: STMPendingRespMap Lib.ClientResponse
-             -> STMRespChanMap Lib.PeerName Lib.PeerRequest
+             -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse
+	     -> STM.TVar (Map.Map Lib.PeerName [(STM.TMVar Lib.PeerResponse, Receiver Lib.PeerResponse)])
              -> STMPendingRespMap Lib.PeerResponse
              -> [ProcessorMessage]
              -> STM.STM ()
-sendMessages pendingClientResponses peers pendingPeerResponses toSend = do
+sendMessages pendingClientResponses peerRequests outstandingRequestsToPeers
+	     pendingPeerResponses toSend = do
             forM_ toSend $ \msg' -> do
                 case msg' of
                     Reply respId reply -> sendPendingReply pendingClientResponses respId reply
-                    PeerRequest peerName req -> sendTo peers peerName req
                     PeerReply respId reply -> sendPendingReply pendingPeerResponses respId reply
+                    PeerRequest peerName req k -> sendRequest peerRequests peerName req k
     where
-        sendTo mapping xid msg = do
-            queuep <- Map.lookup xid <$> STM.readTVar mapping
-            case queuep of
-                Just q -> STM.writeTQueue q $ Just msg
-                Nothing -> error "what?"
         sendPendingReply mapping respId reply = do
           mvarp <- Map.lookup respId <$> STM.readTVar mapping
           STM.modifyTVar mapping $ Map.delete respId
           case mvarp of
               Just mvar -> STM.putTMVar mvar reply
               Nothing -> error $ "No mvar for response id " ++ show respId ++ " : " ++ show reply
+
+        sendRequest mapping xid msg k = do
+	    respMVar <- STM.newEmptyTMVar
+            queuep <- Map.lookup xid <$> STM.readTVar mapping
+            case queuep of
+                Just q -> do
+		  STM.modifyTVar outstandingRequestsToPeers $ Map.insertWith (++) xid [(respMVar, k)]
+		  STM.writeTQueue q $ (msg, respMVar)
+                Nothing -> error "what?"
+
+	    (error "something something process callback action in k")
+
 
 appendToLog :: Lib.ClientRequest -> ProtoStateMachine Lib.LogIdx
 appendToLog command = do
@@ -490,7 +568,7 @@ processTick () (Tick t) = do
         thisTerm <- currentTerm <$> get
         (_prevTerm, prevIdx) <- getPrevLogTermIdx
         let req = Lib.RequestVote thisTerm myId prevIdx
-        tell $ map (\p -> PeerRequest p req) peers
+        tell $ map (\p -> PeerRequest p req $ processPeerResponseMessage p) peers
         Trace.trace ("transitionToCandidate new term: " ++ show thisTerm) $ return ()
 
     whenCandidate candidate = do
@@ -533,7 +611,10 @@ replicatePendingEntriesToFollowers leader = do
         let peerPrevTerm = maybe prevTerm Lib.logTerm $ Map.lookup peerPrevIdx entries
         -- Send everything _after_ their previous index
         let toSend = snd $ Map.split peerPrevIdx entries
-        let req = Lib.AppendEntries $ Lib.AppendEntriesReq thisTerm myId peerPrevTerm peerPrevIdx toSend
-        tell $ [PeerRequest peer req]
+        sendPeerRequest peer $ Lib.AppendEntries $ Lib.AppendEntriesReq thisTerm myId peerPrevTerm peerPrevIdx toSend
         let peerIdx' = maybe peerPrevIdx fst $ Map.lookupMax toSend
         return $ Map.insert peer peerIdx' lastSentTo
+
+
+sendPeerRequest :: Lib.PeerName -> Lib.PeerRequest -> ProtoStateMachine ()
+sendPeerRequest peer req = tell [PeerRequest peer req $ processPeerResponseMessage peer]
