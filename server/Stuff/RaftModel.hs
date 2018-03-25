@@ -318,9 +318,9 @@ processPeerRequestMessage
 
     where
         refuseAppendEntries :: Lib.Term -> ProtoStateMachine ()
-        refuseAppendEntries thisTerm = tell [PeerReply reqId $ Lib.AppendResult thisTerm False]
+        refuseAppendEntries thisTerm = tell [PeerReply reqId $ Lib.AppendResult $ Lib.AppendEntriesResponse thisTerm False]
         ackAppendEntries :: Lib.Term -> ProtoStateMachine ()
-        ackAppendEntries thisTerm = tell [PeerReply reqId $ Lib.AppendResult thisTerm True]
+        ackAppendEntries thisTerm = tell [PeerReply reqId $ Lib.AppendResult $ Lib.AppendEntriesResponse thisTerm True]
 
         whenFollower thisTerm follower = do
 
@@ -391,7 +391,7 @@ processPeerResponseMessage _sender _msg@(Lib.VoteResult peerTerm granted) = do
         else
             return ()
 
-processPeerResponseMessage sender _msg@(Lib.AppendResult _term granted) = do
+processPeerResponseMessage sender _msg@(Lib.AppendResult aer) = do
     Trace.trace ("processPeerResponseMessage: " ++ show _msg) $ return ()
     role <- currentRole <$> get
     case role of
@@ -407,7 +407,7 @@ processPeerResponseMessage sender _msg@(Lib.AppendResult _term granted) = do
         let lastSent = followerLastSent leader
         case Map.lookup sender lastSent of
             Just sentIdx -> do
-                if granted
+                if Lib.aerSucceeded aer
                 then do
                     let followerPrevIdx' = Map.insert sender sentIdx $ followerPrevIdx leader
                     committedIdx <- findCommittedIndex followerPrevIdx'

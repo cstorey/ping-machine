@@ -14,6 +14,7 @@ module Lib
     , PeerName(..)
     , Term
     , AppendEntriesReq(..)
+    , AppendEntriesResponse(..)
     ) where
 
 import GHC.Generics
@@ -71,9 +72,15 @@ data PeerRequest =
   deriving (Show, Generic)
 instance Binary.Binary PeerRequest
 
+data AppendEntriesResponse = AppendEntriesResponse {
+  aerTerm :: Term
+, aerSucceeded :: Bool
+} deriving (Show, Generic)
+instance Binary.Binary AppendEntriesResponse
+
 data PeerResponse =
     VoteResult Term Bool
-  | AppendResult Term Bool
+  | AppendResult AppendEntriesResponse
   deriving (Show, Generic)
 instance Binary.Binary PeerResponse
 
