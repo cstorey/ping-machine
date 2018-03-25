@@ -53,7 +53,7 @@ stash a continuation for the rest of the workflow instead? No? ...
 Maybe we should reconsider what we're doing After all.
 
 At each point in time, we should keep a note of the outgoing requests we've
-made, along with the last offset . 
+made, along with the last offset .
 * Receive AppendEntries response.
 * Update acked offset _for that follower_
 * Then derive the committed offset from a quorum of items.
@@ -64,7 +64,7 @@ widget. Queue? Sub-process (ie: alternative case for STM)
 
 ---
 
-Alternatively, use a callback type approach? 
+Alternatively, use a callback type approach?
 
 Ie: schedule an action to be run once a rpc has completed? Eg:
 
@@ -88,7 +88,7 @@ instance Show ProcessorMessage where
   show (PeerReply reqid resp) = "PeerReply " ++ show reqid ++ " " ++ show resp
   show (PeerRequest name req _) = "PeerRequest " ++ show name ++ " " ++ show req ++ " #<action>"
 
-{- 
+{-
 data ProcessorMessage = Reply (IdFor Lib.ClientResponse) Lib.ClientResponse
     | PeerReply (IdFor Lib.PeerResponse) Lib.PeerResponse
     | RequestVote Lib.Term Lib.PeerName Lib.LogIdx Lib.PeerName (Receiver Lib.VoteResult)
@@ -160,9 +160,9 @@ nextIdSTM = do
 runModel :: Lib.PeerName
             -> RequestsQ Lib.ClientRequest Lib.ClientResponse
             -> RequestsQ Lib.PeerRequest Lib.PeerResponse
-            -> RequestsInQ Lib.PeerName Lib.PeerResponse
+            -> STM.TQueue (ProtoStateMachine ())
             -> RequestsInQ () Tick
-            -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse
+            -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse (ProtoStateMachine ())
             -> IO ()
 runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
     stateRef <- STM.atomically $ STM.newTVar $ RaftState newFollower 0 Map.empty Nothing 0 Nothing
@@ -172,13 +172,12 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
     -- map of ids of requests from peer to their pending responses.
     pendingPeerResponses <- STM.atomically $ STM.newTVar $ Map.empty
     -- Responses that we are awaiting _from_ peers.
-    outstandingRequestsToPeers <- STM.atomically $ STM.newTVar $ Map.empty
 
     let protocolEnv = ProtocolEnv myName <$> (Map.keys <$> STM.readTVar peerOuts)
     let processClientMessage = processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
     let processPeerRequest = processReqRespMessageSTM stateRef protocolEnv pendingPeerResponses peerReqInQ processPeerRequestMessage
     let processTickMessage = processMessageSTM stateRef protocolEnv ticks processTick
-    let processPeerResponse = processMessageSTM stateRef protocolEnv peerRespInQ processPeerResponseMessage
+    let processPeerResponse = processRespMessageSTM stateRef protocolEnv peerRespInQ
 
 
     forever $ do
@@ -187,7 +186,7 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
             putStrLn $ "Env: " ++ show env
         (_st', outputs) <- STM.atomically $ do
             outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
-            sendMessages pendingClientResponses peerOuts outstandingRequestsToPeers pendingPeerResponses outputs
+            sendMessages pendingClientResponses peerOuts pendingPeerResponses outputs
             st' <- STM.readTVar stateRef
             return (st', outputs)
         when False $ putStrLn $ "state now: " ++ show _st'
@@ -209,6 +208,18 @@ processMessageSTM stateRef envSTM reqQ process = do
             return toSend
         Nothing -> return []
 
+processRespMessageSTM :: STM.TVar RaftState
+                               -> STM.STM ProtocolEnv
+                               -> STM.TQueue (ProtoStateMachine ())
+                               -> STM.STM [ProcessorMessage]
+processRespMessageSTM stateRef envSTM reqQ = do
+    action <- STM.readTQueue reqQ
+    s <- STM.readTVar stateRef
+    env <- envSTM
+    let ((), s', toSend) = RWS.runRWS (runProto $ action) env s
+    STM.writeTVar stateRef s'
+    return toSend
+
 processReqRespMessageSTM :: STM.TVar RaftState
                   -> STM.STM ProtocolEnv
                   -> STMPendingRespMap resp
@@ -227,13 +238,11 @@ processReqRespMessageSTM stateRef envSTM pendingResponses reqQ process = do
   return toSend
 
 sendMessages :: STMPendingRespMap Lib.ClientResponse
-             -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse
-	     -> STM.TVar (Map.Map Lib.PeerName [(STM.TMVar Lib.PeerResponse, Receiver Lib.PeerResponse)])
+             -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse (ProtoStateMachine ())
              -> STMPendingRespMap Lib.PeerResponse
              -> [ProcessorMessage]
              -> STM.STM ()
-sendMessages pendingClientResponses peerRequests outstandingRequestsToPeers
-	     pendingPeerResponses toSend = do
+sendMessages pendingClientResponses peerRequests pendingPeerResponses toSend = do
             forM_ toSend $ \msg' -> do
                 case msg' of
                     Reply respId reply -> sendPendingReply pendingClientResponses respId reply
@@ -248,16 +257,11 @@ sendMessages pendingClientResponses peerRequests outstandingRequestsToPeers
               Nothing -> error $ "No mvar for response id " ++ show respId ++ " : " ++ show reply
 
         sendRequest mapping xid msg k = do
-	    respMVar <- STM.newEmptyTMVar
             queuep <- Map.lookup xid <$> STM.readTVar mapping
             case queuep of
                 Just q -> do
-		  STM.modifyTVar outstandingRequestsToPeers $ Map.insertWith (++) xid [(respMVar, k)]
-		  STM.writeTQueue q $ (msg, respMVar)
+                  STM.writeTQueue q $ (msg, k)
                 Nothing -> error "what?"
-
-	    (error "something something process callback action in k")
-
 
 appendToLog :: Lib.ClientRequest -> ProtoStateMachine Lib.LogIdx
 appendToLog command = do

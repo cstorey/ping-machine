@@ -5,6 +5,7 @@ module Stuff.Types
 , RequestsQ
 , ClientID(..)
 , PeerID(..)
+, OutgoingReqQ
 , STMReqChanMap
 , Time
 , Tick(..)
@@ -27,8 +28,10 @@ newtype ClientID = ClientID Int
 newtype PeerID = PeerID Int
     deriving (Show, Eq, Ord)
 
--- 
-type STMReqChanMap xid req resp = STM.TVar (Map.Map xid (RequestsQ req resp))
+--
+type OutgoingReqQ req resp r = (STM.TQueue (req, resp -> r))
+type STMReqChanMap xid req resp r = STM.TVar (Map.Map xid (OutgoingReqQ req resp r))
+
 
 type Time = Double
 data Tick = Tick Time

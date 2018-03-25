@@ -27,8 +27,8 @@ oneSecondMicroSeconds = 1000000
 
 -- Supervisor
 runOutgoing :: [Lib.PeerName]
-            -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse
-            -> RequestsInQ Lib.PeerName Lib.PeerResponse
+            -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse r
+            -> STM.TQueue r
             -> IO ()
 runOutgoing seedPeers peers peerRespQ = do
     putStrLn $ "peers:" ++ show seedPeers
@@ -41,7 +41,7 @@ runOutgoing seedPeers peers peerRespQ = do
         forM_ toStart $ \name -> do
             q <- STM.newTQueueIO
             putStrLn $ "Starting: " ++ show name
-            a <- Async.async $ runPeer peerRespQ name
+            a <- Async.async $ runPeer q peerRespQ name
             STM.atomically $ do
                 STM.modifyTVar peers $ Map.insert name q
                 STM.modifyTVar processes $ Map.insert a name
@@ -72,15 +72,15 @@ connect addr = do
     return sock
 
 runPeer :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp)
-	=> RequestsQ req resp -> Lib.PeerName -> IO ()
-runPeer toPeerQ name = do
+        => OutgoingReqQ req resp r -> STM.TQueue r -> Lib.PeerName -> IO ()
+runPeer toPeerQ fromPeerQ name = do
     Trace.trace ("lookup peer " ++ show name) $ return ()
     addrInfo <- resolve $ Lib.unPeerName name
     Trace.trace ("initiate open " ++ show name) $ return ()
     (is, os) <- streamsOf =<< connect addrInfo
 
     Trace.trace ("Talking to peer " ++ show name) $ return ()
-    processOutgoingConnection toPeerQ name (is, os)
+    processOutgoingConnection toPeerQ fromPeerQ name (is, os)
     Trace.trace ("Finished with peer " ++ show name) $ return ()
 
 resolve :: S.ServiceName -> IO S.AddrInfo
@@ -89,7 +89,7 @@ resolve port = do
             S.addrFlags = [S.AI_PASSIVE]
         , S.addrSocketType = S.Stream
         }
-    addr:_ <- S.getAddrInfo (Just hints) Nothing (Just port)
+    addr:_ <- S.getAddrInfo (Just hints) (Just "127.0.0.1") (Just port)
     return addr
 
 listenFor :: S.AddrInfo -> IO S.Socket
@@ -122,36 +122,37 @@ runAcceptor newId handler listener = go
                 E.bracket (streamsOf client) (const $ S.close client) (handler n)
 
 processOutgoingConnection :: (Show xid, Show req, Show resp) =>
-       RequestsQ req resp
+       OutgoingReqQ req resp r
+    -> STM.TQueue r
     -> xid
-    -> (Streams.InputStream req, Streams.OutputStream resp)
+    -> (Streams.InputStream resp, Streams.OutputStream req)
     -> IO ()
 
-processOutgoingConnection reqQ clientId (is, os) = do
+processOutgoingConnection reqQ respQ clientId (is, os) = do
     pendingResponses <- STM.newTQueueIO
-    Async.concurrently_ (requests pendingResponses) (responses pendingResponses) 
+    Async.concurrently_ (requests pendingResponses) (responses pendingResponses)
     putStrLn $ "Done: " ++ show clientId
     where
-    requests pendingResponses =  do
+    requests pendingResponses = do
         msg <- STM.atomically $ do
-	  (msg, respVar) <- STM.readTQueue reqQ
-	  STM.writeTQueue pendingResponses respVar
-	  return msg
-	  
+          (msg, k) <- STM.readTQueue reqQ
+          STM.writeTQueue pendingResponses k
+          return msg
+
         when False $ putStrLn $ "-> " ++ show clientId ++ ":" ++ show msg
 
-        Streams.write msg os
-        maybe (return ()) (const $ writer_ pendingResponses) msg
+        Streams.write (Just msg) os
+        requests pendingResponses
 
     responses pendingResponses = do
         it <- Streams.read is
         case it of
             Just msg -> do
                 when False $ putStrLn $ "<- " ++ show clientId ++ ":" ++ show msg
-		STM.atomically $ do 
-		  respVar <- STM.readTQueue outQ
-		  STM.putTMVar respVar msg
-                reader_ senderId writerQ
+                STM.atomically $ do
+                  k <- STM.readTQueue pendingResponses
+                  STM.writeTQueue respQ $ k msg
+                responses pendingResponses
             Nothing -> error $ "Well, I'm done: " ++ show clientId
 
 

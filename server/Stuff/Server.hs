@@ -30,9 +30,9 @@ main = S.withSocketsDo $ do
     peerListenAddr <- resolve peerPort
     clientReqQ <- STM.atomically STM.newTQueue:: IO (RequestsQ Lib.ClientRequest Lib.ClientResponse)
     peerReqInQ <- STM.atomically STM.newTQueue :: IO (RequestsQ Lib.PeerRequest Lib.PeerResponse)
-    peerRespQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (Lib.PeerName,Maybe Lib.PeerResponse))
+    peerRespQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (m ()))
     ticks <- STM.atomically STM.newTQueue :: IO (STM.TQueue ((),Maybe Tick))
-    requestToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STM.TVar (Map.Map Lib.PeerName (ResponsesOutQ Lib.PeerRequest)))
+    requestToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse (m ()))
     -- We also need to start a peer manager. This will start a single process
     -- for each known peer, attempt to connect, then relay messages to/from
     -- peers.
