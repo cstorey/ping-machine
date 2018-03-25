@@ -17,7 +17,7 @@ import Control.Monad
 
 import Stuff.Types
 import Stuff.Network
-import Stuff.RaftModel
+import Stuff.RaftDriver
 
 now :: IO Time
 now = fromRational . toRational <$> Clock.getPOSIXTime
