@@ -5,7 +5,7 @@ module Stuff.Network
 )
 where
 
-import qualified Lib
+import qualified Stuff.Proto as Proto
 
 import qualified Network.Socket            as S
 import qualified System.IO.Streams         as Streams
@@ -26,8 +26,8 @@ oneSecondMicroSeconds :: Int
 oneSecondMicroSeconds = 1000000
 
 -- Supervisor
-runOutgoing :: [Lib.PeerName]
-            -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse r
+runOutgoing :: [Proto.PeerName]
+            -> STMReqChanMap Proto.PeerName Proto.PeerRequest Proto.PeerResponse r
             -> STM.TQueue r
             -> IO ()
 runOutgoing seedPeers peers peerRespQ = do
@@ -72,10 +72,10 @@ connect addr = do
     return sock
 
 runPeer :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp)
-        => OutgoingReqQ req resp r -> STM.TQueue r -> Lib.PeerName -> IO ()
+        => OutgoingReqQ req resp r -> STM.TQueue r -> Proto.PeerName -> IO ()
 runPeer toPeerQ fromPeerQ name = do
     Trace.trace ("lookup peer " ++ show name) $ return ()
-    addrInfo <- resolve $ Lib.unPeerName name
+    addrInfo <- resolve $ Proto.unPeerName name
     Trace.trace ("initiate open " ++ show name) $ return ()
     (is, os) <- streamsOf =<< connect addrInfo
 

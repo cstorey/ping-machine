@@ -8,7 +8,7 @@ module Stuff.RaftDriver
 where
 
 
-import qualified Lib
+import qualified Stuff.Proto as Proto
 
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Concurrent.STM as STM
@@ -32,12 +32,12 @@ nextIdSTM = do
     STM.writeTVar nextIds (succ n)
     return n
 
-runModel :: Lib.PeerName
-            -> RequestsQ Lib.ClientRequest Lib.ClientResponse
-            -> RequestsQ Lib.PeerRequest Lib.PeerResponse
+runModel :: Proto.PeerName
+            -> RequestsQ Proto.ClientRequest Proto.ClientResponse
+            -> RequestsQ Proto.PeerRequest Proto.PeerResponse
             -> STM.TQueue (ProtoStateMachine ())
             -> RequestsInQ () Tick
-            -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse (ProtoStateMachine ())
+            -> STMReqChanMap Proto.PeerName Proto.PeerRequest Proto.PeerResponse (ProtoStateMachine ())
             -> IO ()
 runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
     stateRef <- STM.atomically $ STM.newTVar $ mkRaftState
@@ -112,9 +112,9 @@ processReqRespMessageSTM stateRef envSTM pendingResponses reqQ process = do
   STM.writeTVar stateRef s'
   return toSend
 
-sendMessages :: STMPendingRespMap Lib.ClientResponse
-             -> STMReqChanMap Lib.PeerName Lib.PeerRequest Lib.PeerResponse (ProtoStateMachine ())
-             -> STMPendingRespMap Lib.PeerResponse
+sendMessages :: STMPendingRespMap Proto.ClientResponse
+             -> STMReqChanMap Proto.PeerName Proto.PeerRequest Proto.PeerResponse (ProtoStateMachine ())
+             -> STMPendingRespMap Proto.PeerResponse
              -> [ProcessorMessage]
              -> STM.STM ()
 sendMessages pendingClientResponses peerRequests pendingPeerResponses toSend = do

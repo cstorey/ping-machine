@@ -1,7 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
-module Lib
+module Stuff.Proto
     (
       ClientRequest(..)
     , ClientResult(..)
