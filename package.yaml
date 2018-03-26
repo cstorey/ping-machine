@@ -70,7 +70,7 @@ executables:
 
 tests:
   stuff-hs-test:
-    main:                Spec.hs
+    main:                Tests
     source-dirs:         test
     ghc-options:
     - -threaded
