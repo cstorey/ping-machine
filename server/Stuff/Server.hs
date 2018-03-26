@@ -5,6 +5,7 @@ module Stuff.Server where
 
 import qualified Lib
 
+import           System.IO (BufferMode(..), hSetBuffering, stdout, stderr)
 import qualified Network.Socket            as S
 import qualified System.Environment as Env
 import qualified Control.Concurrent.STM as STM
@@ -24,6 +25,9 @@ now = fromRational . toRational <$> Clock.getPOSIXTime
 
 main ::  IO ()
 main = S.withSocketsDo $ do
+    hSetBuffering stdout LineBuffering
+    hSetBuffering stderr LineBuffering
+
     clientPort : peerPort : peerPorts <- Env.getArgs
     let myName = Lib.PeerName peerPort
     clientAddr <- resolve clientPort
