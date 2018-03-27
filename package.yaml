@@ -70,7 +70,7 @@ executables:
 
 tests:
   stuff-hs-test:
-    main:                Tests
+    main:                Spec.hs
     source-dirs:         test
     ghc-options:
     - -threaded
@@ -81,3 +81,5 @@ tests:
     - -Wincomplete-uni-patterns
     dependencies:
     - stuff-hs
+    - hspec
+    - hspec-discover
