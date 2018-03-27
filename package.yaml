@@ -35,6 +35,7 @@ dependencies:
 - random
 - mtl
 - microlens-platform
+- monad-logger
 
 library:
   source-dirs: src
