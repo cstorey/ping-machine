@@ -1,4 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE TemplateHaskell #-}
+
 module Stuff.ConsensusSpec (spec) where
 
 import Test.Hspec
@@ -14,8 +16,10 @@ import Data.Foldable (traverse_)
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Monad.Trans.State.Strict as State
 -- import           Control.Monad.Writer.Class (MonadWriter(..))
-import           Control.Monad.State.Class (MonadState(..), modify, get)
+import           Control.Monad.State.Class (MonadState(..), get)
 -- import           Control.Monad.Reader.Class (MonadReader(..), asks)
+
+import Lens.Micro.Platform
 
 import Stuff.RaftModel
 import Stuff.Proto
@@ -26,10 +30,12 @@ data InboxItem =
   deriving (Show)
 
 data NodeSim = NodeSim {
-  nodeEnv :: ProtocolEnv
-, nodeState :: RaftState
-, nodeInbox :: Seq InboxItem
+  _nodeEnv :: ProtocolEnv
+, _nodeState :: RaftState
+, _nodeInbox :: Seq InboxItem
 } deriving (Show)
+
+makeLenses ''NodeSim
 
 makeNode :: Set PeerName -> PeerName -> NodeSim
 makeNode allPeers self = NodeSim newnodeEnv newnodeState Seq.empty
@@ -59,21 +65,25 @@ simulateStep = do
   allNodes <- get
   outputs <- forM (Map.toList allNodes) $ \(name, node) -> do
     -- sequence?
-    let actions = traverse_ applyState $ nodeInbox node
-    let ((), s', toSend) = RWS.runRWS (runProto actions) (nodeEnv node) (nodeState node)
+    let actions = traverse_ applyState $ view nodeInbox node
+    let ((), s', toSend) = RWS.runRWS (runProto actions) (view nodeEnv node) (view nodeState node)
     let _ = toSend :: [ProcessorMessage]
-    modify $ Map.insert name $ node { nodeState = s' }
+    -- modify $ Map.insert name $ node { nodeState = s' }
+    ix name . nodeState .= s'
     return (name, toSend)
 
   forM_ outputs $ \(_fromName, msgs) -> do
     forM_ msgs $ \msg -> do
       case msg of
         PeerRequest name m _cb -> do
-          modify $ Map.adjust (\node -> node { nodeInbox = nodeInbox node |> RequestFromPeer m}) name
+          -- modify $ Map.adjust (\node -> node { nodeInbox = nodeInbox node |> RequestFromPeer m}) name
+          (ix name . nodeInbox) %= (|> RequestFromPeer m)
           error "Do someething with cb"
         PeerReply peerId m -> do
           let name = nameOfPeerId peerId
-          modify $ Map.adjust (\node -> node { nodeInbox = nodeInbox node |> ResponseFromPeer m}) name
+          -- modify $ Map.adjust (\node -> node { nodeInbox = nodeInbox node |> ResponseFromPeer m}) name
+          (ix name . nodeInbox) %= (|> ResponseFromPeer m)
+          return ()
         Reply clientId m -> do
           error $ "something something client reply" ++ show (clientId, m)
 

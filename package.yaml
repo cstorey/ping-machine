@@ -34,6 +34,7 @@ dependencies:
 - time
 - random
 - mtl
+- microlens-platform
 
 library:
   source-dirs: src
