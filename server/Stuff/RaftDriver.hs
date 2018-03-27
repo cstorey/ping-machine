@@ -13,6 +13,7 @@ import qualified Stuff.Proto as Proto
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Concurrent.STM as STM
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 import Control.Applicative ((<|>))
 import qualified System.IO.Unsafe
 import Control.Monad
@@ -48,7 +49,7 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
     pendingPeerResponses <- STM.atomically $ STM.newTVar $ Map.empty
     -- Responses that we are awaiting _from_ peers.
 
-    let protocolEnv = ProtocolEnv myName <$> (Map.keys <$> STM.readTVar peerOuts)
+    let protocolEnv = ProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts)
     let processClientMessage = processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
     let processPeerRequest = processReqRespMessageSTM stateRef protocolEnv pendingPeerResponses peerReqInQ processPeerRequestMessage
     let processTickMessage = processMessageSTM stateRef protocolEnv ticks processTick

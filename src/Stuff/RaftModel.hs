@@ -21,6 +21,8 @@ import           Control.Monad.Writer.Class (MonadWriter(..))
 import           Control.Monad.State.Class (MonadState(..), modify)
 import           Control.Monad.Reader.Class (MonadReader(..), asks)
 import qualified Data.Map as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import qualified Debug.Trace as Trace
 import qualified Data.Maybe as Maybe
 import qualified Data.List as List
@@ -80,6 +82,8 @@ sendRequestVoteRpc ... $ \case
 
 -}
 
+type PeerSet = Set Proto.PeerName
+
 type Receiver a = a -> ProtoStateMachine ()
 
 -- Maybe generalise Receiver to some contrafunctor?
@@ -102,7 +106,7 @@ data ProcessorMessage = Reply (IdFor Proto.ClientResponse) Proto.ClientResponse
 
 data ProtocolEnv = ProtocolEnv {
     selfId :: Proto.PeerName,
-    peerNames :: [Proto.PeerName]
+    peerNames :: PeerSet
 } deriving (Show)
 
 data FollowerState = FollowerState {
@@ -111,7 +115,7 @@ data FollowerState = FollowerState {
 
 data CandidateState = CandidateState {
     requestVoteSentAt :: Time
-,   votesForMe :: [Proto.PeerName]
+,   votesForMe :: PeerSet
 } deriving (Show)
 
 data LeaderState = LeaderState {
@@ -339,7 +343,7 @@ processPeerResponseMessage _sender _msg@(Proto.VoteResult peerTerm granted) = do
         if granted
         then do
             let newCandidate = candidate {
-                votesForMe = _sender : votesForMe candidate
+                votesForMe = Set.insert _sender $ votesForMe candidate
             }
 
             let currentVotes = votesForMe newCandidate
@@ -452,7 +456,7 @@ processTick () (Tick t) = do
     transitionToCandidate = do
         myName <- asks selfId
         modify $ \st -> st {
-            currentRole = Candidate $ CandidateState t [myName],
+            currentRole = Candidate $ CandidateState t $ Set.singleton myName,
             currentTerm = currentTerm st + 1,
             votedFor = Just myName
         }
@@ -461,7 +465,7 @@ processTick () (Tick t) = do
         thisTerm <- currentTerm <$> get
         (_prevTerm, prevIdx) <- getPrevLogTermIdx
         let req = Proto.RequestVote thisTerm myId prevIdx
-        tell $ map (\p -> PeerRequest p req $ processPeerResponseMessage p) peers
+        tell $ map (\p -> PeerRequest p req $ processPeerResponseMessage p) $ Set.toList peers
         Trace.trace ("transitionToCandidate new term: " ++ show thisTerm) $ return ()
 
     whenCandidate candidate = do
