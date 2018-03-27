@@ -31,8 +31,12 @@ data NodeSim = NodeSim {
 , nodeInbox :: Seq InboxItem
 } deriving (Show)
 
+data Network = Network {
+  nodes :: Map PeerName NodeSim
+}
+
 makeNode :: Set PeerName -> PeerName -> NodeSim
-makeNode allPeers self = NodeSim newnodeEnv newnodeState Seq.empty
+makeNode allPeers self = Network $ NodeSim newnodeEnv newnodeState Seq.empty
   where
     newnodeEnv = (ProtocolEnv self (Set.difference allPeers $ Set.singleton self) :: ProtocolEnv)
     newnodeState = mkRaftState
@@ -51,18 +55,29 @@ spec = do
       let allNodes = Map.fromList $ fmap (\p -> (p , makeNode allPeers p)) $ Set.toList allPeers
       
       let ((), _allNodes') = State.runState simulateStep allNodes
-      print _allNodes'
+      forM_ (Map.toList _allNodes') $ print
       pending
 
-simulateStep :: MonadState (Map PeerName NodeSim) m => m ()
+simulateIteration :: MonadState (Map PeerName NodeSim) m => m ()
+simulateIteration = do
+  simulateStep
+
+  st <- get
+  when $ not $ isQuiesecent st $ simulateIteration
+
+
+isQuiesecent :: Network -> Bool
+isQuiesecent  = error "isQuiesecent"
+
+simulateStep :: MonadState Network m => m ()
 simulateStep = do
-  allNodes <- get
+  allNodes <- nodes <$> get
   outputs <- forM (Map.toList allNodes) $ \(name, node) -> do
     -- sequence?
     let actions = traverse_ applyState $ nodeInbox node
     let ((), s', toSend) = RWS.runRWS (runProto actions) (nodeEnv node) (nodeState node)
     let _ = toSend :: [ProcessorMessage]
-    modify $ Map.insert name $ node { nodeState = s' }
+    modify $ \n -> n { nodes = Map.insert name (node { nodeState = s' }) $ nodes n }
     return (name, toSend)
 
   forM_ outputs $ \(_fromName, msgs) -> do
