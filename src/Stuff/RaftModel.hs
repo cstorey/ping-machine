@@ -80,6 +80,14 @@ sendRequestVoteRpc ... $ \case
   Rejected peerTerm -> do
     ...
 
+---
+
+TODO:
+
+Factor out failure detection / election timeouts to a "peer failed" event,
+perhaps? Alternatively, we need a deterministic clock that doesn't have the
+same issues as floating point. Rational? Factor out the time type?
+
 -}
 
 type PeerSet = Set Proto.PeerName
