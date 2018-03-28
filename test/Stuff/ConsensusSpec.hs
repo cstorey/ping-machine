@@ -57,8 +57,11 @@ data Network = Network {
 makeLenses ''NodeSim
 makeLenses ''Network
 
-makeNode :: Set PeerName -> PeerName -> NodeSim
-makeNode allPeers self = NodeSim newnodeEnv newnodeState Seq.empty Seq.empty
+allPeers :: Set PeerName
+allPeers = Set.fromList $ fmap PeerName ["a", "b", "c"]
+
+makeNode :: PeerName -> NodeSim
+makeNode self = NodeSim newnodeEnv newnodeState Seq.empty Seq.empty
   where
     newnodeEnv = (ProtocolEnv self (Set.difference allPeers $ Set.singleton self) :: ProtocolEnv)
     newnodeState = mkRaftState
@@ -88,48 +91,73 @@ verteces are activations where a node can process it's inputs, and edges are
 thefore the time taken to transmit a message between nodes.
 
 As a simpler example though, we can represent it as a sequence, sort of, or
-`Map Time ProcessId`, where `data ProcessId = Client Int | Node Int`. Messages
+`Map Time ProcessId`, where ``. Messages
 in this model are effectively delivered immediately, and will be processed at
 the node's next activation.
 -}
 
-prop_simulate :: Property
-prop_simulate = property $ do
-      schedule <- forAll (Gen.set (Range.linear 0 50) $ Gen.double (Range.linearFrac 0 100))
-      evalIO $ do
-        let simulation = forM (Set.toList schedule) $ \i -> do
-              simulateIteration i
-              res <- get
-              return (i, res)
+data ProcessId =
+    Client Int
+  | Clock
+  | Node PeerName
+  deriving (Show)
 
-        (states, _) <- State.runStateT (runStderrLoggingT simulation) network
-        forM_ states $ \(i, network') -> do
-          putStrLn $ "T: " ++ show i
-          forM_ (Map.toList $ view nodes network') $ \(name, node) ->
-            putStrLn $ unPeerName name ++ "\t" ++ show (view nodeState node)
+peerName :: Gen PeerName
+peerName = Gen.element $ Set.toList allPeers
+
+processId :: Gen ProcessId
+processId = Gen.choice
+  [ Node <$> peerName
+  , Gen.constant Clock
+  ]
+
+schedule :: Gen (Map Double ProcessId)
+schedule = Gen.map (Range.linear 10 500) $ ((,) <$> Gen.double (Range.linearFrac 0 100) <*> processId)
+
+leadersOf :: Network -> Set PeerName
+leadersOf net =
+  Set.fromList $
+    fmap fst $
+    filter (\(_, st) -> case currentRole $ view nodeState st of Leader _ -> True; _ -> False) $
+    Map.toList $ view nodes net
+
+prop_simulateLeaderElection :: Property
+prop_simulateLeaderElection = property $ do
+      sched <- forAll schedule
+      states <- evalIO $ do
+        let simulation = forM (Map.toList sched) $ \(t, node) -> do
+              simulateIteration t node
+              res <- get
+              return (t, res)
+
+        fst <$> State.runStateT (runStderrLoggingT simulation) network
+      test $ do
+        forM_ states $ \(t, network') -> do
+          -- putStrLn $ "T: " ++ show t
+          -- forM_ (Map.toList $ view nodes network') $ \(name, node) ->
+            -- putStrLn $ unPeerName name ++ "\t" ++ show (view nodeState node)
+          footnoteShow $ ("Leaders", t, leadersOf network')
+          assert $ 1 >= Set.size (leadersOf network')
   where
-      allPeers = Set.fromList $ fmap PeerName ["a", "b", "c"]
-      allNodes = Map.fromList $ fmap (\p -> (p , makeNode allPeers p)) $ Set.toList allPeers
+      allNodes = Map.fromList $ fmap (\p -> (p , makeNode p)) $ Set.toList allPeers
       network = Network allNodes
 
-simulateIteration :: (MonadLogger m, MonadState Network m) => Double -> m ()
-simulateIteration n = do
+simulateIteration :: (MonadLogger m, MonadState Network m) => Double -> ProcessId -> m ()
+simulateIteration n Clock = do
     broadcastTick n
-    go
-
+simulateIteration _ (Node name) = go
   where
   go = do
-    simulateStep
-
-    quiescentp <- getQuiesecent
+    quiescentp <- getQuiesecent name
     if quiescentp
-      then return ()
-      else go
+    then return ()
+    else simulateStep name >> go
 
-getQuiesecent :: (MonadLogger m, MonadState Network m) => m Bool
-getQuiesecent = do
-  st <- get
-  let inboxes = toListOf (nodes . each . nodeInbox) st
+simulateIteration _ other = error $ "simulateIteration: " ++ show other
+
+getQuiesecent :: (MonadLogger m, MonadState Network m) => PeerName -> m Bool
+getQuiesecent name = do
+  inboxes <- toListOf (nodes . ix name . nodeInbox) <$> get
   $(logDebugSH) ("Inboxes: ", inboxes)
   return $ all Seq.null $ inboxes
 
@@ -137,33 +165,30 @@ broadcastTick :: (MonadLogger m, MonadState Network m) => Double -> m ()
 broadcastTick n = do
   (nodes . each . nodeInbox) %= (|> ClockTick n)
 
-simulateStep :: (MonadLogger m, MonadState Network m) => m ()
-simulateStep = do
-  allNodes <- use nodes
-  outputs <- forM (Map.toList allNodes) $ \(name, node) -> do
-    $(logDebugSH) ("Node:", name, view nodeInbox node)
-    let actions = traverse_ applyState $ view nodeInbox node
-    let ((), s', toSend) = RWS.runRWS (runProto actions) (view nodeEnv node) (view nodeState node)
-    nodes . ix name . nodeState .= s'
-    nodes . ix name . nodeInbox .= Seq.empty
-    return (name, toSend)
+simulateStep :: (MonadLogger m, MonadState Network m) => PeerName -> m ()
+simulateStep thisNode = do
+  node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get
+  $(logDebugSH) ("Node:", thisNode, view nodeInbox node)
+  let actions = traverse_ applyState $ view nodeInbox node
+  let ((), s', toSend) = RWS.runRWS (runProto actions) (view nodeEnv node) (view nodeState node)
+  nodes . ix thisNode . nodeState .= s'
+  nodes . ix thisNode . nodeInbox .= Seq.empty
 
-  forM_ outputs $ \(fromName, msgs) -> do
-    forM_ msgs $ \msg -> do
-      case msg of
-        PeerRequest name m cb -> do
-          $(logDebugSH) (fromName, name, "PeerRequest", m)
-          nodes . ix name . nodeInbox %= (|> RequestFromPeer fromName m)
-          nodes . ix fromName . nodePendingResponses %= (|> WaitingCallback cb)
-        PeerReply peerId m -> do
-          let name = nameOfPeerId peerId
-          $(logDebugSH) (fromName, name, "PeerReply", m)
-          cb <- fromMaybe (error "No waiting callback?") <$> preview (nodes . ix name . nodePendingResponses . each) <$> get
-          nodes . ix name . nodeInbox %= (|> ResponseFromPeer fromName cb m)
-          return ()
-        Reply clientId m -> do
-          $(logDebugSH) (fromName, clientId, "reply", m)
-          error $ "something something client reply" ++ show (clientId, m)
+  forM_ toSend $ \msg -> do
+    case msg of
+      PeerRequest name m cb -> do
+        $(logDebugSH) (thisNode, name, "PeerRequest", m)
+        nodes . ix name . nodeInbox %= (|> RequestFromPeer thisNode m)
+        nodes . ix thisNode . nodePendingResponses %= (|> WaitingCallback cb)
+      PeerReply peerId m -> do
+        let name = nameOfPeerId peerId
+        $(logDebugSH) (thisNode, name, "PeerReply", m)
+        cb <- fromMaybe (error "No waiting callback?") <$> preview (nodes . ix name . nodePendingResponses . each) <$> get
+        nodes . ix name . nodeInbox %= (|> ResponseFromPeer thisNode cb m)
+        return ()
+      Reply clientId m -> do
+        $(logDebugSH) (thisNode, clientId, "reply", m)
+        error $ "something something client reply" ++ show (clientId, m)
 
   return ()
 

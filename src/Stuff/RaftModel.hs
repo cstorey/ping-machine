@@ -4,7 +4,8 @@
 module Stuff.RaftModel
 ( ProcessorMessage(..)
 , ProtoStateMachine(..)
-, RaftState
+, RaftState(..)
+, RaftRole(..)
 , ProtocolEnv(..)
 , IdFor(..)
 , processClientReqRespMessage
