@@ -9,6 +9,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Maybe (fromMaybe)
 import Control.Monad
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
@@ -26,13 +27,17 @@ import Stuff.RaftModel
 import Stuff.Proto
 import Stuff.Types
 
-data InboxItem =
-    RequestFromPeer PeerRequest
-  | ResponseFromPeer PeerResponse
-  | ClockTick Int
-  deriving (Show)
+newtype WaitingCallback = WaitingCallback (PeerResponse -> ProtoStateMachine ())
 
-data WaitingCallback = WaitingCallback (PeerResponse -> ProtoStateMachine ())
+data InboxItem =
+    RequestFromPeer PeerName PeerRequest
+  | ResponseFromPeer PeerName WaitingCallback PeerResponse
+  | ClockTick Int
+
+instance Show InboxItem where
+  show (RequestFromPeer name req) = "RequestFromPeer " ++ show name ++ " " ++ show req
+  show (ResponseFromPeer name _ resp) = "ResponseFromPeer " ++ show name ++ " _ " ++ show resp
+  show (ClockTick i) = "ClockTick " ++ show i
 
 data NodeSim = NodeSim {
   _nodeEnv :: ProtocolEnv
@@ -59,7 +64,11 @@ applyState :: InboxItem -> ProtoStateMachine ()
 applyState (ClockTick i) = do
   processTick () $ Tick $ fromIntegral i
 
-applyState other = error $ "applyState: " ++ show other
+applyState (RequestFromPeer sender req) = do
+  processPeerRequestMessage req $ peerIdOfName sender
+applyState (ResponseFromPeer _sender (WaitingCallback f) resp) = f resp
+
+-- applyState other = error $ "applyState: " ++ show other
 
 spec :: Spec
 spec = do
@@ -67,9 +76,16 @@ spec = do
     it "removes leading and trailing whitespace" $ do
       () `shouldBe` ()
     it "Starts in Follower mode" $ do
-      let simulation = forM_ [0..5] simulateIteration
-      network' <- State.execStateT (runStderrLoggingT simulation) network
-      forM_ (Map.toList $ view nodes network') $ \(name, node) -> putStrLn $ unPeerName name ++ "\t" ++ show (view nodeState node)
+      let simulation = forM [0..32] $ \i -> do
+            simulateIteration i
+            res <- get
+            return (i, res)
+
+      (states, _) <- State.runStateT (runStderrLoggingT simulation) network
+      forM_ states $ \(i, network') -> do
+        putStrLn $ "T: " ++ show i
+        forM_ (Map.toList $ view nodes network') $ \(name, node) ->
+          putStrLn $ unPeerName name ++ "\t" ++ show (view nodeState node)
       pending
   where
       allPeers = Set.fromList $ fmap PeerName ["a", "b", "c"]
@@ -117,12 +133,13 @@ simulateStep = do
       case msg of
         PeerRequest name m cb -> do
           $(logDebugSH) (fromName, name, "PeerRequest", m)
-          nodes . ix name . nodeInbox %= (|> RequestFromPeer m)
+          nodes . ix name . nodeInbox %= (|> RequestFromPeer fromName m)
           nodes . ix fromName . nodePendingResponses %= (|> WaitingCallback cb)
         PeerReply peerId m -> do
           let name = nameOfPeerId peerId
           $(logDebugSH) (fromName, name, "PeerReply", m)
-          nodes . ix name . nodeInbox %= (|> ResponseFromPeer m)
+          cb <- fromMaybe (error "No waiting callback?") <$> preview (nodes . ix name . nodePendingResponses . each) <$> get
+          nodes . ix name . nodeInbox %= (|> ResponseFromPeer fromName cb m)
           return ()
         Reply clientId m -> do
           $(logDebugSH) (fromName, clientId, "reply", m)
@@ -131,7 +148,13 @@ simulateStep = do
   return ()
 
 nameOfPeerId :: IdFor PeerResponse -> PeerName
-nameOfPeerId (IdFor 0) = PeerName "9990"
-nameOfPeerId (IdFor 1) = PeerName "9991"
-nameOfPeerId (IdFor 2) = PeerName "9992"
+nameOfPeerId (IdFor 0) = PeerName "a"
+nameOfPeerId (IdFor 1) = PeerName "b"
+nameOfPeerId (IdFor 2) = PeerName "c"
 nameOfPeerId other = error $ "Unnown peer id: " ++ show other
+
+peerIdOfName :: PeerName -> IdFor PeerResponse
+peerIdOfName (PeerName "a") = (IdFor 0)
+peerIdOfName (PeerName "b") = (IdFor 1)
+peerIdOfName (PeerName "c") = (IdFor 2)
+peerIdOfName other = error $ "Unnown peer name: " ++ show other
