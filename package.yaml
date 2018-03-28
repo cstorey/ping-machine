@@ -72,7 +72,7 @@ executables:
 
 tests:
   stuff-hs-test:
-    main:                Spec.hs
+    main:                Stuff.ConsensusSpec
     source-dirs:         test
     ghc-options:
     - -threaded
@@ -85,3 +85,4 @@ tests:
     - stuff-hs
     - hspec
     - hspec-discover
+    - hedgehog
