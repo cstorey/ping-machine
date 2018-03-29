@@ -111,13 +111,16 @@ processId = Gen.choice
   , Gen.constant Clock
   ]
 
-schedule :: Gen (Map Double ProcessId)
-schedule = Gen.map (Range.linear 10 500) $ ((,) <$> Gen.double (Range.linearFrac 0 100) <*> processId)
+timestamp :: Double -> Gen Double
+timestamp len = Gen.double (Range.linearFrac 0 len)
 
-leadersOf :: Network -> Set PeerName
+schedule :: Gen (Map Double ProcessId)
+schedule = Gen.map (Range.linear 10 500) $ ((,) <$> timestamp 100 <*> processId)
+
+leadersOf :: Network -> Map Term PeerName
 leadersOf net =
   Set.fromList $
-    fmap fst $
+    fmap (\(name, st) -> (currentTerm $ view nodeState) $
     filter (\(_, st) -> case currentRole $ view nodeState st of Leader _ -> True; _ -> False) $
     Map.toList $ view nodes net
 
