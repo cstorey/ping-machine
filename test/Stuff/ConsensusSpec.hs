@@ -11,7 +11,7 @@ import Data.Maybe (fromMaybe)
 import Control.Monad
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
-import Data.Foldable (traverse_)
+import Data.Foldable (traverse_, foldl')
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Monad.Trans.State.Strict as State
 -- import           Control.Monad.Writer.Class (MonadWriter(..))
@@ -20,6 +20,7 @@ import           Control.Monad.State.Class (MonadState(..), get)
 import Control.Monad.Logger
 import           System.IO (BufferMode(..), hSetBuffering, stdout, stderr)
 import           System.Exit (exitFailure)
+import qualified Debug.Trace as Trace
 
 import Lens.Micro.Platform
 
@@ -115,40 +116,64 @@ timestamp :: Double -> Gen Double
 timestamp len = Gen.double (Range.linearFrac 0 len)
 
 schedule :: Gen (Map Double ProcessId)
-schedule = Gen.map (Range.linear 10 500) $ ((,) <$> timestamp 100 <*> processId)
+schedule = Gen.map (Range.linear 100 2000) $ ((,) <$> timestamp 300 <*> processId)
 
-leadersOf :: Network -> Map Term PeerName
-leadersOf net =
-  Set.fromList $
-    fmap (\(name, st) -> (currentTerm $ view nodeState) $
-    filter (\(_, st) -> case currentRole $ view nodeState st of Leader _ -> True; _ -> False) $
-    Map.toList $ view nodes net
+leadersOf :: Network -> Map Term (Set PeerName)
+leadersOf net = leaders
+  where
+    nodeList :: [(PeerName, NodeSim)]
+    nodeList = Map.toList $ view nodes net
+    leaders :: Map Term (Set PeerName)
+    leaders = Map.fromList $ do
+            (name, state) <- nodeList
+            let st = view nodeState state
+            let term = currentTerm st
+            case currentRole st of
+              Leader _ -> [(term, Set.singleton name)]
+              _ -> []
+
+
+{-
+We know that _only_ leaders will emit AppendEntries events, so rather than
+inspecting the node state directly, we can listen for `AppendEntries` messages
+from nodes, and record the source against the term.
+-}
 
 prop_simulateLeaderElection :: Property
 prop_simulateLeaderElection = property $ do
       sched <- forAll schedule
       states <- evalIO $ do
+        putStrLn "---"
+        putStrLn "Running:"
+        Trace.traceShow ("Schedule", sched) $ return ()
         let simulation = forM (Map.toList sched) $ \(t, node) -> do
               simulateIteration t node
               res <- get
               return (t, res)
-
         fst <$> State.runStateT (runStderrLoggingT simulation) network
+
       test $ do
-        forM_ states $ \(t, network') -> do
-          -- putStrLn $ "T: " ++ show t
-          -- forM_ (Map.toList $ view nodes network') $ \(name, node) ->
-            -- putStrLn $ unPeerName name ++ "\t" ++ show (view nodeState node)
-          footnoteShow $ ("Leaders", t, leadersOf network')
-          assert $ 1 >= Set.size (leadersOf network')
+        -- We should use Map.unionWith Set.union here
+
+        let allLeaders = leadersByTerm states
+        Trace.traceShow ("Leaders by term", allLeaders) $ return ()
+
+        footnoteShow $ ("Leaders by term", allLeaders)
+        forM_ (Map.toList allLeaders) $ \(term, leaders) -> do
+          assert $ 1 >= Set.size leaders
   where
       allNodes = Map.fromList $ fmap (\p -> (p , makeNode p)) $ Set.toList allPeers
       network = Network allNodes
+      leadersByTerm :: [(a, Network)] -> Map Term (Set PeerName)
+      leadersByTerm states = foldl' (Map.unionWith Set.union) Map.empty $ map (leadersOf . snd) states
+        -- let allLeaders = List.foldl' ... $
 
 simulateIteration :: (MonadLogger m, MonadState Network m) => Double -> ProcessId -> m ()
 simulateIteration n Clock = do
+    $(logDebugSH) ("Clock", n)
     broadcastTick n
-simulateIteration _ (Node name) = go
+simulateIteration _ (Node name) = do
+    go
   where
   go = do
     quiescentp <- getQuiesecent name
@@ -161,7 +186,7 @@ simulateIteration _ other = error $ "simulateIteration: " ++ show other
 getQuiesecent :: (MonadLogger m, MonadState Network m) => PeerName -> m Bool
 getQuiesecent name = do
   inboxes <- toListOf (nodes . ix name . nodeInbox) <$> get
-  $(logDebugSH) ("Inboxes: ", inboxes)
+  $(logDebugSH) ("Inbox ", name, inboxes)
   return $ all Seq.null $ inboxes
 
 broadcastTick :: (MonadLogger m, MonadState Network m) => Double -> m ()
