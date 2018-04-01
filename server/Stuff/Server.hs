@@ -21,7 +21,7 @@ import Stuff.Network
 import Stuff.RaftDriver
 
 now :: IO Time
-now = fromRational . toRational <$> Clock.getPOSIXTime
+now = toRational <$> Clock.getPOSIXTime
 
 main ::  IO ()
 main = S.withSocketsDo $ do

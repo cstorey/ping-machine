@@ -202,28 +202,34 @@ laterTermObserved laterTerm = do
     thisTerm <- currentTerm <$> get
     formerRole <- currentRole <$> get
     Trace.trace ("Later term observed: " ++ show laterTerm ++ " > " ++ show thisTerm) $ return ()
-    prevTick <- prevTickTime <$> get
 
     case formerRole of
         Leader leader -> whenLeader leader
         _ -> return ()
 
     modify $ \st -> st {
-        currentRole = Follower $ FollowerState {
-            lastLeaderHeartbeat = prevTick
-        },
         currentTerm = laterTerm,
         votedFor = Nothing
     }
 
+    stepDown
     where
-    whenLeader :: LeaderState -> ProtoStateMachine ()
-    whenLeader leader = do
-        let pending = pendingClientRequests leader
-        Trace.trace ("Nacking requests: " ++ show pending) $ return ()
-        forM_ (Map.toList pending) $ \(_, clid) -> do
-            -- We should really actually run a state machine here. But ...
-            tell [Reply clid $ Left $ Proto.NotLeader $ Nothing]
+        whenLeader :: LeaderState -> ProtoStateMachine ()
+        whenLeader leader = do
+            let pending = pendingClientRequests leader
+            Trace.trace ("Nacking requests: " ++ show pending) $ return ()
+            forM_ (Map.toList pending) $ \(_, clid) -> do
+                -- We should really actually run a state machine here. But ...
+                tell [Reply clid $ Left $ Proto.NotLeader $ Nothing]
+
+stepDown :: ProtoStateMachine ()
+stepDown = do
+    prevTick <- prevTickTime <$> get
+    modify $ \st -> st {
+        currentRole = Follower $ FollowerState {
+            lastLeaderHeartbeat = prevTick
+        }
+    }
 
 getPrevLogTermIdx :: ProtoStateMachine (Proto.Term, Proto.LogIdx)
 getPrevLogTermIdx = do
@@ -274,7 +280,7 @@ processPeerRequestMessage (Proto.RequestVote candidateTerm candidateName candida
 processPeerRequestMessage
     _msg@(Proto.AppendEntries (Proto.AppendEntriesReq leaderTerm leaderName prevTerm prevIdx newEntries)) reqId = do
     -- prevTick <- prevTickTime <$> get
-    Trace.trace ("Append Entries: " ++ show _msg) $ return ()
+    Trace.trace ("<- Append Entries: " ++ show _msg) $ return ()
 
     thisTerm <- currentTerm <$> get
     -- myLog <- logEntries <$> get
@@ -295,7 +301,7 @@ processPeerRequestMessage
                 Follower follower -> do
                     whenFollower thisTerm follower
                 Candidate _st -> do
-                    error ("appendEntries recieved when leader? " ++ show _msg)
+                    stepDown
                 Leader _st -> do
                     error ("appendEntries recieved when leader? " ++ show _msg)
 

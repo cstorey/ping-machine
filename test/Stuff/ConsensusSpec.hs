@@ -22,6 +22,7 @@ import           Control.Monad.State.Class (MonadState(..), get)
 -- import           Control.Monad.Reader.Class (MonadReader(..), asks)
 import Control.Monad.Logger
 import qualified Debug.Trace as Trace
+import Data.Ratio ((%))
 
 import Lens.Micro.Platform
 
@@ -38,7 +39,7 @@ newtype WaitingCallback = WaitingCallback (PeerResponse -> ProtoStateMachine ())
 data InboxItem =
     RequestFromPeer PeerName PeerRequest
   | ResponseFromPeer PeerName WaitingCallback PeerResponse
-  | ClockTick Double
+  | ClockTick Time
 
 instance Show InboxItem where
   show (RequestFromPeer name req) = "RequestFromPeer " ++ show name ++ " " ++ show req
@@ -113,10 +114,13 @@ processId = Gen.choice
   , Gen.constant Clock
   ]
 
-timestamp :: Double -> Gen Double
-timestamp len = Gen.double (Range.linearFrac 0 len)
+timestamp :: Time -> Gen Time
+timestamp len = do
+  let denom = 1000
+  num <- Gen.integral (Range.linear 0 denom)
+  return $ (num % denom) * len
 
-schedule :: Gen (Map Double ProcessId)
+schedule :: Gen (Map Time ProcessId)
 schedule = Gen.map (Range.linear 0 1000) $ ((,) <$> timestamp 100 <*> processId)
 
 leadersOf :: Network -> Map Term (Set PeerName)
@@ -173,7 +177,7 @@ prop_simulateLeaderElection = property $ do
         -- let allLeaders = List.foldl' ... $
       timeouts = Gen.list (Range.constant 3 3) $ ((+2.5) <$> timestamp 1)
 
-simulateIteration :: (MonadLogger m, MonadState Network m) => Double -> ProcessId -> m ()
+simulateIteration :: (MonadLogger m, MonadState Network m) => Time -> ProcessId -> m ()
 simulateIteration n Clock = do
     $(logDebugSH) ("Clock", n)
     broadcastTick n
@@ -194,7 +198,7 @@ getQuiesecent name = do
   $(logDebugSH) ("Inbox ", name, inboxes)
   return $ all Seq.null $ inboxes
 
-broadcastTick :: (MonadLogger m, MonadState Network m) => Double -> m ()
+broadcastTick :: (MonadLogger m, MonadState Network m) => Time -> m ()
 broadcastTick n = do
   (nodes . each . nodeInbox) %= (|> ClockTick n)
 

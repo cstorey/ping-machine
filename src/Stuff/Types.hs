@@ -32,6 +32,5 @@ newtype PeerID = PeerID Int
 type OutgoingReqQ req resp r = (STM.TQueue (req, resp -> r))
 type STMReqChanMap xid req resp r = STM.TVar (Map.Map xid (OutgoingReqQ req resp r))
 
-type Time = Double
+type Time = Rational
 data Tick = Tick Time
-

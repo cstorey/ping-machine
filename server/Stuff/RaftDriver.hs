@@ -18,6 +18,7 @@ import Control.Applicative ((<|>))
 import qualified System.IO.Unsafe
 import Control.Monad
 import qualified System.Random as Random
+import Data.Ratio ((%))
 
 import Stuff.Types
 import Stuff.RaftModel
@@ -50,8 +51,8 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
     pendingPeerResponses <- STM.atomically $ STM.newTVar $ Map.empty
     -- Responses that we are awaiting _from_ peers.
 
-    elTimeout <- (+ 2.5) <$> Random.randomIO
-    let aeTimeout = 1.0 :: Time
+    elTimeout <- (% 1000) <$> Random.randomRIO (2500, 3500) :: IO Time
+    let aeTimeout = 1 :: Time
     putStrLn $ show ("Election timeout is", elTimeout, "append entries", aeTimeout)
 
     let protocolEnv = ProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout
