@@ -1,7 +1,10 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TemplateHaskell #-}
 
-module Stuff.ConsensusSpec (main) where
+module Stuff.ConsensusSpec (
+  tests
+, prop_simulateLeaderElection
+) where
 
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -18,8 +21,6 @@ import qualified Control.Monad.Trans.State.Strict as State
 import           Control.Monad.State.Class (MonadState(..), get)
 -- import           Control.Monad.Reader.Class (MonadReader(..), asks)
 import Control.Monad.Logger
-import           System.IO (BufferMode(..), hSetBuffering, stdout, stderr)
-import           System.Exit (exitFailure)
 import qualified Debug.Trace as Trace
 
 import Lens.Micro.Platform
@@ -235,10 +236,6 @@ peerIdOfName other = error $ "Unnown peer name: " ++ show other
 
 -- Driver bits
 
-main :: IO ()
-main = do
-  hSetBuffering stdout LineBuffering
-  hSetBuffering stderr LineBuffering
 
-  res <- checkParallel $$(discover)
-  unless res $ exitFailure
+tests :: Group
+tests = $$(discover)
