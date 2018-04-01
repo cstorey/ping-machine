@@ -114,13 +114,19 @@ processId = Gen.choice
   , Gen.constant Clock
   ]
 
-timestamp :: Time -> Gen Time
-timestamp len = do
-  let denom = 1000
-  num <- Gen.integral (Range.linear 0 denom)
-  return $ (num % denom) * len
+ticksPerSecond :: Integer
+ticksPerSecond = 1000
 
-schedule :: Gen (Map Time ProcessId)
+timestamp :: Integer -> Gen Integer
+timestamp len = do
+  num <- Gen.integral (Range.linear 0 (len * ticksPerSecond))
+  return $ num
+
+-- Technically, a Set of processid should be activated at each timestep.
+-- But, at the moment, clocks are instantanious and global, wheras they should
+-- be per process, really.
+
+schedule :: Gen (Map Integer ProcessId)
 schedule = Gen.map (Range.linear 0 1000) $ ((,) <$> timestamp 100 <*> processId)
 
 leadersOf :: Network -> Map Term (Set PeerName)
@@ -148,7 +154,7 @@ prop_simulateLeaderElection :: Property
 prop_simulateLeaderElection = property $ do
       ts <- forAll timeouts
       sched <- forAll schedule
-      let network = Network (allNodes ts)
+      let network = Network (allNodes $ map (% ticksPerSecond) ts)
       states <- evalIO $ do
         putStrLn "---"
         putStrLn "Running:"
@@ -175,12 +181,13 @@ prop_simulateLeaderElection = property $ do
       leadersByTerm :: [(a, Network)] -> Map Term (Set PeerName)
       leadersByTerm states = foldl' (Map.unionWith Set.union) Map.empty $ map (leadersOf . snd) states
         -- let allLeaders = List.foldl' ... $
-      timeouts = Gen.list (Range.constant 3 3) $ ((+2.5) <$> timestamp 1)
+      timeouts = Gen.list (Range.constant 3 3) $ ((+ 2500) <$> timestamp 1)
 
-simulateIteration :: (MonadLogger m, MonadState Network m) => Time -> ProcessId -> m ()
+simulateIteration :: (MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m ()
 simulateIteration n Clock = do
-    $(logDebugSH) ("Clock", n)
-    broadcastTick n
+    let t = n % ticksPerSecond
+    $(logDebugSH) ("Clock", t)
+    broadcastTick t
 simulateIteration _ (Node name) = do
     go
   where
