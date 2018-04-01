@@ -115,7 +115,9 @@ data ProcessorMessage = Reply (IdFor Proto.ClientResponse) Proto.ClientResponse
 
 data ProtocolEnv = ProtocolEnv {
     selfId :: Proto.PeerName,
-    peerNames :: PeerSet
+    peerNames :: PeerSet,
+    electionTimeout :: Time,
+    appendEntriesPeriod :: Time
 } deriving (Show)
 
 data FollowerState = FollowerState {
@@ -155,9 +157,6 @@ newtype ProtoStateMachine a = ProtoStateMachine {
 
 oneSecond :: Time
 oneSecond = 1
-
-timeout :: Time
-timeout = oneSecond * 3
 
 newFollower :: RaftRole
 newFollower = Follower $ FollowerState 0
@@ -457,7 +456,8 @@ processTick () (Tick t) = do
     where
     whenFollower follower = do
         let elapsed = (t - lastLeaderHeartbeat follower)
-        Trace.trace ("Elapsed: " ++ show elapsed ) $ return ()
+        timeout <- asks electionTimeout
+        Trace.trace ("Elapsed: " ++ show elapsed ++ "/" ++ show timeout) $ return ()
         if elapsed > timeout
         then Trace.trace "Election timeout elapsed" $ transitionToCandidate
         else return ()
@@ -480,7 +480,8 @@ processTick () (Tick t) = do
     whenCandidate candidate = do
         -- has the election timeout passed?
         let elapsed = t - requestVoteSentAt candidate
-        Trace.trace ("Elapsed: " ++ show elapsed ) $ return ()
+        timeout <- asks electionTimeout
+        Trace.trace ("Elapsed: " ++ show elapsed ++ "/" ++ show timeout) $ return ()
         if elapsed > timeout
         then Trace.trace "Election timeout elapsed" $ transitionToCandidate
         else return ()

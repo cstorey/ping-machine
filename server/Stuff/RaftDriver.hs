@@ -17,6 +17,7 @@ import qualified Data.Set as Set
 import Control.Applicative ((<|>))
 import qualified System.IO.Unsafe
 import Control.Monad
+import qualified System.Random as Random
 
 import Stuff.Types
 import Stuff.RaftModel
@@ -49,7 +50,11 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
     pendingPeerResponses <- STM.atomically $ STM.newTVar $ Map.empty
     -- Responses that we are awaiting _from_ peers.
 
-    let protocolEnv = ProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts)
+    elTimeout <- (+ 2.5) <$> Random.randomIO
+    let aeTimeout = 1.0 :: Time
+    putStrLn $ show ("Election timeout is", elTimeout, "append entries", aeTimeout)
+
+    let protocolEnv = ProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout
     let processClientMessage = processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
     let processPeerRequest = processReqRespMessageSTM stateRef protocolEnv pendingPeerResponses peerReqInQ processPeerRequestMessage
     let processTickMessage = processMessageSTM stateRef protocolEnv ticks processTick

@@ -62,10 +62,10 @@ makeLenses ''Network
 allPeers :: Set PeerName
 allPeers = Set.fromList $ fmap PeerName ["a", "b", "c"]
 
-makeNode :: PeerName -> NodeSim
-makeNode self = NodeSim newnodeEnv newnodeState Seq.empty Seq.empty
+makeNode :: PeerName -> Time -> NodeSim
+makeNode self elTimeout = NodeSim newnodeEnv newnodeState Seq.empty Seq.empty
   where
-    newnodeEnv = (ProtocolEnv self (Set.difference allPeers $ Set.singleton self) :: ProtocolEnv)
+    newnodeEnv = (ProtocolEnv self (Set.difference allPeers $ Set.singleton self) elTimeout (elTimeout / 3.0) :: ProtocolEnv)
     newnodeState = mkRaftState
 
 
@@ -117,7 +117,7 @@ timestamp :: Double -> Gen Double
 timestamp len = Gen.double (Range.linearFrac 0 len)
 
 schedule :: Gen (Map Double ProcessId)
-schedule = Gen.map (Range.linear 100 2000) $ ((,) <$> timestamp 300 <*> processId)
+schedule = Gen.map (Range.linear 0 1000) $ ((,) <$> timestamp 100 <*> processId)
 
 leadersOf :: Network -> Map Term (Set PeerName)
 leadersOf net = leaders
@@ -142,7 +142,9 @@ from nodes, and record the source against the term.
 
 prop_simulateLeaderElection :: Property
 prop_simulateLeaderElection = property $ do
+      ts <- forAll timeouts
       sched <- forAll schedule
+      let network = Network (allNodes ts)
       states <- evalIO $ do
         putStrLn "---"
         putStrLn "Running:"
@@ -162,12 +164,14 @@ prop_simulateLeaderElection = property $ do
         footnoteShow $ ("Leaders by term", allLeaders)
         forM_ (Map.toList allLeaders) $ \(term, leaders) -> do
           assert $ 1 >= Set.size leaders
+
+      evalIO $ putStrLn $ "Okay!"
   where
-      allNodes = Map.fromList $ fmap (\p -> (p , makeNode p)) $ Set.toList allPeers
-      network = Network allNodes
+      allNodes ts = Map.fromList $ fmap (\(p, t) -> (p , makeNode p t)) $ zip (Set.toList allPeers) ts
       leadersByTerm :: [(a, Network)] -> Map Term (Set PeerName)
       leadersByTerm states = foldl' (Map.unionWith Set.union) Map.empty $ map (leadersOf . snd) states
         -- let allLeaders = List.foldl' ... $
+      timeouts = Gen.list (Range.constant 3 3) $ ((+2.5) <$> timestamp 1)
 
 simulateIteration :: (MonadLogger m, MonadState Network m) => Double -> ProcessId -> m ()
 simulateIteration n Clock = do
