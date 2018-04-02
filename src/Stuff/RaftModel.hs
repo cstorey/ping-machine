@@ -252,9 +252,11 @@ getMajority = do
     return $ succ (memberCount `div` 2)
 
 processPeerRequestMessage :: Proto.PeerRequest -> IdFor Proto.PeerResponse -> ProtoStateMachine ()
-processPeerRequestMessage (Proto.RequestVote candidateTerm candidateName candidateIdx) sender = do
+processPeerRequestMessage (Proto.RequestVote req) sender = do
+    -- let x = (RequestVoteReq candidateTerm candidateName candidateIdx);
     thisTerm <- use currentTerm
     vote <- use votedFor
+    let candidateTerm = Proto.rvTerm req
     (_prevTerm, logIdx) <- getPrevLogTermIdx
     case () of
         _ | candidateTerm < thisTerm -> do
@@ -264,7 +266,7 @@ processPeerRequestMessage (Proto.RequestVote candidateTerm candidateName candida
             laterTermObserved candidateTerm
             Trace.trace ("Granting vote") $ grantVote candidateTerm
             -- Reply No?
-        _ | Maybe.isNothing vote && candidateIdx >= logIdx -> do
+        _ | Maybe.isNothing vote && Proto.rvHead req >= logIdx -> do
             Trace.trace ("Granting vote") $ return ()
             grantVote candidateTerm
             -- Already
@@ -279,7 +281,7 @@ processPeerRequestMessage (Proto.RequestVote candidateTerm candidateName candida
         refuseVote thisTerm = tell [PeerReply sender $ Proto.VoteResult thisTerm False]
         grantVote :: Proto.Term -> ProtoStateMachine ()
         grantVote thisTerm = do
-            votedFor .= Just candidateName
+            votedFor .= Just (Proto.rvName req)
             tell [PeerReply sender $ Proto.VoteResult thisTerm True]
 
 processPeerRequestMessage
@@ -471,7 +473,7 @@ processTick () (Tick t) = do
         myId <- view selfId
         thisTerm <- use currentTerm
         (_prevTerm, logIdx) <- getPrevLogTermIdx
-        let req = Proto.RequestVote thisTerm myId logIdx
+        let req = Proto.RequestVote $ Proto.RequestVoteReq thisTerm myId logIdx
         tell $ map (\p -> PeerRequest p req $ processPeerResponseMessage p) $ Set.toList peers
         Trace.trace ("transitionToCandidate new term: " ++ show thisTerm) $ return ()
 

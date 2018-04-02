@@ -14,6 +14,7 @@ module Stuff.Proto
     , PeerName(..)
     , Term
     , AppendEntriesReq(..)
+    , RequestVoteReq(..)
     , AppendEntriesResponse(..)
     ) where
 
@@ -66,8 +67,15 @@ data AppendEntriesReq = AppendEntriesReq {
 } deriving (Show, Eq, Ord, Generic)
 instance Binary.Binary AppendEntriesReq
 
+data RequestVoteReq = RequestVoteReq {
+  rvTerm :: Term
+, rvName :: PeerName
+, rvHead :: LogIdx
+} deriving (Show, Generic)
+instance Binary.Binary RequestVoteReq
+
 data PeerRequest =
-    RequestVote Term PeerName LogIdx
+    RequestVote RequestVoteReq
   | AppendEntries AppendEntriesReq
   deriving (Show, Generic)
 instance Binary.Binary PeerRequest
