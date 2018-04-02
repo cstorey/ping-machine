@@ -153,6 +153,7 @@ prop_simulateLeaderElection = property $ do
       states <- evalIO $ do
         putStrLn "---"
         putStrLn "Running:"
+        Trace.traceShow ("Timeouts", ts) $ return ()
         Trace.traceShow ("Schedule", sched) $ return ()
         let simulation = forM (Map.toList sched) $ \(t, node) -> do
               simulateIteration t node
@@ -176,7 +177,8 @@ prop_simulateLeaderElection = property $ do
       leadersByTerm :: [(a, Network)] -> Map Term (Set PeerName)
       leadersByTerm states = foldl' (Map.unionWith Set.union) Map.empty $ map (leadersOf . snd) states
         -- let allLeaders = List.foldl' ... $
-      timeouts = Gen.list (Range.constant 3 3) $ ((+ 2500) <$> timestamp 1)
+      timeouts = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> timestamp 1)
+      nnodes = Set.size allPeers
 
 simulateIteration :: (MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m ()
 simulateIteration t (Node name) = do
@@ -227,12 +229,16 @@ nameOfPeerId :: IdFor PeerResponse -> PeerName
 nameOfPeerId (IdFor 0) = PeerName "a"
 nameOfPeerId (IdFor 1) = PeerName "b"
 nameOfPeerId (IdFor 2) = PeerName "c"
+nameOfPeerId (IdFor 3) = PeerName "d"
+nameOfPeerId (IdFor 4) = PeerName "e"
 nameOfPeerId other = error $ "Unnown peer id: " ++ show other
 
 peerIdOfName :: PeerName -> IdFor PeerResponse
 peerIdOfName (PeerName "a") = (IdFor 0)
 peerIdOfName (PeerName "b") = (IdFor 1)
 peerIdOfName (PeerName "c") = (IdFor 2)
+peerIdOfName (PeerName "d") = (IdFor 3)
+peerIdOfName (PeerName "e") = (IdFor 4)
 peerIdOfName other = error $ "Unnown peer name: " ++ show other
 
 
