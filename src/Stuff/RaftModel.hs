@@ -88,9 +88,9 @@ sendRequestVoteRpc ... $ \case
 
 TODO:
 
-Factor out failure detection / election timeouts to a "peer failed" event,
-perhaps? Alternatively, we need a deterministic clock that doesn't have the
-same issues as floating point. Rational? Factor out the time type?
+ * Make use of appendEntriesPeriod, so that we can
+ * Use more "dense" timesteps in simulation
+ * Avoid random scheduling oddness.
 
 -}
 
@@ -125,12 +125,17 @@ data CandidateState = CandidateState {
 } deriving (Show)
 makeLenses ''CandidateState
 
+data LeaderFollowerState = LeaderFollowerState {
+    _prevIdx :: Proto.LogIdx
+,   _lastSent :: Proto.LogIdx
+}
+makeLenses ''LeaderFollowerState
+
 data LeaderState = LeaderState {
-    _followerPrevIdx :: Map.Map Proto.PeerName Proto.LogIdx
-,   _followerLastSent :: Map.Map Proto.PeerName Proto.LogIdx
+    _followers :: Map.Map Proto.PeerName LeaderFollowerState
 ,   _committed :: Maybe Proto.LogIdx
 ,   _pendingClientRequests :: Map.Map Proto.LogIdx (IdFor Proto.ClientResponse)
-} deriving (Show)
+}
 makeLenses ''LeaderState
 
 
@@ -138,7 +143,6 @@ data RaftRole =
     Follower FollowerState
   | Candidate CandidateState
   | Leader LeaderState
-    deriving (Show)
 
 data RaftState = RaftState {
     _currentRole :: RaftRole
@@ -147,7 +151,7 @@ data RaftState = RaftState {
 ,   _votedFor :: Maybe Proto.PeerName
 ,   _prevTickTime :: Time
 ,   _currentLeader :: Maybe Proto.PeerName
-} deriving (Show)
+}
 makeLenses ''RaftState
 
 
@@ -180,8 +184,8 @@ appendToLog :: Proto.ClientRequest -> ProtoStateMachine Proto.LogIdx
 appendToLog command = do
     thisTerm <- use currentTerm
     let entry = Proto.LogEntry thisTerm command
-    (_, prevIdx) <- getPrevLogTermIdx
-    let idx = succ prevIdx
+    (_, logIdx) <- getPrevLogTermIdx
+    let idx = succ logIdx
     logEntries .ix idx .= entry
     return idx
 
@@ -279,7 +283,7 @@ processPeerRequestMessage (Proto.RequestVote candidateTerm candidateName candida
             tell [PeerReply sender $ Proto.VoteResult thisTerm True]
 
 processPeerRequestMessage
-    _msg@(Proto.AppendEntries (Proto.AppendEntriesReq leaderTerm leaderName prevTerm prevIdx newEntries)) reqId = do
+    _msg@(Proto.AppendEntries (Proto.AppendEntriesReq leaderTerm leaderName assumedHeadTerm assumedHeadIdx newEntries)) reqId = do
     -- prevTick <- prevTickTime <$> get
     Trace.trace ("<- Append Entries: " ++ show _msg) $ return ()
 
@@ -318,18 +322,17 @@ processPeerRequestMessage
             (_prevTerm, logHeadIdx) <- getPrevLogTermIdx
             entries <- use logEntries
 
-            let myEntry = Map.lookup prevIdx entries
+            let myEntry = Map.lookup assumedHeadIdx entries
             case Proto.logTerm <$> myEntry of
-                Just n | n /= prevTerm -> do
-                    Trace.trace ("Refusing as prev item was: " ++ show myEntry ++ " wanted term " ++ show prevTerm) $
+                Just n | n /= assumedHeadTerm -> do
+                    Trace.trace ("Refusing as prev item was: " ++ show myEntry ++ " wanted term " ++ show assumedHeadTerm) $
                         refuseAppendEntries thisTerm
                 -- We need to refuse here iff it's ahead of our log
-                Nothing | prevIdx > logHeadIdx -> do
-                    Trace.trace ("Refusing as prevIdx index: " ++ show prevIdx ++ " ahead of our " ++ show logHeadIdx) $
+                Nothing | assumedHeadIdx > logHeadIdx -> do
+                    Trace.trace ("Refusing as prevIdx index: " ++ show assumedHeadIdx ++ " ahead of our " ++ show logHeadIdx) $
                         refuseAppendEntries thisTerm
                 _ -> do
-                    let idx = succ prevIdx
-                    let (entries', _)  = Map.split idx entries
+                    let (entries', _)  = Map.split (succ assumedHeadIdx) entries
                     let entries'' = Map.union entries' newEntries
                     logEntries .= entries''
                     currentLeader .= Just leaderName
@@ -364,7 +367,7 @@ processPeerResponseMessage _sender _msg@(Proto.VoteResult peerTerm granted) = do
                 ) $ return ()
 
             let newRole = if length currentVotes >= neededVotes
-                then Leader $ LeaderState Map.empty Map.empty Nothing Map.empty
+                then Leader $ LeaderState Map.empty Nothing Map.empty
                 else Candidate newCandidate
 
             currentRole .= newRole
@@ -383,34 +386,37 @@ processPeerResponseMessage sender _msg@(Proto.AppendResult aer) = do
             Trace.trace ("append response recieved when non leader? " ++ show _msg) $ return ()
     where
     whenLeader leader = do
-        let lastSent = view followerLastSent leader
-        case Map.lookup sender lastSent of
+        -- FIXME: This is wrong, as it'll produce incorrect results when we
+        -- have multiple overlaping requests. We need to correlate these with the actually sent id.
+        -- Then again, this is invoked via callback, so should be trivial.
+
+        case preview (followers . ix sender . lastSent) leader of
             Just sentIdx -> do
                 if Proto.aerSucceeded aer
                 then do
-                    let followerPrevIdx' = Map.insert sender sentIdx $ view followerPrevIdx leader
-                    committedIdx <- findCommittedIndex followerPrevIdx'
+                    -- let followerPrevIdx' = Map.insert sender sentIdx $ view followerPrevIdx leader
+                    committedIdx <- findCommittedIndex leader
 
                     Trace.trace ("committed index should be: " ++ show committedIdx) $ return ()
 
                     return $ leader
-                        & set followerPrevIdx followerPrevIdx'
-                        & over followerLastSent (Map.delete sender)
+                        & set (followers . ix sender . prevIdx) sentIdx
                         & set committed committedIdx
 
                 else do
                     let toTry = Proto.LogIdx . (`div` 2) . Proto.unLogIdx $ sentIdx
-                    let lastSent' = Map.insert sender toTry $ view followerLastSent leader
                     Trace.trace ("Retry peer " ++ show sender ++ " at : " ++ show toTry) $ return ()
-                    return $ leader & set followerLastSent lastSent'
+                    return $ leader & set (followers . ix sender . prevIdx) toTry
             _ -> Trace.trace ("Response to an unsent message? from " ++ show sender) $ return leader
 
-    findCommittedIndex followerPrevIdx' = do
+    findCommittedIndex :: LeaderState -> ProtoStateMachine (Maybe Proto.LogIdx)
+    findCommittedIndex st = do
         majority <- getMajority
         -- Find items acked by a ajority of servers.
         -- So first derive the acked idxes in descending order
         (_, myIdx ) <- getPrevLogTermIdx
-        let known = List.sortOn (0 -) $ myIdx : Map.elems followerPrevIdx'
+        let allIndexes = myIdx : toListOf (followers . each . prevIdx) st
+        let known = List.sortOn (0 -) $ allIndexes
         Trace.trace ("Known follower indexes: " ++ show known) $ return ()
         return $ Maybe.listToMaybe $ List.drop (pred majority) known
 
@@ -464,8 +470,8 @@ processTick () (Tick t) = do
         peers <- view peerNames
         myId <- view selfId
         thisTerm <- use currentTerm
-        (_prevTerm, prevIdx) <- getPrevLogTermIdx
-        let req = Proto.RequestVote thisTerm myId prevIdx
+        (_prevTerm, logIdx) <- getPrevLogTermIdx
+        let req = Proto.RequestVote thisTerm myId logIdx
         tell $ map (\p -> PeerRequest p req $ processPeerResponseMessage p) $ Set.toList peers
         Trace.trace ("transitionToCandidate new term: " ++ show thisTerm) $ return ()
 
@@ -488,30 +494,26 @@ replicatePendingEntriesToFollowers :: LeaderState -> ProtoStateMachine LeaderSta
 replicatePendingEntriesToFollowers leader = do
     Trace.trace ("Leader Tick") $ return ()
     peers <- view peerNames
-    let lastSent = view followerLastSent leader
-    let peerPrevIxes = view followerPrevIdx leader
-    peerSentIxes <- foldM (updatePeer peerPrevIxes) lastSent peers
-
-    return $ leader & set followerLastSent peerSentIxes
+    foldM updatePeer leader peers
 
     where
-    updatePeer :: Map.Map Proto.PeerName Proto.LogIdx
-               -> Map.Map Proto.PeerName Proto.LogIdx
+    updatePeer :: LeaderState
                -> Proto.PeerName
-               -> ProtoStateMachine (Map.Map Proto.PeerName Proto.LogIdx)
+               -> ProtoStateMachine LeaderState
 
-    updatePeer peerPrevIxes lastSentTo peer = do
+    updatePeer st peer = do
         thisTerm <- use currentTerm
         myId <- view selfId
-        (prevTerm, prevIdx) <- getPrevLogTermIdx
-        let peerPrevIdx = maybe prevIdx id $ Map.lookup peer peerPrevIxes
+        (logTerm, logIdx) <- getPrevLogTermIdx
+        let peerLastSent = maybe logIdx id $ preview (followers . ix peer . lastSent) st
         entries <- use logEntries
-        let peerPrevTerm = maybe prevTerm Proto.logTerm $ Map.lookup peerPrevIdx entries
+        let peerPrevTerm = maybe logTerm Proto.logTerm $ Map.lookup peerLastSent entries
         -- Send everything _after_ their previous index
-        let toSend = snd $ Map.split peerPrevIdx entries
+        let toSend = snd $ Map.split peerLastSent entries
+        let peerPrevIdx = maybe logIdx id $ preview (followers . ix peer . prevIdx) st
         sendPeerRequest peer $ Proto.AppendEntries $ Proto.AppendEntriesReq thisTerm myId peerPrevTerm peerPrevIdx toSend
-        let peerIdx' = maybe peerPrevIdx fst $ Map.lookupMax toSend
-        return $ Map.insert peer peerIdx' lastSentTo
+        let lastSent' = maybe peerPrevIdx fst $ Map.lookupMax toSend
+        return $ st & set (followers . ix peer . lastSent) lastSent'
 
 
 sendPeerRequest :: Proto.PeerName -> Proto.PeerRequest -> ProtoStateMachine ()

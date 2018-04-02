@@ -71,7 +71,6 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
             sendMessages pendingClientResponses peerOuts pendingPeerResponses outputs
             st' <- STM.readTVar stateRef
             return (st', outputs)
-        when False $ putStrLn $ "state now: " ++ show _st'
         when False $ putStrLn $ "sent: " ++ show outputs
 
 processMessageSTM :: STM.TVar RaftState
