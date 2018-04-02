@@ -155,9 +155,6 @@ newtype ProtoStateMachine a = ProtoStateMachine {
     runProto :: RWS.RWS ProtocolEnv [ProcessorMessage] RaftState a
 } deriving (Monad, Applicative, Functor, MonadState RaftState, MonadWriter [ProcessorMessage], MonadReader ProtocolEnv)
 
-oneSecond :: Time
-oneSecond = 1
-
 newFollower :: RaftRole
 newFollower = Follower $ FollowerState 0
 
