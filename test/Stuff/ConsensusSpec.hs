@@ -39,12 +39,10 @@ newtype WaitingCallback = WaitingCallback (PeerResponse -> ProtoStateMachine ())
 data InboxItem =
     RequestFromPeer PeerName PeerRequest
   | ResponseFromPeer PeerName WaitingCallback PeerResponse
-  | ClockTick Time
 
 instance Show InboxItem where
   show (RequestFromPeer name req) = "RequestFromPeer " ++ show name ++ " " ++ show req
   show (ResponseFromPeer name _ resp) = "ResponseFromPeer " ++ show name ++ " _ " ++ show resp
-  show (ClockTick t) = "ClockTick " ++ show t
 
 data NodeSim = NodeSim {
   _nodeEnv :: ProtocolEnv
@@ -61,7 +59,7 @@ makeLenses ''NodeSim
 makeLenses ''Network
 
 allPeers :: Set PeerName
-allPeers = Set.fromList $ fmap PeerName ["a", "b", "c"]
+allPeers = Set.fromList $ fmap PeerName ["a", "b", "c", "d", "e"]
 
 makeNode :: PeerName -> Time -> NodeSim
 makeNode self elTimeout = NodeSim newnodeEnv newnodeState Seq.empty Seq.empty
@@ -69,14 +67,12 @@ makeNode self elTimeout = NodeSim newnodeEnv newnodeState Seq.empty Seq.empty
     newnodeEnv = (ProtocolEnv self (Set.difference allPeers $ Set.singleton self) elTimeout (elTimeout / 3.0) :: ProtocolEnv)
     newnodeState = mkRaftState
 
-
-applyState :: InboxItem -> ProtoStateMachine ()
-applyState (ClockTick t) = do
+applyState :: Integer -> InboxItem -> ProtoStateMachine ()
+applyState n (RequestFromPeer sender req) = do
+  let t = n % ticksPerSecond
   processTick () $ Tick t
-
-applyState (RequestFromPeer sender req) = do
   processPeerRequestMessage req $ peerIdOfName sender
-applyState (ResponseFromPeer _sender (WaitingCallback f) resp) = f resp
+applyState _ (ResponseFromPeer _sender (WaitingCallback f) resp) = f resp
 
 -- applyState other = error $ "applyState: " ++ show other
 
@@ -99,9 +95,10 @@ in this model are effectively delivered immediately, and will be processed at
 the node's next activation.
 -}
 
+-- Arguably, clock should tick at a given node.
+-- Clock tick means that it just checks for timeouts.
 data ProcessId =
     Client Int
-  | Clock
   | Node PeerName
   deriving (Show)
 
@@ -110,9 +107,7 @@ peerName = Gen.element $ Set.toList allPeers
 
 processId :: Gen ProcessId
 processId = Gen.choice
-  [ Node <$> peerName
-  , Gen.constant Clock
-  ]
+  [ Node <$> peerName ]
 
 ticksPerSecond :: Integer
 ticksPerSecond = 1000
@@ -136,8 +131,8 @@ leadersOf net = leaders
     nodeList = Map.toList $ view nodes net
     leaders :: Map Term (Set PeerName)
     leaders = Map.fromList $ do
-            (name, state) <- nodeList
-            let st = view nodeState state
+            (name, state') <- nodeList
+            let st = view nodeState state'
             let term = currentTerm st
             case currentRole st of
               Leader _ -> [(term, Set.singleton name)]
@@ -172,7 +167,7 @@ prop_simulateLeaderElection = property $ do
         Trace.traceShow ("Leaders by term", allLeaders) $ return ()
 
         footnoteShow $ ("Leaders by term", allLeaders)
-        forM_ (Map.toList allLeaders) $ \(term, leaders) -> do
+        forM_ (Map.toList allLeaders) $ \(_, leaders) -> do
           assert $ 1 >= Set.size leaders
 
       evalIO $ putStrLn $ "Okay!"
@@ -184,18 +179,14 @@ prop_simulateLeaderElection = property $ do
       timeouts = Gen.list (Range.constant 3 3) $ ((+ 2500) <$> timestamp 1)
 
 simulateIteration :: (MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m ()
-simulateIteration n Clock = do
-    let t = n % ticksPerSecond
-    $(logDebugSH) ("Clock", t)
-    broadcastTick t
-simulateIteration _ (Node name) = do
+simulateIteration t (Node name) = do
     go
   where
   go = do
     quiescentp <- getQuiesecent name
     if quiescentp
     then return ()
-    else simulateStep name >> go
+    else simulateStep t name >> go
 
 simulateIteration _ other = error $ "simulateIteration: " ++ show other
 
@@ -205,15 +196,11 @@ getQuiesecent name = do
   $(logDebugSH) ("Inbox ", name, inboxes)
   return $ all Seq.null $ inboxes
 
-broadcastTick :: (MonadLogger m, MonadState Network m) => Time -> m ()
-broadcastTick n = do
-  (nodes . each . nodeInbox) %= (|> ClockTick n)
-
-simulateStep :: (MonadLogger m, MonadState Network m) => PeerName -> m ()
-simulateStep thisNode = do
+simulateStep :: (MonadLogger m, MonadState Network m) => Integer -> PeerName -> m ()
+simulateStep t thisNode = do
   node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get
   $(logDebugSH) ("Node:", thisNode, view nodeInbox node)
-  let actions = traverse_ applyState $ view nodeInbox node
+  let actions = traverse_ (applyState t) $ view nodeInbox node
   let ((), s', toSend) = RWS.runRWS (runProto actions) (view nodeEnv node) (view nodeState node)
   nodes . ix thisNode . nodeState .= s'
   nodes . ix thisNode . nodeInbox .= Seq.empty
