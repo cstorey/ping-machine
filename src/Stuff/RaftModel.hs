@@ -4,9 +4,10 @@
 module Stuff.RaftModel
 ( ProcessorMessage(..)
 , ProtoStateMachine(..)
-, RaftState(..)
-, RaftRole(..)
-, ProtocolEnv(..)
+, RaftState
+, RaftRole
+, ProtocolEnv
+, mkProtocolEnv
 , IdFor(..)
 , processClientReqRespMessage
 , processPeerRequestMessage
@@ -117,7 +118,7 @@ data ProtocolEnv = ProtocolEnv {
     selfId :: Proto.PeerName,
     peerNames :: PeerSet,
     electionTimeout :: Time,
-    appendEntriesPeriod :: Time
+    _appendEntriesPeriod :: Time
 } deriving (Show)
 
 data FollowerState = FollowerState {
@@ -154,6 +155,9 @@ data RaftState = RaftState {
 newtype ProtoStateMachine a = ProtoStateMachine {
     runProto :: RWS.RWS ProtocolEnv [ProcessorMessage] RaftState a
 } deriving (Monad, Applicative, Functor, MonadState RaftState, MonadWriter [ProcessorMessage], MonadReader ProtocolEnv)
+
+mkProtocolEnv :: Proto.PeerName -> PeerSet -> Time -> Time -> ProtocolEnv
+mkProtocolEnv = ProtocolEnv
 
 newFollower :: RaftRole
 newFollower = Follower $ FollowerState 0
@@ -413,7 +417,7 @@ processPeerResponseMessage sender _msg@(Proto.AppendResult aer) = do
                     return leader {
                         followerLastSent = lastSent'
                     }
-            _ -> Trace.trace ("Response to an unsent message?") $ return leader
+            _ -> Trace.trace ("Response to an unsent message? from " ++ show sender) $ return leader
 
     findCommittedIndex followerPrevIdx' = do
         majority <- getMajority

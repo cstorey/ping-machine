@@ -55,7 +55,7 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
     let aeTimeout = 1 :: Time
     putStrLn $ show ("Election timeout is", elTimeout, "append entries", aeTimeout)
 
-    let protocolEnv = ProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout
+    let protocolEnv = mkProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout
     let processClientMessage = processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
     let processPeerRequest = processReqRespMessageSTM stateRef protocolEnv pendingPeerResponses peerReqInQ processPeerRequestMessage
     let processTickMessage = processMessageSTM stateRef protocolEnv ticks processTick

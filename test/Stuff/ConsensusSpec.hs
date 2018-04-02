@@ -66,7 +66,7 @@ allPeers = Set.fromList $ fmap PeerName ["a", "b", "c"]
 makeNode :: PeerName -> Time -> NodeSim
 makeNode self elTimeout = NodeSim newnodeEnv newnodeState Seq.empty Seq.empty
   where
-    newnodeEnv = (ProtocolEnv self (Set.difference allPeers $ Set.singleton self) elTimeout (elTimeout / 3.0) :: ProtocolEnv)
+    newnodeEnv = (mkProtocolEnv self (Set.difference allPeers $ Set.singleton self) elTimeout (elTimeout / 3.0) :: ProtocolEnv)
     newnodeState = mkRaftState
 
 
@@ -129,21 +129,6 @@ timestamp len = do
 schedule :: Gen (Map Integer ProcessId)
 schedule = Gen.map (Range.linear 0 1000) $ ((,) <$> timestamp 100 <*> processId)
 
-leadersOf :: Network -> Map Term (Set PeerName)
-leadersOf net = leaders
-  where
-    nodeList :: [(PeerName, NodeSim)]
-    nodeList = Map.toList $ view nodes net
-    leaders :: Map Term (Set PeerName)
-    leaders = Map.fromList $ do
-            (name, state) <- nodeList
-            let st = view nodeState state
-            let term = currentTerm st
-            case currentRole st of
-              Leader _ -> [(term, Set.singleton name)]
-              _ -> []
-
-
 {-
 We know that _only_ leaders will emit AppendEntries events, so rather than
 inspecting the node state directly, we can listen for `AppendEntries` messages
@@ -161,10 +146,11 @@ prop_simulateLeaderElection = property $ do
         Trace.traceShow ("Timeouts", ts) $ return ()
         Trace.traceShow ("Schedule", sched) $ return ()
         let simulation = forM (Map.toList sched) $ \(t, node) -> do
-              simulateIteration t node
-              res <- get
-              return (t, res)
-        fst <$> State.runStateT (runStderrLoggingT simulation) network
+              msgs <- simulateIteration t node
+              return msgs
+        mconcat <$> fst <$> State.runStateT (runStderrLoggingT simulation) network
+
+      let _ = states :: [(PeerName, ProcessorMessage)]
 
       test $ do
         -- We should use Map.unionWith Set.union here
@@ -173,31 +159,30 @@ prop_simulateLeaderElection = property $ do
         Trace.traceShow ("Leaders by term", allLeaders) $ return ()
 
         footnoteShow $ ("Leaders by term", allLeaders)
-        forM_ (Map.toList allLeaders) $ \(term, leaders) -> do
+        forM_ (Map.toList allLeaders) $ \(_term, leaders) -> do
           assert $ 1 >= Set.size leaders
 
       evalIO $ putStrLn $ "Okay!"
   where
       allNodes ts = Map.fromList $ fmap (\(p, t) -> (p , makeNode p t)) $ zip (Set.toList allPeers) ts
-      leadersByTerm :: [(a, Network)] -> Map Term (Set PeerName)
-      leadersByTerm states = foldl' (Map.unionWith Set.union) Map.empty $ map (leadersOf . snd) states
+      leadersByTerm :: [(PeerName, ProcessorMessage)] -> Map Term (Set PeerName)
+      leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
         -- let allLeaders = List.foldl' ... $
+      leadersOf :: (PeerName, ProcessorMessage) -> Map Term (Set PeerName)
+      leadersOf (sender, PeerRequest _ (AppendEntries aer) _) = Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
+      leadersOf _ = Map.empty
+
       timeouts = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> timestamp 1)
       nnodes = Set.size allPeers
 
-simulateIteration :: (MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m ()
+simulateIteration :: (MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [(PeerName, ProcessorMessage)]
 simulateIteration n Clock = do
     let t = n % ticksPerSecond
     $(logDebugSH) ("Clock", t)
     broadcastTick t
+    return []
 simulateIteration _ (Node name) = do
-    go
-  where
-  go = do
-    quiescentp <- getQuiesecent name
-    if quiescentp
-    then return ()
-    else simulateStep name >> go
+    simulateStep name
 
 simulateIteration _ other = error $ "simulateIteration: " ++ show other
 
@@ -211,7 +196,7 @@ broadcastTick :: (MonadLogger m, MonadState Network m) => Time -> m ()
 broadcastTick n = do
   (nodes . each . nodeInbox) %= (|> ClockTick n)
 
-simulateStep :: (MonadLogger m, MonadState Network m) => PeerName -> m ()
+simulateStep :: (MonadLogger m, MonadState Network m) => PeerName -> m [(PeerName, ProcessorMessage)]
 simulateStep thisNode = do
   node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get
   $(logDebugSH) ("Node:", thisNode, view nodeInbox node)
@@ -236,7 +221,7 @@ simulateStep thisNode = do
         $(logDebugSH) (thisNode, clientId, "reply", m)
         error $ "something something client reply" ++ show (clientId, m)
 
-  return ()
+  return $ map (\m -> (thisNode, m)) toSend
 
 nameOfPeerId :: IdFor PeerResponse -> PeerName
 nameOfPeerId (IdFor 0) = PeerName "a"
