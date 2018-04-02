@@ -32,6 +32,7 @@ import qualified Data.List as List
 import Control.Monad
 import Lens.Micro.Platform
 
+import GHC.Stack
 import Stuff.Types
 
 newtype IdFor a = IdFor Int
@@ -340,9 +341,9 @@ processPeerRequestMessage
                     currentLeader .= Just leaderName
                     ackAppendEntries thisTerm
 
-processPeerResponseMessage :: Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
-processPeerResponseMessage _sender _msg@(Proto.VoteResult peerTerm granted) = do
-    Trace.trace ("processPeerResponseMessage: " ++ show _msg) $ return ()
+handleVoteResponse :: HasCallStack => Proto.RequestVoteReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
+handleVoteResponse _ _sender _msg@(Proto.VoteResult peerTerm granted) = do
+    Trace.trace ("handleVoteResponse: " ++ show _msg) $ return ()
     role <- use currentRole
     myTerm <- use currentTerm
 
@@ -375,9 +376,19 @@ processPeerResponseMessage _sender _msg@(Proto.VoteResult peerTerm granted) = do
             currentRole .= newRole
         else
             return ()
+handleVoteResponse req sender _msg = do
+    me <- view selfId
+    let msg =
+            Proto.unPeerName me ++ ": Unexpected response from " ++ show sender ++
+            " to vote request " ++ show req ++ " resp " ++ show _msg
+    -- error msg
+    -- Should at least be a warning, or something.
+    Trace.trace msg $ return ()
 
-processPeerResponseMessage sender _msg@(Proto.AppendResult aer) = do
-    Trace.trace ("processPeerResponseMessage: " ++ show _msg) $ return ()
+
+handleAppendEntriesResponse :: Proto.AppendEntriesReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
+handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
+    Trace.trace ("handleAppendEntriesResponse: " ++ show _msg) $ return ()
     role <- use currentRole
     case role of
         Leader leader -> do
@@ -436,8 +447,16 @@ processPeerResponseMessage sender _msg@(Proto.AppendResult aer) = do
         return $ leader & set pendingClientRequests unCommitted
 
 
+handleAppendEntriesResponse req sender _msg = do
+    me <- view selfId
+    let msg = Proto.unPeerName me ++ "Unepected response from " ++ show sender ++
+                " to append entries request:" ++ show req ++
+                " got " ++ show _msg
+    -- error msg
+    -- Should at least be a warning, or something.
+    Trace.trace msg $ return ()
 
-processTick :: () -> Tick -> ProtoStateMachine ()
+processTick :: HasCallStack => () -> Tick -> ProtoStateMachine ()
 processTick () (Tick t) = do
     role <- use currentRole
     case role of
@@ -452,7 +471,7 @@ processTick () (Tick t) = do
     return ()
 
     where
-    whenFollower :: FollowerState -> ProtoStateMachine ()
+    whenFollower :: HasCallStack => FollowerState -> ProtoStateMachine ()
     whenFollower follower = do
         let elapsed = (t - view lastLeaderHeartbeat follower)
         timeout <- view electionTimeout
@@ -461,7 +480,7 @@ processTick () (Tick t) = do
         then Trace.trace "Election timeout elapsed" $ transitionToCandidate
         else return ()
 
-    transitionToCandidate :: ProtoStateMachine ()
+    transitionToCandidate :: HasCallStack => ProtoStateMachine ()
     transitionToCandidate = do
         myName <- view selfId
         currentRole .= (Candidate $ CandidateState t $ Set.singleton myName)
@@ -473,9 +492,14 @@ processTick () (Tick t) = do
         myId <- view selfId
         thisTerm <- use currentTerm
         (_prevTerm, logIdx) <- getPrevLogTermIdx
-        let req = Proto.RequestVote $ Proto.RequestVoteReq thisTerm myId logIdx
-        tell $ map (\p -> PeerRequest p req $ processPeerResponseMessage p) $ Set.toList peers
+        let req = Proto.RequestVoteReq thisTerm myId logIdx
+        sendRequestVotes req peers
         Trace.trace ("transitionToCandidate new term: " ++ show thisTerm) $ return ()
+
+
+    sendRequestVotes :: HasCallStack => Proto.RequestVoteReq -> Set Proto.PeerName -> ProtoStateMachine ()
+    sendRequestVotes req peers =
+        tell $ map (\p -> PeerRequest p (Proto.RequestVote req) $ handleVoteResponse req p) $ Set.toList peers
 
     whenCandidate :: CandidateState -> ProtoStateMachine ()
     whenCandidate candidate = do
@@ -513,10 +537,11 @@ replicatePendingEntriesToFollowers leader = do
         -- Send everything _after_ their previous index
         let toSend = snd $ Map.split peerLastSent entries
         let peerPrevIdx = maybe logIdx id $ preview (followers . ix peer . prevIdx) st
-        sendPeerRequest peer $ Proto.AppendEntries $ Proto.AppendEntriesReq thisTerm myId peerPrevTerm peerPrevIdx toSend
+        sendAppendEntriesRequest peer $ Proto.AppendEntriesReq thisTerm myId peerPrevTerm peerPrevIdx toSend
         let lastSent' = maybe peerPrevIdx fst $ Map.lookupMax toSend
         return $ st & set (followers . ix peer . lastSent) lastSent'
 
 
-sendPeerRequest :: Proto.PeerName -> Proto.PeerRequest -> ProtoStateMachine ()
-sendPeerRequest peer req = tell [PeerRequest peer req $ processPeerResponseMessage peer]
+sendAppendEntriesRequest :: Proto.PeerName -> Proto.AppendEntriesReq -> ProtoStateMachine ()
+sendAppendEntriesRequest peer req = do
+    tell [PeerRequest peer (Proto.AppendEntries req) $ handleAppendEntriesResponse req peer]

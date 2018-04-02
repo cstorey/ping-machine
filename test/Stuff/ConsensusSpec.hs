@@ -12,7 +12,7 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
 import Control.Monad
-import Data.Sequence (Seq, (|>))
+import Data.Sequence (Seq, (|>), ViewL(..))
 import qualified Data.Sequence as Seq
 import Data.Foldable (traverse_, foldl')
 import qualified Control.Monad.Trans.RWS.Strict as RWS
@@ -23,6 +23,7 @@ import           Control.Monad.State.Class (MonadState(..), get)
 import Control.Monad.Logger
 import qualified Debug.Trace as Trace
 import Data.Ratio ((%))
+import GHC.Stack
 
 import Lens.Micro.Platform
 
@@ -48,7 +49,7 @@ instance Show InboxItem where
 
 data NodeSim = NodeSim {
   _nodeEnv :: ProtocolEnv
-, _nodeState :: RaftState
+, _nodeState :: !RaftState
 , _nodeInbox :: Seq InboxItem
 , _nodePendingResponses :: Seq (WaitingCallback)
 }
@@ -70,7 +71,7 @@ makeNode self elTimeout = NodeSim newnodeEnv newnodeState Seq.empty Seq.empty
     newnodeState = mkRaftState
 
 
-applyState :: InboxItem -> ProtoStateMachine ()
+applyState :: HasCallStack => InboxItem -> ProtoStateMachine ()
 applyState (ClockTick t) = do
   processTick () $ Tick t
 
@@ -189,33 +190,40 @@ simulateIteration _ other = error $ "simulateIteration: " ++ show other
 getQuiesecent :: (MonadLogger m, MonadState Network m) => PeerName -> m Bool
 getQuiesecent name = do
   inboxes <- toListOf (nodes . ix name . nodeInbox) <$> get
-  $(logDebugSH) ("Inbox ", name, inboxes)
+  $(logDebugSH) ("Inbox", name, inboxes)
   return $ all Seq.null $ inboxes
 
 broadcastTick :: (MonadLogger m, MonadState Network m) => Time -> m ()
 broadcastTick n = do
   (nodes . each . nodeInbox) %= (|> ClockTick n)
 
-simulateStep :: (MonadLogger m, MonadState Network m) => PeerName -> m [(PeerName, ProcessorMessage)]
+simulateStep :: (HasCallStack, MonadLogger m, MonadState Network m) => PeerName -> m [(PeerName, ProcessorMessage)]
 simulateStep thisNode = do
   node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get
-  $(logDebugSH) ("Node:", thisNode, view nodeInbox node)
+  $(logDebugSH) ("Run", thisNode, view nodeInbox node)
+  Trace.traceShow ("Run", thisNode, view nodeInbox node) $ return ()
   let actions = traverse_ applyState $ view nodeInbox node
   let ((), s', toSend) = RWS.runRWS (runProto actions) (view nodeEnv node) (view nodeState node)
-  nodes . ix thisNode . nodeState .= s'
+  nodes . ix thisNode . nodeState .= (s' `seq` s')
   nodes . ix thisNode . nodeInbox .= Seq.empty
+
+  $(logDebugSH) ("Outputs from ", thisNode, toSend)
 
   forM_ toSend $ \msg -> do
     case msg of
       PeerRequest name m cb -> do
-        $(logDebugSH) (thisNode, name, "PeerRequest", m)
+        $(logDebugSH) (unPeerName thisNode, "->", unPeerName name, "PeerRequest", m)
         nodes . ix name . nodeInbox %= (|> RequestFromPeer thisNode m)
         nodes . ix thisNode . nodePendingResponses %= (|> WaitingCallback cb)
       PeerReply peerId m -> do
         let name = nameOfPeerId peerId
-        $(logDebugSH) (thisNode, name, "PeerReply", m)
-        cb <- fromMaybe (error "No waiting callback?") <$> preview (nodes . ix name . nodePendingResponses . each) <$> get
-        nodes . ix name . nodeInbox %= (|> ResponseFromPeer thisNode cb m)
+        $(logDebugSH) (unPeerName name, "<-", unPeerName thisNode, "PeerReply", m)
+        pending <- use (nodes . ix name . nodePendingResponses)
+        case Seq.viewl pending of
+          Seq.EmptyL -> error "No waiting callback?"
+          cb :< rest -> do
+            (nodes . ix name . nodePendingResponses)  .= rest
+            nodes . ix name . nodeInbox %= (|> ResponseFromPeer thisNode cb m)
         return ()
       Reply clientId m -> do
         $(logDebugSH) (thisNode, clientId, "reply", m)
