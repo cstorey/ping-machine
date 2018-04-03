@@ -195,16 +195,19 @@ simulateStep :: (HasCallStack, MonadLogger m, MonadState Network m) => PeerName 
 simulateStep thisNode = do
   node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get
   let inbox = view nodeInbox node
+  nodes . ix thisNode . nodeInbox .= Seq.empty
+
   $(logDebugSH) ("Run", thisNode, inbox)
   let actions = flip traverse_ inbox $ \it -> do
                   $(logDebugSH) ("apply", thisNode, it)
                   applyState it
+
   let (((), s', toSend), logs) = Identity.runIdentity $
                                  Logger.runWriterLoggingT $
                                  RWS.runRWST (runProto $ actions) (view nodeEnv node) (view nodeState node)
   forM_ logs $ \(loc, src, lvl, logmsg) -> Logger.monadLoggerLog loc src lvl logmsg
+
   nodes . ix thisNode . nodeState .= (s' `seq` s')
-  nodes . ix thisNode . nodeInbox .= Seq.empty
 
   $(logDebugSH) ("Outputs from ", thisNode, toSend)
 

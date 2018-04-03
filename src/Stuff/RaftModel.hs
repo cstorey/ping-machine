@@ -227,7 +227,7 @@ laterTermObserved laterTerm = do
     currentTerm .= laterTerm
     votedFor .= Nothing
 
-    stepDown
+    void $ stepDown
     where
         whenLeader :: HasCallStack => LeaderState -> ProtoStateMachine ()
         whenLeader leader = do
@@ -237,11 +237,13 @@ laterTermObserved laterTerm = do
                 -- We should really actually run a state machine here. But ...
                 tell [Reply clid $ Left $ Proto.NotLeader $ Nothing]
 
-stepDown :: HasCallStack => ProtoStateMachine ()
+stepDown :: HasCallStack => ProtoStateMachine FollowerState
 stepDown = do
     prevTick <- use prevTickTime
-    let role' = Follower $ FollowerState prevTick
+    let st = FollowerState prevTick
+    let role' = Follower $ st
     currentRole .= role'
+    return st
 
 getPrevLogTermIdx :: HasCallStack => ProtoStateMachine (Proto.Term, Proto.LogIdx)
 getPrevLogTermIdx = do
@@ -306,7 +308,8 @@ processPeerRequestMessage
                 Follower follower -> do
                     whenFollower thisTerm follower
                 Candidate _st -> do
-                    stepDown
+                    follower <- stepDown
+                    whenFollower thisTerm follower
                 Leader _st -> do
                     error ("appendEntries recieved when leader? " ++ show _msg)
 
