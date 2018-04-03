@@ -43,11 +43,13 @@ data InboxItem =
     RequestFromPeer PeerName PeerRequest
   | ResponseFromPeer PeerName WaitingCallback PeerResponse
   | ClockTick Time
+  | ClientRequest (IdFor ClientResponse) ClientRequest
 
 instance Show InboxItem where
   show (RequestFromPeer name req) = "RequestFromPeer " ++ show name ++ " " ++ show req
   show (ResponseFromPeer name _ resp) = "ResponseFromPeer " ++ show name ++ " _ " ++ show resp
   show (ClockTick t) = "ClockTick " ++ show t
+  show (ClientRequest rid req) = "Client " ++ show rid ++ " " ++ show req
 
 data NodeSim = NodeSim {
   _nodeEnv :: ProtocolEnv
@@ -81,6 +83,9 @@ applyState (RequestFromPeer sender req) = do
   processPeerRequestMessage req $ peerIdOfName sender
 applyState (ResponseFromPeer _sender (WaitingCallback f) resp) = f resp
 
+applyState (ClientRequest rid cmd) = do
+  processClientReqRespMessage cmd rid
+
 -- applyState other = error $ "applyState: " ++ show other
 
 {-
@@ -103,7 +108,7 @@ the node's next activation.
 -}
 
 data ProcessId =
-    Client Int
+    Client PeerName (IdFor ClientResponse) ClientRequest
   | Clock PeerName
   | Node PeerName
   deriving (Show)
@@ -111,10 +116,20 @@ data ProcessId =
 peerName :: Gen PeerName
 peerName = Gen.element $ Set.toList allPeers
 
+clientCommand :: Gen ClientRequest
+clientCommand = Gen.choice
+  [ Gen.constant Bing
+  , Gen.constant Ping
+  ]
+
+aClientId :: Gen (IdFor ClientResponse)
+aClientId = IdFor <$> Gen.integral (Range.linear 0 100)
+
 processId :: Gen ProcessId
 processId = Gen.choice
   [ Node <$> peerName
   , Clock <$> peerName
+  , Client <$> peerName <*> aClientId <*> clientCommand
   ]
 
 ticksPerSecond :: Integer
@@ -138,22 +153,31 @@ inspecting the node state directly, we can listen for `AppendEntries` messages
 from nodes, and record the source against the term.
 -}
 
-prop_simulateLeaderElection :: HasCallStack => Property
-prop_simulateLeaderElection = property $ do
+runSimulation :: [Char] -> PropertyT IO [(PeerName, ProcessorMessage)]
+runSimulation prefix = do
       ts <- forAll timeouts
       sched <- forAll schedule
       let network = Network (allNodes $ map (% ticksPerSecond) ts)
       let h = hash $ show (ts, sched)
-      let fname = "/tmp/prop_simulateLeaderElection_" ++ show h
+      let fname = prefix ++ show h
       footnoteShow $ "Logging to: " ++ fname
 
-      states <- evalIO $ do
+      evalIO $ do
         let simulation = forM (Map.toList sched) $ \(t, node) -> do
               msgs <- simulateIteration t node
               return msgs
         mconcat <$> fst <$> State.runStateT (runFileLoggingT fname simulation) network
 
-      let allLeaders = leadersByTerm states
+  where
+    timeouts = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> timestamp 1)
+    nnodes = Set.size allPeers
+    allNodes ts = Map.fromList $ fmap (\(p, t) -> (p , makeNode p t)) $ zip (Set.toList allPeers) ts
+
+prop_simulateLeaderElection :: HasCallStack => Property
+prop_simulateLeaderElection = property $ do
+      messages <- runSimulation "/tmp/prop_simulateLeaderElection_"
+
+      let allLeaders = leadersByTerm messages
 
       test $ do
         footnoteShow $ ("Leaders by term", allLeaders)
@@ -161,7 +185,6 @@ prop_simulateLeaderElection = property $ do
           assert $ 1 >= Set.size leaders
 
   where
-      allNodes ts = Map.fromList $ fmap (\(p, t) -> (p , makeNode p t)) $ zip (Set.toList allPeers) ts
       leadersByTerm :: [(PeerName, ProcessorMessage)] -> Map Term (Set PeerName)
       leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
         -- let allLeaders = List.foldl' ... $
@@ -169,8 +192,23 @@ prop_simulateLeaderElection = property $ do
       leadersOf (sender, PeerRequest _ (AppendEntries aer) _) = Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
       leadersOf _ = Map.empty
 
-      timeouts = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> timestamp 1)
-      nnodes = Set.size allPeers
+prop_clientsAlwaysGetSomeResponse :: HasCallStack => Property
+prop_clientsAlwaysGetSomeResponse = property $ do
+      messages <- runSimulation "/tmp/prop_clientsAlwaysGetSomeResponse"
+
+      let reqIds = foldl' findRequest Set.empty messages
+      let respIds = foldl' findResponse Set.empty messages
+      test $ do
+          footnoteShow messages
+          reqIds === respIds
+
+  where
+    findRequest :: Set (IdFor z) -> (PeerName, ProcessorMessage) -> Set (IdFor z)
+    findRequest r (ClientRequest rid _) = Set.insert rid r
+    findRequest r _ = r
+    -- findResponse r _ = Set.insert rid r
+    -- findResponse r _ = r
+    findResponse a _ = a
 
 simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [(PeerName, ProcessorMessage)]
 simulateIteration n (Clock name) = do
@@ -182,7 +220,11 @@ simulateIteration n (Clock name) = do
 simulateIteration _ (Node name) = do
     simulateStep name
 
-simulateIteration _ other = error $ "simulateIteration: " ++ show other
+simulateIteration n (Client peer rid cmd) = do
+    let t = n % ticksPerSecond
+    $(logDebugSH) ("Client", peer, rid, t)
+    (nodes . ix peer . nodeInbox) %= (|> ClientRequest rid cmd)
+    return []
 
 getQuiesecent :: (MonadLogger m, MonadState Network m) => PeerName -> m Bool
 getQuiesecent name = do
@@ -250,7 +292,6 @@ simulateStep thisNode = do
 
   sendClientReply clientId m = do
         $(logDebugSH) (thisNode, clientId, "sendClientReply", m)
-        error $ "something something client reply" ++ show (clientId, m)
 
 nameOfPeerId :: IdFor PeerResponse -> PeerName
 nameOfPeerId (IdFor 0) = PeerName "a"

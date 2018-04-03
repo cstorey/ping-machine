@@ -167,7 +167,7 @@ data ProcessorMessage = Reply (IdFor Proto.ClientResponse) Proto.ClientResponse
 instance Show ProcessorMessage where
   show (Reply reqid resp) = "Reply " ++ show reqid ++ " " ++ show resp
   show (PeerReply reqid resp) = "PeerReply " ++ show reqid ++ " " ++ show resp
-  show (PeerRequest name req _) = "PeerRequest " ++ show name ++ " " ++ show req ++ " #<action>"
+  show (PeerRequest name req _) = "PeerRequest " ++ show name ++ " " ++ show req ++ " _"
 
 newtype ProtoStateMachine a = ProtoStateMachine {
     runProto :: (RWS.RWST ProtocolEnv [ProcessorMessage] RaftState (WriterLoggingT Identity)) a
