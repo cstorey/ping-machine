@@ -23,11 +23,10 @@ import qualified Control.Monad.Trans.RWS.Strict as RWS
 import           Control.Monad.Writer.Class (MonadWriter(..))
 import           Control.Monad.State.Class (MonadState(..))
 import           Control.Monad.Reader.Class (MonadReader(..))
-import           Control.Monad.Logger (WriterLoggingT, MonadLogger)
+import           Control.Monad.Logger (WriterLoggingT, MonadLogger, logDebugSH, logWarnSH, logInfoSH)
 import qualified Data.Map as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
-import qualified Debug.Trace as Trace
 import qualified Data.Maybe as Maybe
 import qualified Data.List as List
 import Control.Monad
@@ -207,7 +206,7 @@ processClientReqRespMessage command pendingResponse = do
     where
     refuseClientRequest = do
         myLeader <- use currentLeader
-        Trace.trace "Not leader" $ return ()
+        $(logDebugSH) "Not leader"
         tell [Reply pendingResponse $ Left $ Proto.NotLeader myLeader]
 
     recordPendingClientRequest :: Monad m => Proto.LogIdx -> LeaderState -> m LeaderState
@@ -219,7 +218,7 @@ laterTermObserved :: Proto.Term -> ProtoStateMachine ()
 laterTermObserved laterTerm = do
     thisTerm <- use currentTerm
     formerRole <- use currentRole
-    Trace.trace ("Later term observed: " ++ show laterTerm ++ " > " ++ show thisTerm) $ return ()
+    $(logDebugSH) ("Later term observed", laterTerm, " > ", thisTerm)
 
     case formerRole of
         Leader leader -> whenLeader leader
@@ -233,7 +232,7 @@ laterTermObserved laterTerm = do
         whenLeader :: LeaderState -> ProtoStateMachine ()
         whenLeader leader = do
             let pending = view pendingClientRequests leader
-            Trace.trace ("Nacking requests: " ++ show pending) $ return ()
+            $(logDebugSH) ("Nacking requests", pending)
             forM_ (Map.toList pending) $ \(_, clid) -> do
                 -- We should really actually run a state machine here. But ...
                 tell [Reply clid $ Left $ Proto.NotLeader $ Nothing]
@@ -263,18 +262,17 @@ processPeerRequestMessage (Proto.RequestVote req) sender = do
     (_prevTerm, logIdx) <- getPrevLogTermIdx
     case () of
         _ | candidateTerm < thisTerm -> do
-            Trace.trace (show candidateTerm ++ " < " ++ show thisTerm) $ return ()
+            $(logDebugSH) (candidateTerm, " < ", thisTerm)
             refuseVote thisTerm
         _ | candidateTerm > thisTerm -> do
             laterTermObserved candidateTerm
-            Trace.trace ("Granting vote") $ grantVote candidateTerm
-            -- Reply No?
-        _ | Maybe.isNothing vote && Proto.rvHead req >= logIdx -> do
-            Trace.trace ("Granting vote") $ return ()
+            $(logDebugSH) ("Granting vote")
             grantVote candidateTerm
-            -- Already
+        _ | Maybe.isNothing vote && Proto.rvHead req >= logIdx -> do
+            $(logDebugSH) ("Granting vote")
+            grantVote candidateTerm
         _ -> do
-            Trace.trace ("Already voted for " ++ show vote) $ return ()
+            $(logDebugSH) ("Already voted for", vote)
             refuseVote thisTerm
 
     return ()
@@ -290,14 +288,13 @@ processPeerRequestMessage (Proto.RequestVote req) sender = do
 processPeerRequestMessage
     _msg@(Proto.AppendEntries (Proto.AppendEntriesReq leaderTerm leaderName assumedHeadTerm assumedHeadIdx newEntries)) reqId = do
     -- prevTick <- prevTickTime <$> get
-    Trace.trace ("<- Append Entries: " ++ show _msg) $ return ()
+    $(logDebugSH) ("<- Append Entries", _msg)
 
     thisTerm <- use currentTerm
     if leaderTerm < thisTerm
     then do
         return ()
-        Trace.trace (show leaderTerm ++ " < " ++ show thisTerm) $ return ()
-        Trace.trace ("Refuse appendentries") $ return ()
+        $(logDebugSH) ("Refuse appendentries", leaderTerm, " < ", thisTerm)
         refuseAppendEntries thisTerm
     else
         if leaderTerm > thisTerm
@@ -330,12 +327,12 @@ processPeerRequestMessage
             let myEntry = Map.lookup assumedHeadIdx entries
             case Proto.logTerm <$> myEntry of
                 Just n | n /= assumedHeadTerm -> do
-                    Trace.trace ("Refusing as prev item was: " ++ show myEntry ++ " wanted term " ++ show assumedHeadTerm) $
-                        refuseAppendEntries thisTerm
+                    $(logDebugSH) ("Refusing as prev item was", myEntry, "wanted term", assumedHeadTerm)
+                    refuseAppendEntries thisTerm
                 -- We need to refuse here iff it's ahead of our log
                 Nothing | assumedHeadIdx > logHeadIdx -> do
-                    Trace.trace ("Refusing as prevIdx index: " ++ show assumedHeadIdx ++ " ahead of our " ++ show logHeadIdx) $
-                        refuseAppendEntries thisTerm
+                    $(logDebugSH) ("Refusing as prevIdx index", assumedHeadIdx, "ahead of our", logHeadIdx)
+                    refuseAppendEntries thisTerm
                 _ -> do
                     let (entries', _)  = Map.split (succ assumedHeadIdx) entries
                     let entries'' = Map.union entries' newEntries
@@ -345,17 +342,17 @@ processPeerRequestMessage
 
 handleVoteResponse :: HasCallStack => Proto.RequestVoteReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
 handleVoteResponse _ _sender _msg@(Proto.VoteResult peerTerm granted) = do
-    Trace.trace ("handleVoteResponse: " ++ show _msg) $ return ()
+    $(logDebugSH) ("handleVoteResponse", _msg)
     role <- use currentRole
     myTerm <- use currentTerm
 
     case role of
         _ | peerTerm > myTerm -> laterTermObserved peerTerm
-        _ | peerTerm < myTerm -> Trace.trace ("Ignoring vote for previous term") $ return ()
+        _ | peerTerm < myTerm -> $(logDebugSH) ("Ignoring vote for previous term")
         Candidate st -> do
             whenCandidate myTerm st
         _ -> do
-            Trace.trace ("vote recieved when non candidate?") $ return ()
+            $(logDebugSH) ("vote recieved when non candidate?")
     where
     whenCandidate myTerm candidate = do
         if granted
@@ -365,11 +362,9 @@ handleVoteResponse _ _sender _msg@(Proto.VoteResult peerTerm granted) = do
 
             neededVotes <- getMajority
 
-            Trace.trace ("In term: " ++ show myTerm ++
-                " Vote ack for term: " ++ show peerTerm ++
-                " needed: " ++ show neededVotes ++
-                " have: " ++ show currentVotes
-                ) $ return ()
+            $(logDebugSH) (
+                "In term: " , myTerm , " Vote ack for term: " , peerTerm ,
+                " needed: " , neededVotes , " have: " , currentVotes)
 
             let newRole = if length currentVotes >= neededVotes
                 then Leader $ LeaderState Map.empty Nothing Map.empty
@@ -381,16 +376,16 @@ handleVoteResponse _ _sender _msg@(Proto.VoteResult peerTerm granted) = do
 handleVoteResponse req sender _msg = do
     me <- view selfId
     let msg =
-            Proto.unPeerName me ++ ": Unexpected response from " ++ show sender ++
-            " to vote request " ++ show req ++ " resp " ++ show _msg
+            (Proto.unPeerName me , ": Unexpected response from " , sender ,
+            " to vote request " , req , " resp " , _msg)
     -- error msg
     -- Should at least be a warning, or something.
-    Trace.trace msg $ return ()
+    $(logWarnSH) msg
 
 
 handleAppendEntriesResponse :: Proto.AppendEntriesReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
 handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
-    Trace.trace ("handleAppendEntriesResponse: " ++ show _msg) $ return ()
+    $(logDebugSH) ("handleAppendEntriesResponse", _msg)
     role <- use currentRole
     case role of
         Leader leader -> do
@@ -398,7 +393,7 @@ handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
             leader'' <- maybe (return leader') (ackPendingClientResponses leader' ) $ view committed leader'
             currentRole .= (Leader $ leader'')
         _st -> do
-            Trace.trace ("append response recieved when non leader? " ++ show _msg) $ return ()
+            $(logWarnSH) ("append response recieved when non leader?", _msg)
     where
     whenLeader leader = do
         -- FIXME: This is wrong, as it'll produce incorrect results when we
@@ -412,7 +407,7 @@ handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
                     -- let followerPrevIdx' = Map.insert sender sentIdx $ view followerPrevIdx leader
                     committedIdx <- findCommittedIndex leader
 
-                    Trace.trace ("committed index should be: " ++ show committedIdx) $ return ()
+                    $(logDebugSH) ("committed index should be", committedIdx)
 
                     return $ leader
                         & set (followers . ix sender . prevIdx) sentIdx
@@ -420,9 +415,11 @@ handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
 
                 else do
                     let toTry = Proto.LogIdx . (`div` 2) . Proto.unLogIdx $ sentIdx
-                    Trace.trace ("Retry peer " ++ show sender ++ " at : " ++ show toTry) $ return ()
+                    $(logDebugSH) ("Retry peer " , sender , " at : " , toTry)
                     return $ leader & set (followers . ix sender . prevIdx) toTry
-            _ -> Trace.trace ("Response to an unsent message? from " ++ show sender) $ return leader
+            _ -> do
+                  $(logDebugSH) ("Response to an unsent message? from " , sender)
+                  return leader
 
     findCommittedIndex :: LeaderState -> ProtoStateMachine (Maybe Proto.LogIdx)
     findCommittedIndex st = do
@@ -432,16 +429,16 @@ handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
         (_, myIdx ) <- getPrevLogTermIdx
         let allIndexes = myIdx : toListOf (followers . each . prevIdx) st
         let known = List.sortOn (0 -) $ allIndexes
-        Trace.trace ("Known follower indexes: " ++ show known) $ return ()
+        $(logDebugSH) ("Known follower indexes: " , known)
         return $ Maybe.listToMaybe $ List.drop (pred majority) known
 
     ackPendingClientResponses :: LeaderState -> Proto.LogIdx -> ProtoStateMachine LeaderState
     ackPendingClientResponses leader idx = do
         let pending = view pendingClientRequests leader
         let (canRespond, unCommitted) = Map.spanAntitone (<= idx) pending
-        Trace.trace ("committed index: " ++ show idx ++ " pending: " ++ show canRespond) $ return ()
+        $(logDebugSH) ("committed index: " , idx , " pending: " , canRespond)
 
-        Trace.trace ("Responding to requests: " ++ show canRespond) $ return ()
+        $(logDebugSH) ("Responding to requests: " , canRespond)
         forM_ (Map.toList canRespond) $ \(reqIdx, clid) -> do
             -- We should really actually run a state machine here. But ...
             tell [Reply clid $ Right $ Proto.Bong $ show reqIdx]
@@ -456,7 +453,7 @@ handleAppendEntriesResponse req sender _msg = do
                 " got " ++ show _msg
     -- error msg
     -- Should at least be a warning, or something.
-    Trace.trace msg $ return ()
+    $(logDebugSH) msg
 
 processTick :: HasCallStack => () -> Tick -> ProtoStateMachine ()
 processTick () (Tick t) = do
@@ -477,9 +474,11 @@ processTick () (Tick t) = do
     whenFollower follower = do
         let elapsed = (t - view lastLeaderHeartbeat follower)
         timeout <- view electionTimeout
-        Trace.trace ("Elapsed: " ++ show elapsed ++ "/" ++ show timeout) $ return ()
+        $(logDebugSH) ("Elapsed: " , elapsed , "/" , timeout)
         if elapsed > timeout
-        then Trace.trace "Election timeout elapsed" $ transitionToCandidate
+        then do
+            $(logDebugSH) "Election timeout elapsed"
+            transitionToCandidate
         else return ()
 
     transitionToCandidate :: HasCallStack => ProtoStateMachine ()
@@ -496,7 +495,7 @@ processTick () (Tick t) = do
         (_prevTerm, logIdx) <- getPrevLogTermIdx
         let req = Proto.RequestVoteReq thisTerm myId logIdx
         sendRequestVotes req peers
-        Trace.trace ("transitionToCandidate new term: " ++ show thisTerm) $ return ()
+        $(logDebugSH) ("transitionToCandidate new term: " , thisTerm)
 
 
     sendRequestVotes :: HasCallStack => Proto.RequestVoteReq -> Set Proto.PeerName -> ProtoStateMachine ()
@@ -508,9 +507,11 @@ processTick () (Tick t) = do
         -- has the election timeout passed?
         let elapsed = t - view requestVoteSentAt candidate
         timeout <- view electionTimeout
-        Trace.trace ("Elapsed: " ++ show elapsed ++ "/" ++ show timeout) $ return ()
+        $(logDebugSH) ("Elapsed: " , elapsed , "/" , timeout)
         if elapsed > timeout
-        then Trace.trace "Election timeout elapsed" $ transitionToCandidate
+        then do
+          $(logInfoSH) "Election timeout elapsed"
+          transitionToCandidate
         else return ()
 
     whenLeader leader = do
@@ -520,7 +521,7 @@ processTick () (Tick t) = do
 
 replicatePendingEntriesToFollowers :: LeaderState -> ProtoStateMachine LeaderState
 replicatePendingEntriesToFollowers leader = do
-    Trace.trace ("Leader Tick") $ return ()
+    $(logDebugSH) ("Leader Tick")
     peers <- view peerNames
     foldM updatePeer leader peers
 
