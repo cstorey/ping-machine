@@ -23,9 +23,9 @@ import           Control.Monad.State.Class (MonadState(..), get)
 import qualified Data.Functor.Identity as Identity
 import qualified Control.Monad.Logger as Logger
 import Control.Monad.Logger
-import qualified Debug.Trace as Trace
 import Data.Ratio ((%))
 import GHC.Stack
+import Data.Hashable
 
 import Lens.Micro.Platform
 
@@ -138,34 +138,28 @@ inspecting the node state directly, we can listen for `AppendEntries` messages
 from nodes, and record the source against the term.
 -}
 
-prop_simulateLeaderElection :: Property
+prop_simulateLeaderElection :: HasCallStack => Property
 prop_simulateLeaderElection = property $ do
       ts <- forAll timeouts
       sched <- forAll schedule
       let network = Network (allNodes $ map (% ticksPerSecond) ts)
+      let h = hash $ show (ts, sched)
+      let fname = "/tmp/foo-" ++ show h
+      footnoteShow $ "Logging to: " ++ fname
+
       states <- evalIO $ do
-        putStrLn "---"
-        putStrLn "Running:"
-        Trace.traceShow ("Timeouts", ts) $ return ()
-        Trace.traceShow ("Schedule", sched) $ return ()
         let simulation = forM (Map.toList sched) $ \(t, node) -> do
               msgs <- simulateIteration t node
               return msgs
-        mconcat <$> fst <$> State.runStateT (runStderrLoggingT simulation) network
+        mconcat <$> fst <$> State.runStateT (runFileLoggingT fname simulation) network
 
-      let _ = states :: [(PeerName, ProcessorMessage)]
+      let allLeaders = leadersByTerm states
 
       test $ do
-        -- We should use Map.unionWith Set.union here
-
-        let allLeaders = leadersByTerm states
-        Trace.traceShow ("Leaders by term", allLeaders) $ return ()
-
         footnoteShow $ ("Leaders by term", allLeaders)
         forM_ (Map.toList allLeaders) $ \(_term, leaders) -> do
           assert $ 1 >= Set.size leaders
 
-      evalIO $ putStrLn $ "Okay!"
   where
       allNodes ts = Map.fromList $ fmap (\(p, t) -> (p , makeNode p t)) $ zip (Set.toList allPeers) ts
       leadersByTerm :: [(PeerName, ProcessorMessage)] -> Map Term (Set PeerName)
@@ -178,7 +172,7 @@ prop_simulateLeaderElection = property $ do
       timeouts = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> timestamp 1)
       nnodes = Set.size allPeers
 
-simulateIteration :: (MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [(PeerName, ProcessorMessage)]
+simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [(PeerName, ProcessorMessage)]
 simulateIteration n Clock = do
     let t = n % ticksPerSecond
     $(logDebugSH) ("Clock", t)
@@ -203,7 +197,6 @@ simulateStep :: (HasCallStack, MonadLogger m, MonadState Network m) => PeerName 
 simulateStep thisNode = do
   node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get
   $(logDebugSH) ("Run", thisNode, view nodeInbox node)
-  Trace.traceShow ("Run", thisNode, view nodeInbox node) $ return ()
   let actions = traverse_ applyState $ view nodeInbox node
   let (((), s', toSend), logs) = Identity.runIdentity $
                                  Logger.runWriterLoggingT $

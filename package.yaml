@@ -86,3 +86,4 @@ tests:
     - hspec
     - hspec-discover
     - hedgehog
+    - hashable
