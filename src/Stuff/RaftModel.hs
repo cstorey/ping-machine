@@ -381,7 +381,7 @@ handleVoteResponse req sender _msg = do
     let msg =
             Proto.unPeerName me ++ ": Unexpected response from " ++ show sender ++
             " to vote request " ++ show req ++ " resp " ++ show _msg
-    -- error msg
+    _ <- error msg
     -- Should at least be a warning, or something.
     Trace.trace msg $ return ()
 
@@ -452,7 +452,7 @@ handleAppendEntriesResponse req sender _msg = do
     let msg = Proto.unPeerName me ++ "Unepected response from " ++ show sender ++
                 " to append entries request:" ++ show req ++
                 " got " ++ show _msg
-    -- error msg
+    _ <- error msg
     -- Should at least be a warning, or something.
     Trace.trace msg $ return ()
 

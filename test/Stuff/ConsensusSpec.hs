@@ -24,6 +24,7 @@ import Control.Monad.Logger
 import qualified Debug.Trace as Trace
 import Data.Ratio ((%))
 import GHC.Stack
+import Data.Hashable
 
 import Lens.Micro.Platform
 
@@ -136,11 +137,15 @@ inspecting the node state directly, we can listen for `AppendEntries` messages
 from nodes, and record the source against the term.
 -}
 
-prop_simulateLeaderElection :: Property
+prop_simulateLeaderElection :: HasCallStack => Property
 prop_simulateLeaderElection = property $ do
       ts <- forAll timeouts
       sched <- forAll schedule
       let network = Network (allNodes $ map (% ticksPerSecond) ts)
+      let h = hash $ show (ts, sched)
+      let fname = "/tmp/foo-" ++ show h
+      footnoteShow $ "Logging to: " ++ fname
+
       states <- evalIO $ do
         putStrLn "---"
         putStrLn "Running:"
@@ -149,7 +154,7 @@ prop_simulateLeaderElection = property $ do
         let simulation = forM (Map.toList sched) $ \(t, node) -> do
               msgs <- simulateIteration t node
               return msgs
-        mconcat <$> fst <$> State.runStateT (runStderrLoggingT simulation) network
+        mconcat <$> fst <$> State.runStateT (runFileLoggingT fname simulation) network
 
       let _ = states :: [(PeerName, ProcessorMessage)]
 
@@ -176,7 +181,7 @@ prop_simulateLeaderElection = property $ do
       timeouts = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> timestamp 1)
       nnodes = Set.size allPeers
 
-simulateIteration :: (MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [(PeerName, ProcessorMessage)]
+simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [(PeerName, ProcessorMessage)]
 simulateIteration n Clock = do
     let t = n % ticksPerSecond
     $(logDebugSH) ("Clock", t)
