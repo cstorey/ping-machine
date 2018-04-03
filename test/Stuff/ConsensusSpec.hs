@@ -104,7 +104,7 @@ the node's next activation.
 
 data ProcessId =
     Client Int
-  | Clock
+  | Clock PeerName
   | Node PeerName
   deriving (Show)
 
@@ -114,7 +114,7 @@ peerName = Gen.element $ Set.toList allPeers
 processId :: Gen ProcessId
 processId = Gen.choice
   [ Node <$> peerName
-  , Gen.constant Clock
+  , Clock <$> peerName
   ]
 
 ticksPerSecond :: Integer
@@ -173,11 +173,12 @@ prop_simulateLeaderElection = property $ do
       nnodes = Set.size allPeers
 
 simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [(PeerName, ProcessorMessage)]
-simulateIteration n Clock = do
+simulateIteration n (Clock name) = do
     let t = n % ticksPerSecond
-    $(logDebugSH) ("Clock", t)
-    broadcastTick t
+    $(logDebugSH) ("Clock", name, t)
+    (nodes . ix name . nodeInbox) %= (|> ClockTick t)
     return []
+
 simulateIteration _ (Node name) = do
     simulateStep name
 
@@ -189,9 +190,6 @@ getQuiesecent name = do
   $(logDebugSH) ("Inbox", name, inboxes)
   return $ all Seq.null $ inboxes
 
-broadcastTick :: (MonadLogger m, MonadState Network m) => Time -> m ()
-broadcastTick n = do
-  (nodes . each . nodeInbox) %= (|> ClockTick n)
 
 simulateStep :: (HasCallStack, MonadLogger m, MonadState Network m) => PeerName -> m [(PeerName, ProcessorMessage)]
 simulateStep thisNode = do
