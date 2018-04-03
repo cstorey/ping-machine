@@ -381,9 +381,8 @@ handleVoteResponse req sender _msg = do
     let msg =
             (Proto.unPeerName me , ": Unexpected response from " , sender ,
             " to vote request " , req , " resp " , _msg)
-    -- error msg
-    -- Should at least be a warning, or something.
     $(logWarnSH) msg
+    void $ error $ show msg
 
 
 handleAppendEntriesResponse :: HasCallStack => Proto.AppendEntriesReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
@@ -454,9 +453,8 @@ handleAppendEntriesResponse req sender _msg = do
     let msg = Proto.unPeerName me ++ ": Unexpected response from " ++ show sender ++
                 " to append entries request:" ++ show req ++
                 " got " ++ show _msg
-    -- error msg
-    -- Should at least be a warning, or something.
-    $(logDebugSH) msg
+    $(logWarnSH) msg
+    void $ error $ show msg
 
 processTick :: HasCallStack => () -> Tick -> ProtoStateMachine ()
 processTick () (Tick t) = do
