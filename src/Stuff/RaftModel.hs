@@ -23,6 +23,7 @@ import qualified Control.Monad.Trans.RWS.Strict as RWS
 import           Control.Monad.Writer.Class (MonadWriter(..))
 import           Control.Monad.State.Class (MonadState(..))
 import           Control.Monad.Reader.Class (MonadReader(..))
+import           Control.Monad.Logger (WriterLoggingT, MonadLogger)
 import qualified Data.Map as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -30,6 +31,7 @@ import qualified Debug.Trace as Trace
 import qualified Data.Maybe as Maybe
 import qualified Data.List as List
 import Control.Monad
+import Data.Functor.Identity (Identity)
 import Lens.Micro.Platform
 
 import GHC.Stack
@@ -169,8 +171,8 @@ instance Show ProcessorMessage where
   show (PeerRequest name req _) = "PeerRequest " ++ show name ++ " " ++ show req ++ " #<action>"
 
 newtype ProtoStateMachine a = ProtoStateMachine {
-    runProto :: RWS.RWS ProtocolEnv [ProcessorMessage] RaftState a
-} deriving (Monad, Applicative, Functor, MonadState RaftState, MonadWriter [ProcessorMessage], MonadReader ProtocolEnv)
+    runProto :: (RWS.RWST ProtocolEnv [ProcessorMessage] RaftState (WriterLoggingT Identity)) a
+} deriving (Monad, Applicative, Functor, MonadState RaftState, MonadWriter [ProcessorMessage], MonadReader ProtocolEnv, MonadLogger)
 
 mkProtocolEnv :: Proto.PeerName -> PeerSet -> Time -> Time -> ProtocolEnv
 mkProtocolEnv = ProtocolEnv

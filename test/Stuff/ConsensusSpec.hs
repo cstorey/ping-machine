@@ -20,6 +20,8 @@ import qualified Control.Monad.Trans.State.Strict as State
 -- import           Control.Monad.Writer.Class (MonadWriter(..))
 import           Control.Monad.State.Class (MonadState(..), get)
 -- import           Control.Monad.Reader.Class (MonadReader(..), asks)
+import qualified Data.Functor.Identity as Identity
+import qualified Control.Monad.Logger as Logger
 import Control.Monad.Logger
 import qualified Debug.Trace as Trace
 import Data.Ratio ((%))
@@ -203,7 +205,10 @@ simulateStep thisNode = do
   $(logDebugSH) ("Run", thisNode, view nodeInbox node)
   Trace.traceShow ("Run", thisNode, view nodeInbox node) $ return ()
   let actions = traverse_ applyState $ view nodeInbox node
-  let ((), s', toSend) = RWS.runRWS (runProto actions) (view nodeEnv node) (view nodeState node)
+  let (((), s', toSend), logs) = Identity.runIdentity $
+                                 Logger.runWriterLoggingT $
+                                 RWS.runRWST (runProto $ actions) (view nodeEnv node) (view nodeState node)
+  forM_ logs $ \(loc, src, lvl, logmsg) -> Logger.monadLoggerLog loc src lvl logmsg
   nodes . ix thisNode . nodeState .= (s' `seq` s')
   nodes . ix thisNode . nodeInbox .= Seq.empty
 

@@ -11,6 +11,8 @@ where
 import qualified Stuff.Proto as Proto
 
 import qualified Control.Monad.Trans.RWS.Strict as RWS
+import qualified Control.Monad.Logger as Logger
+import qualified Data.Functor.Identity as Identity
 import qualified Control.Concurrent.STM as STM
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -19,6 +21,7 @@ import qualified System.IO.Unsafe
 import Control.Monad
 import qualified System.Random as Random
 import Data.Ratio ((%))
+import Control.Monad.Trans.Class (lift)
 
 import Stuff.Types
 import Stuff.RaftModel
@@ -51,54 +54,69 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
     pendingPeerResponses <- STM.atomically $ STM.newTVar $ Map.empty
     -- Responses that we are awaiting _from_ peers.
 
+    logVar <- STM.atomically $ STM.newTVar []
+
     elTimeout <- (% 1000) <$> Random.randomRIO (2500, 3500) :: IO Time
     let aeTimeout = 1 :: Time
     putStrLn $ show ("Election timeout is", elTimeout, "append entries", aeTimeout)
 
     let protocolEnv = mkProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout
-    let processClientMessage = processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
-    let processPeerRequest = processReqRespMessageSTM stateRef protocolEnv pendingPeerResponses peerReqInQ processPeerRequestMessage
-    let processTickMessage = processMessageSTM stateRef protocolEnv ticks processTick
-    let processPeerResponse = processRespMessageSTM stateRef protocolEnv peerRespInQ
+    let processClientMessage = runLoggerSTM logVar $ processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
+    let processPeerRequest = runLoggerSTM logVar $ processReqRespMessageSTM stateRef protocolEnv pendingPeerResponses peerReqInQ processPeerRequestMessage
+    let processTickMessage = runLoggerSTM logVar $ processMessageSTM stateRef protocolEnv ticks processTick
+    let processPeerResponse = runLoggerSTM logVar $ processRespMessageSTM stateRef protocolEnv peerRespInQ
 
 
     forever $ do
         when False $ do
             env <- STM.atomically protocolEnv
             putStrLn $ "Env: " ++ show env
-        (_st', outputs) <- STM.atomically $ do
+        (_st', outputs, logs) <- STM.atomically $ do
             outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
             sendMessages pendingClientResponses peerOuts pendingPeerResponses outputs
             st' <- STM.readTVar stateRef
-            return (st', outputs)
+            logs <- STM.swapTVar logVar []
+            return (st', outputs, logs)
+        Logger.runStderrLoggingT $ forM_ logs $ \(loc, src, lvl, s) -> Logger.monadLoggerLog loc src lvl s
         when False $ putStrLn $ "sent: " ++ show outputs
+
+type LogLine = (Logger.Loc,Logger.LogSource,Logger.LogLevel,Logger.LogStr)
+
+runLoggerSTM :: (STM.TVar [LogLine]) -> Logger.WriterLoggingT STM.STM a -> STM.STM a
+runLoggerSTM out action = do
+  (a, logs) <- Logger.runWriterLoggingT action
+  STM.modifyTVar' out (++ logs)
+  return a
 
 processMessageSTM :: STM.TVar RaftState
                   -> STM.STM ProtocolEnv
                   -> RequestsInQ xid req
                   -> (xid -> req -> ProtoStateMachine ())
-                  -> STM.STM [ProcessorMessage]
+                  -> Logger.WriterLoggingT STM.STM [ProcessorMessage]
 processMessageSTM stateRef envSTM reqQ process = do
-    (sender, m) <- STM.readTQueue reqQ
+    (sender, m) <- lift $ STM.readTQueue reqQ
     case m of
         Just msg -> do
-            s <- STM.readTVar stateRef
-            env <- envSTM
-            let ((), s', toSend) = RWS.runRWS (runProto $ process sender msg) env s
-            STM.writeTVar stateRef s'
+            s <- lift $ STM.readTVar stateRef
+            env <- lift $ envSTM
+            -- TODO: Extract
+            let (((), s', toSend), logs) = Identity.runIdentity $ Logger.runWriterLoggingT $ RWS.runRWST (runProto $ process sender msg) env s
+            forM_ logs $ \(loc, src, lvl, logmsg) -> Logger.monadLoggerLog loc src lvl logmsg
+            lift $ STM.writeTVar stateRef s'
             return toSend
         Nothing -> return []
 
 processRespMessageSTM :: STM.TVar RaftState
                                -> STM.STM ProtocolEnv
                                -> STM.TQueue (ProtoStateMachine ())
-                               -> STM.STM [ProcessorMessage]
+                               -> Logger.WriterLoggingT STM.STM [ProcessorMessage]
 processRespMessageSTM stateRef envSTM reqQ = do
-    action <- STM.readTQueue reqQ
-    s <- STM.readTVar stateRef
-    env <- envSTM
-    let ((), s', toSend) = RWS.runRWS (runProto $ action) env s
-    STM.writeTVar stateRef s'
+    action <- lift $ STM.readTQueue reqQ
+    s <- lift $ STM.readTVar stateRef
+    env <- lift $ envSTM
+    let (((), s', toSend), logs) = Identity.runIdentity $ Logger.runWriterLoggingT $ RWS.runRWST (runProto $ action) env s
+    forM_ logs $ \(loc, src, lvl, logmsg) -> Logger.monadLoggerLog loc src lvl logmsg
+    lift $ STM.writeTVar stateRef s'
     return toSend
 
 processReqRespMessageSTM :: STM.TVar RaftState
@@ -106,16 +124,17 @@ processReqRespMessageSTM :: STM.TVar RaftState
                   -> STMPendingRespMap resp
                   -> RequestsQ req resp
                   -> (req -> IdFor resp -> ProtoStateMachine ())
-                  -> STM.STM [ProcessorMessage]
+                  -> Logger.WriterLoggingT STM.STM [ProcessorMessage]
 processReqRespMessageSTM stateRef envSTM pendingResponses reqQ process = do
-  (msg, pendingResponse) <- STM.readTQueue reqQ
-  reqId <- IdFor <$> nextIdSTM
-  STM.modifyTVar pendingResponses $ Map.insert reqId pendingResponse
+  (msg, pendingResponse) <- lift $ STM.readTQueue reqQ
+  reqId <- lift $ IdFor <$> nextIdSTM
+  lift $ STM.modifyTVar pendingResponses $ Map.insert reqId pendingResponse
 
-  s <- STM.readTVar stateRef
-  env <- envSTM
-  let ((), s', toSend) = RWS.runRWS (runProto $ process msg reqId) env s
-  STM.writeTVar stateRef s'
+  s <- lift $ STM.readTVar stateRef
+  env <- lift $ envSTM
+  let (((), s', toSend), logs) = Identity.runIdentity $ Logger.runWriterLoggingT $ RWS.runRWST (runProto $ process msg reqId) env s
+  forM_ logs $ \(loc, src, lvl, logmsg) -> Logger.monadLoggerLog loc src lvl logmsg
+  lift $ STM.writeTVar stateRef s'
   return toSend
 
 sendMessages :: STMPendingRespMap Proto.ClientResponse
@@ -143,5 +162,3 @@ sendMessages pendingClientResponses peerRequests pendingPeerResponses toSend = d
                 Just q -> do
                   STM.writeTQueue q $ (msg, k)
                 Nothing -> error "what?"
-
-
