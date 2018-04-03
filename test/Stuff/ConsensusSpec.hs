@@ -138,22 +138,31 @@ inspecting the node state directly, we can listen for `AppendEntries` messages
 from nodes, and record the source against the term.
 -}
 
-prop_simulateLeaderElection :: HasCallStack => Property
-prop_simulateLeaderElection = property $ do
+runSimulation :: [Char] -> PropertyT IO [(PeerName, ProcessorMessage)]
+runSimulation prefix = do
       ts <- forAll timeouts
       sched <- forAll schedule
       let network = Network (allNodes $ map (% ticksPerSecond) ts)
       let h = hash $ show (ts, sched)
-      let fname = "/tmp/prop_simulateLeaderElection_" ++ show h
+      let fname = prefix ++ show h
       footnoteShow $ "Logging to: " ++ fname
 
-      states <- evalIO $ do
+      evalIO $ do
         let simulation = forM (Map.toList sched) $ \(t, node) -> do
               msgs <- simulateIteration t node
               return msgs
         mconcat <$> fst <$> State.runStateT (runFileLoggingT fname simulation) network
 
-      let allLeaders = leadersByTerm states
+  where
+    timeouts = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> timestamp 1)
+    nnodes = Set.size allPeers
+    allNodes ts = Map.fromList $ fmap (\(p, t) -> (p , makeNode p t)) $ zip (Set.toList allPeers) ts
+
+prop_simulateLeaderElection :: HasCallStack => Property
+prop_simulateLeaderElection = property $ do
+      messages <- runSimulation "/tmp/prop_simulateLeaderElection_"
+
+      let allLeaders = leadersByTerm messages
 
       test $ do
         footnoteShow $ ("Leaders by term", allLeaders)
@@ -161,7 +170,6 @@ prop_simulateLeaderElection = property $ do
           assert $ 1 >= Set.size leaders
 
   where
-      allNodes ts = Map.fromList $ fmap (\(p, t) -> (p , makeNode p t)) $ zip (Set.toList allPeers) ts
       leadersByTerm :: [(PeerName, ProcessorMessage)] -> Map Term (Set PeerName)
       leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
         -- let allLeaders = List.foldl' ... $
