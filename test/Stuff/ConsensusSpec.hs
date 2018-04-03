@@ -53,7 +53,7 @@ data NodeSim = NodeSim {
   _nodeEnv :: ProtocolEnv
 , _nodeState :: !RaftState
 , _nodeInbox :: Seq InboxItem
-, _nodePendingResponses :: Seq (WaitingCallback)
+, _nodePendingResponses :: Map PeerName (Seq WaitingCallback)
 }
 
 data Network = Network {
@@ -67,7 +67,7 @@ allPeers :: Set PeerName
 allPeers = Set.fromList $ fmap PeerName ["a", "b", "c"]
 
 makeNode :: PeerName -> Time -> NodeSim
-makeNode self elTimeout = NodeSim newnodeEnv newnodeState Seq.empty Seq.empty
+makeNode self elTimeout = NodeSim newnodeEnv newnodeState Seq.empty Map.empty
   where
     newnodeEnv = (mkProtocolEnv self (Set.difference allPeers $ Set.singleton self) elTimeout (elTimeout / 3.0) :: ProtocolEnv)
     newnodeState = mkRaftState
@@ -144,7 +144,7 @@ prop_simulateLeaderElection = property $ do
       sched <- forAll schedule
       let network = Network (allNodes $ map (% ticksPerSecond) ts)
       let h = hash $ show (ts, sched)
-      let fname = "/tmp/foo-" ++ show h
+      let fname = "/tmp/prop_simulateLeaderElection_" ++ show h
       footnoteShow $ "Logging to: " ++ fname
 
       states <- evalIO $ do
@@ -196,8 +196,11 @@ broadcastTick n = do
 simulateStep :: (HasCallStack, MonadLogger m, MonadState Network m) => PeerName -> m [(PeerName, ProcessorMessage)]
 simulateStep thisNode = do
   node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get
-  $(logDebugSH) ("Run", thisNode, view nodeInbox node)
-  let actions = traverse_ applyState $ view nodeInbox node
+  let inbox = view nodeInbox node
+  $(logDebugSH) ("Run", thisNode, inbox)
+  let actions = flip traverse_ inbox $ \it -> do
+                  $(logDebugSH) ("apply", thisNode, it)
+                  applyState it
   let (((), s', toSend), logs) = Identity.runIdentity $
                                  Logger.runWriterLoggingT $
                                  RWS.runRWST (runProto $ actions) (view nodeEnv node) (view nodeState node)
@@ -209,25 +212,44 @@ simulateStep thisNode = do
 
   forM_ toSend $ \msg -> do
     case msg of
-      PeerRequest name m cb -> do
-        $(logDebugSH) (unPeerName thisNode, "->", unPeerName name, "PeerRequest", m)
-        nodes . ix name . nodeInbox %= (|> RequestFromPeer thisNode m)
-        nodes . ix thisNode . nodePendingResponses %= (|> WaitingCallback cb)
-      PeerReply peerId m -> do
-        let name = nameOfPeerId peerId
-        $(logDebugSH) (unPeerName name, "<-", unPeerName thisNode, "PeerReply", m)
-        pending <- use (nodes . ix name . nodePendingResponses)
+      PeerRequest dst m cb -> sendPeerRequest dst m cb
+      PeerReply peerId m -> sendPeerReply peerId m
+      Reply clientId m -> sendClientReply clientId m
+
+  return $ map (\m -> (thisNode, m)) toSend
+
+  where
+
+  sendPeerRequest dst m cb= do
+        $(logDebugSH) (unPeerName thisNode, "->", unPeerName dst, "PeerRequest", m)
+        nodes . ix dst . nodeInbox %= (|> RequestFromPeer thisNode m)
+        nodes . ix thisNode . nodePendingResponses %= (Map.insertWith (flip mappend) dst $ Seq.singleton $ WaitingCallback cb)
+        do
+          p <-  use $ nodes . ix thisNode . nodePendingResponses
+          $(logDebugSH) (unPeerName thisNode, "post sendPeerRequest", "num pending callbacks", fmap Seq.length p)
+
+  sendPeerReply peerId m = do
+        let dst = nameOfPeerId peerId
+        $(logDebugSH) (unPeerName dst, "<-", unPeerName thisNode, "PeerReply", m)
+
+        do
+          p <-  use $ nodes . ix dst . nodePendingResponses
+          $(logDebugSH) (unPeerName dst, "pre sendPeerReply", "num pending callbacks", fmap Seq.length p)
+
+        pending <- use (nodes . ix dst . nodePendingResponses . ix thisNode)
         case Seq.viewl pending of
           Seq.EmptyL -> error "No waiting callback?"
           cb :< rest -> do
-            (nodes . ix name . nodePendingResponses)  .= rest
-            nodes . ix name . nodeInbox %= (|> ResponseFromPeer thisNode cb m)
+            (nodes . ix dst . nodePendingResponses . ix thisNode)  .= rest
+            nodes . ix dst . nodeInbox %= (|> ResponseFromPeer thisNode cb m)
+        do
+          p <-  use $ nodes . ix dst . nodePendingResponses
+          $(logDebugSH) (unPeerName dst, "post sendPeerReply", "num pending callbacks", fmap Seq.length p)
         return ()
-      Reply clientId m -> do
-        $(logDebugSH) (thisNode, clientId, "reply", m)
-        error $ "something something client reply" ++ show (clientId, m)
 
-  return $ map (\m -> (thisNode, m)) toSend
+  sendClientReply clientId m = do
+        $(logDebugSH) (thisNode, clientId, "sendClientReply", m)
+        error $ "something something client reply" ++ show (clientId, m)
 
 nameOfPeerId :: IdFor PeerResponse -> PeerName
 nameOfPeerId (IdFor 0) = PeerName "a"

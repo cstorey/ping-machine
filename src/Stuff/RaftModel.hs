@@ -209,12 +209,12 @@ processClientReqRespMessage command pendingResponse = do
         $(logDebugSH) "Not leader"
         tell [Reply pendingResponse $ Left $ Proto.NotLeader myLeader]
 
-    recordPendingClientRequest :: Monad m => Proto.LogIdx -> LeaderState -> m LeaderState
+    recordPendingClientRequest :: HasCallStack => Monad m => Proto.LogIdx -> LeaderState -> m LeaderState
     recordPendingClientRequest idx leader = do
         return $ over pendingClientRequests (Map.insert idx pendingResponse) leader
 
 
-laterTermObserved :: Proto.Term -> ProtoStateMachine ()
+laterTermObserved :: HasCallStack => Proto.Term -> ProtoStateMachine ()
 laterTermObserved laterTerm = do
     thisTerm <- use currentTerm
     formerRole <- use currentRole
@@ -229,7 +229,7 @@ laterTermObserved laterTerm = do
 
     stepDown
     where
-        whenLeader :: LeaderState -> ProtoStateMachine ()
+        whenLeader :: HasCallStack => LeaderState -> ProtoStateMachine ()
         whenLeader leader = do
             let pending = view pendingClientRequests leader
             $(logDebugSH) ("Nacking requests", pending)
@@ -237,23 +237,23 @@ laterTermObserved laterTerm = do
                 -- We should really actually run a state machine here. But ...
                 tell [Reply clid $ Left $ Proto.NotLeader $ Nothing]
 
-stepDown :: ProtoStateMachine ()
+stepDown :: HasCallStack => ProtoStateMachine ()
 stepDown = do
     prevTick <- use prevTickTime
     let role' = Follower $ FollowerState prevTick
     currentRole .= role'
 
-getPrevLogTermIdx :: ProtoStateMachine (Proto.Term, Proto.LogIdx)
+getPrevLogTermIdx :: HasCallStack => ProtoStateMachine (Proto.Term, Proto.LogIdx)
 getPrevLogTermIdx = do
     myLog <- use logEntries
     return $ maybe (0, 0) (\(idx, it) -> (Proto.logTerm it, idx)) $ Map.lookupMax myLog
 
-getMajority :: ProtoStateMachine Int
+getMajority :: HasCallStack => ProtoStateMachine Int
 getMajority = do
     memberCount <- succ . length <$> view peerNames
     return $ succ (memberCount `div` 2)
 
-processPeerRequestMessage :: Proto.PeerRequest -> IdFor Proto.PeerResponse -> ProtoStateMachine ()
+processPeerRequestMessage :: HasCallStack => Proto.PeerRequest -> IdFor Proto.PeerResponse -> ProtoStateMachine ()
 processPeerRequestMessage (Proto.RequestVote req) sender = do
     -- let x = (RequestVoteReq candidateTerm candidateName candidateIdx);
     thisTerm <- use currentTerm
@@ -278,9 +278,9 @@ processPeerRequestMessage (Proto.RequestVote req) sender = do
     return ()
 
     where
-        refuseVote :: Proto.Term -> ProtoStateMachine ()
+        refuseVote :: HasCallStack => Proto.Term -> ProtoStateMachine ()
         refuseVote thisTerm = tell [PeerReply sender $ Proto.VoteResult thisTerm False]
-        grantVote :: Proto.Term -> ProtoStateMachine ()
+        grantVote :: HasCallStack => Proto.Term -> ProtoStateMachine ()
         grantVote thisTerm = do
             votedFor .= Just (Proto.rvName req)
             tell [PeerReply sender $ Proto.VoteResult thisTerm True]
@@ -311,9 +311,9 @@ processPeerRequestMessage
                     error ("appendEntries recieved when leader? " ++ show _msg)
 
     where
-        refuseAppendEntries :: Proto.Term -> ProtoStateMachine ()
+        refuseAppendEntries :: HasCallStack => Proto.Term -> ProtoStateMachine ()
         refuseAppendEntries thisTerm = tell [PeerReply reqId $ Proto.AppendResult $ Proto.AppendEntriesResponse thisTerm False]
-        ackAppendEntries :: Proto.Term -> ProtoStateMachine ()
+        ackAppendEntries :: HasCallStack => Proto.Term -> ProtoStateMachine ()
         ackAppendEntries thisTerm = tell [PeerReply reqId $ Proto.AppendResult $ Proto.AppendEntriesResponse thisTerm True]
 
         whenFollower thisTerm follower = do
@@ -341,8 +341,8 @@ processPeerRequestMessage
                     ackAppendEntries thisTerm
 
 handleVoteResponse :: HasCallStack => Proto.RequestVoteReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
-handleVoteResponse _ _sender _msg@(Proto.VoteResult peerTerm granted) = do
-    $(logDebugSH) ("handleVoteResponse", _msg)
+handleVoteResponse req _sender _msg@(Proto.VoteResult peerTerm granted) = do
+    $(logDebugSH) ("handleVoteResponse to", req, _msg)
     role <- use currentRole
     myTerm <- use currentTerm
 
@@ -383,7 +383,7 @@ handleVoteResponse req sender _msg = do
     $(logWarnSH) msg
 
 
-handleAppendEntriesResponse :: Proto.AppendEntriesReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
+handleAppendEntriesResponse :: HasCallStack => Proto.AppendEntriesReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
 handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
     $(logDebugSH) ("handleAppendEntriesResponse", _msg)
     role <- use currentRole
@@ -421,7 +421,7 @@ handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
                   $(logDebugSH) ("Response to an unsent message? from " , sender)
                   return leader
 
-    findCommittedIndex :: LeaderState -> ProtoStateMachine (Maybe Proto.LogIdx)
+    findCommittedIndex :: HasCallStack => LeaderState -> ProtoStateMachine (Maybe Proto.LogIdx)
     findCommittedIndex st = do
         majority <- getMajority
         -- Find items acked by a ajority of servers.
@@ -432,7 +432,7 @@ handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
         $(logDebugSH) ("Known follower indexes: " , known)
         return $ Maybe.listToMaybe $ List.drop (pred majority) known
 
-    ackPendingClientResponses :: LeaderState -> Proto.LogIdx -> ProtoStateMachine LeaderState
+    ackPendingClientResponses :: HasCallStack => LeaderState -> Proto.LogIdx -> ProtoStateMachine LeaderState
     ackPendingClientResponses leader idx = do
         let pending = view pendingClientRequests leader
         let (canRespond, unCommitted) = Map.spanAntitone (<= idx) pending
@@ -448,7 +448,7 @@ handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
 
 handleAppendEntriesResponse req sender _msg = do
     me <- view selfId
-    let msg = Proto.unPeerName me ++ "Unepected response from " ++ show sender ++
+    let msg = Proto.unPeerName me ++ ": Unexpected response from " ++ show sender ++
                 " to append entries request:" ++ show req ++
                 " got " ++ show _msg
     -- error msg
@@ -519,7 +519,7 @@ processTick () (Tick t) = do
         currentRole .= (Leader leader')
 
 
-replicatePendingEntriesToFollowers :: LeaderState -> ProtoStateMachine LeaderState
+replicatePendingEntriesToFollowers :: HasCallStack => LeaderState -> ProtoStateMachine LeaderState
 replicatePendingEntriesToFollowers leader = do
     $(logDebugSH) ("Leader Tick")
     peers <- view peerNames
@@ -545,6 +545,6 @@ replicatePendingEntriesToFollowers leader = do
         return $ st & set (followers . ix peer . lastSent) lastSent'
 
 
-sendAppendEntriesRequest :: Proto.PeerName -> Proto.AppendEntriesReq -> ProtoStateMachine ()
+sendAppendEntriesRequest :: HasCallStack => Proto.PeerName -> Proto.AppendEntriesReq -> ProtoStateMachine ()
 sendAppendEntriesRequest peer req = do
     tell [PeerRequest peer (Proto.AppendEntries req) $ handleAppendEntriesResponse req peer]
