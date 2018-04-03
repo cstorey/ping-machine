@@ -14,7 +14,7 @@ import Data.Maybe (fromMaybe)
 import Control.Monad
 import Data.Sequence (Seq, (|>), ViewL(..))
 import qualified Data.Sequence as Seq
-import Data.Foldable (traverse_, foldl')
+import Data.Foldable (traverse_, foldl', toList)
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Monad.Trans.State.Strict as State
 -- import           Control.Monad.Writer.Class (MonadWriter(..))
@@ -117,6 +117,10 @@ processId = Gen.choice
   , Clock <$> peerName
   ]
 
+data MessageEvent =
+    MessageIn PeerName InboxItem
+  | MessageOut PeerName ProcessorMessage
+
 ticksPerSecond :: Integer
 ticksPerSecond = 1000
 
@@ -138,7 +142,7 @@ inspecting the node state directly, we can listen for `AppendEntries` messages
 from nodes, and record the source against the term.
 -}
 
-runSimulation :: [Char] -> PropertyT IO [(PeerName, ProcessorMessage)]
+runSimulation :: [Char] -> PropertyT IO [MessageEvent]
 runSimulation prefix = do
       ts <- forAll timeouts
       sched <- forAll schedule
@@ -170,14 +174,15 @@ prop_simulateLeaderElection = property $ do
           assert $ 1 >= Set.size leaders
 
   where
-      leadersByTerm :: [(PeerName, ProcessorMessage)] -> Map Term (Set PeerName)
+      leadersByTerm :: [MessageEvent] -> Map Term (Set PeerName)
       leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
         -- let allLeaders = List.foldl' ... $
-      leadersOf :: (PeerName, ProcessorMessage) -> Map Term (Set PeerName)
-      leadersOf (sender, PeerRequest _ (AppendEntries aer) _) = Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
+      leadersOf :: MessageEvent -> Map Term (Set PeerName)
+      leadersOf (MessageOut sender (PeerRequest _ (AppendEntries aer) _)) =
+          Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
       leadersOf _ = Map.empty
 
-simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [(PeerName, ProcessorMessage)]
+simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [MessageEvent]
 simulateIteration n (Clock name) = do
     let t = n % ticksPerSecond
     $(logDebugSH) ("Clock", name, t)
@@ -196,7 +201,7 @@ getQuiesecent name = do
   return $ all Seq.null $ inboxes
 
 
-simulateStep :: (HasCallStack, MonadLogger m, MonadState Network m) => PeerName -> m [(PeerName, ProcessorMessage)]
+simulateStep :: (HasCallStack, MonadLogger m, MonadState Network m) => PeerName -> m [MessageEvent]
 simulateStep thisNode = do
   node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get
   let inbox = view nodeInbox node
@@ -222,7 +227,9 @@ simulateStep thisNode = do
       PeerReply peerId m -> sendPeerReply peerId m
       Reply clientId m -> sendClientReply clientId m
 
-  return $ map (\m -> (thisNode, m)) toSend
+  let ins = map (MessageIn thisNode) $ toList inbox
+  let outs = map (MessageOut thisNode) toSend
+  return $ ins ++ outs
 
   where
 
