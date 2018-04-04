@@ -59,8 +59,13 @@ data NodeSim = NodeSim {
 , _nodePendingResponses :: Map PeerName (Seq WaitingCallback)
 }
 
+data ClientSim = ClientSim {
+  lastSeenLeader :: Maybe PeerName
+}
+
 data Network = Network {
   _nodes :: Map PeerName NodeSim
+, _client :: ClientSim
 }
 
 makeLenses ''NodeSim
@@ -109,7 +114,7 @@ the node's next activation.
 -}
 
 data ProcessId =
-    Client PeerName (IdFor ClientResponse) ClientRequest
+    Client (IdFor ClientResponse) ClientRequest
   | Clock PeerName
   | Node PeerName
   deriving (Show)
