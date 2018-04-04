@@ -14,6 +14,7 @@ import Data.Maybe (fromMaybe)
 import Control.Monad
 import Data.Sequence (Seq, (|>), ViewL(..))
 import qualified Data.Sequence as Seq
+import qualified Data.List as List
 import Data.Foldable (traverse_, foldl', toList)
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Monad.Trans.State.Strict as State
@@ -43,11 +44,13 @@ data InboxItem =
     RequestFromPeer PeerName PeerRequest
   | ResponseFromPeer PeerName WaitingCallback PeerResponse
   | ClockTick Time
+  | ClientRequest (IdFor ClientResponse) ClientRequest
 
 instance Show InboxItem where
   show (RequestFromPeer name req) = "RequestFromPeer " ++ show name ++ " " ++ show req
   show (ResponseFromPeer name _ resp) = "ResponseFromPeer " ++ show name ++ " _ " ++ show resp
   show (ClockTick t) = "ClockTick " ++ show t
+  show (ClientRequest rid req) = "Client " ++ show rid ++ " " ++ show req
 
 data NodeSim = NodeSim {
   _nodeEnv :: ProtocolEnv
@@ -81,6 +84,9 @@ applyState (RequestFromPeer sender req) = do
   processPeerRequestMessage req $ peerIdOfName sender
 applyState (ResponseFromPeer _sender (WaitingCallback f) resp) = f resp
 
+applyState (ClientRequest rid cmd) = do
+  processClientReqRespMessage cmd rid
+
 -- applyState other = error $ "applyState: " ++ show other
 
 {-
@@ -103,7 +109,7 @@ the node's next activation.
 -}
 
 data ProcessId =
-    Client Int
+    Client PeerName (IdFor ClientResponse) ClientRequest
   | Clock PeerName
   | Node PeerName
   deriving (Show)
@@ -111,15 +117,26 @@ data ProcessId =
 peerName :: Gen PeerName
 peerName = Gen.element $ Set.toList allPeers
 
+clientCommand :: Gen ClientRequest
+clientCommand = Gen.choice
+  [ Gen.constant Bing
+  , Gen.constant Ping
+  ]
+
+aClientId :: Gen (IdFor ClientResponse)
+aClientId = IdFor <$> Gen.integral (Range.linear 0 100)
+
 processId :: Gen ProcessId
 processId = Gen.choice
   [ Node <$> peerName
   , Clock <$> peerName
+  , Client <$> peerName <*> aClientId <*> clientCommand
   ]
 
 data MessageEvent =
     MessageIn PeerName InboxItem
   | MessageOut PeerName ProcessorMessage
+  deriving (Show)
 
 ticksPerSecond :: Integer
 ticksPerSecond = 1000
@@ -182,6 +199,19 @@ prop_simulateLeaderElection = property $ do
           Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
       leadersOf _ = Map.empty
 
+prop_bongsAreMonotonic :: HasCallStack => Property
+prop_bongsAreMonotonic = property $ do
+      messages <- runSimulation "/tmp/prop_bongsAreMonotonic"
+
+      let respValues = foldr findResponse [] messages
+      test $ do
+          footnoteShow messages
+          respValues === List.sort respValues
+
+  where
+    findResponse (MessageOut _ (Reply _ (Right val))) r = val : r
+    findResponse _ r = r
+
 simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [MessageEvent]
 simulateIteration n (Clock name) = do
     let t = n % ticksPerSecond
@@ -192,7 +222,11 @@ simulateIteration n (Clock name) = do
 simulateIteration _ (Node name) = do
     simulateStep name
 
-simulateIteration _ other = error $ "simulateIteration: " ++ show other
+simulateIteration n (Client peer rid cmd) = do
+    let t = n % ticksPerSecond
+    $(logDebugSH) ("Client", peer, rid, t)
+    (nodes . ix peer . nodeInbox) %= (|> ClientRequest rid cmd)
+    return []
 
 getQuiesecent :: (MonadLogger m, MonadState Network m) => PeerName -> m Bool
 getQuiesecent name = do
@@ -262,7 +296,6 @@ simulateStep thisNode = do
 
   sendClientReply clientId m = do
         $(logDebugSH) (thisNode, clientId, "sendClientReply", m)
-        error $ "something something client reply" ++ show (clientId, m)
 
 nameOfPeerId :: IdFor PeerResponse -> PeerName
 nameOfPeerId (IdFor 0) = PeerName "a"
