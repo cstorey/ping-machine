@@ -103,12 +103,12 @@ verteces are activations where a node can process it's inputs, and edges are
 thefore the time taken to transmit a message between nodes.
 
 As a simpler example though, we can represent it as a sequence, sort of, or
-`Map Time ProcessId`, where ``. Messages
+`Map Time ProcessActivation`, where ``. Messages
 in this model are effectively delivered immediately, and will be processed at
 the node's next activation.
 -}
 
-data ProcessId =
+data ProcessActivation =
     Client PeerName (IdFor ClientResponse) ClientRequest
   | Clock PeerName
   | Node PeerName
@@ -126,7 +126,7 @@ clientCommand = Gen.choice
 aClientId :: Gen (IdFor ClientResponse)
 aClientId = IdFor <$> Gen.integral (Range.linear 0 100)
 
-processId :: Gen ProcessId
+processId :: Gen ProcessActivation
 processId = Gen.choice
   [ Node <$> peerName
   , Clock <$> peerName
@@ -150,7 +150,7 @@ timestamp len = do
 -- But, at the moment, clocks are instantanious and global, wheras they should
 -- be per process, really.
 
-schedule :: Gen (Map Integer ProcessId)
+schedule :: Gen (Map Integer ProcessActivation)
 schedule = Gen.map (Range.linear 0 1000) $ ((,) <$> timestamp 100 <*> processId)
 
 {-
@@ -212,7 +212,7 @@ prop_bongsAreMonotonic = property $ do
     findResponse (MessageOut _ (Reply _ (Right val))) r = val : r
     findResponse _ r = r
 
-simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessId -> m [MessageEvent]
+simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessActivation -> m [MessageEvent]
 simulateIteration n (Clock name) = do
     let t = n % ticksPerSecond
     $(logDebugSH) ("Clock", name, t)
