@@ -29,7 +29,7 @@ data ClientRequest =
 instance Binary.Binary ClientRequest
 
 data ClientResult =
-    Bong String
+    Bong Int
   deriving (Eq, Ord, Show, Generic)
 instance Binary.Binary ClientResult
 

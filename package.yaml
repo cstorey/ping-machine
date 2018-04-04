@@ -87,3 +87,5 @@ tests:
     - hspec-discover
     - hedgehog
     - hashable
+    - pretty-show
+    - text

@@ -130,14 +130,14 @@ makeLenses ''CandidateState
 data LeaderFollowerState = LeaderFollowerState {
     _prevIdx :: Proto.LogIdx
 ,   _lastSent :: Proto.LogIdx
-}
+} deriving (Show)
 makeLenses ''LeaderFollowerState
 
 data LeaderState = LeaderState {
     _followers :: Map.Map Proto.PeerName LeaderFollowerState
 ,   _committed :: Maybe Proto.LogIdx
 ,   _pendingClientRequests :: Map.Map Proto.LogIdx (IdFor Proto.ClientResponse)
-}
+} deriving (Show)
 makeLenses ''LeaderState
 
 
@@ -145,7 +145,7 @@ data RaftRole =
     Follower FollowerState
   | Candidate CandidateState
   | Leader LeaderState
-
+ deriving (Show)
 data RaftState = RaftState {
     _currentRole :: RaftRole
 ,   _currentTerm :: Proto.Term
@@ -153,7 +153,7 @@ data RaftState = RaftState {
 ,   _votedFor :: Maybe Proto.PeerName
 ,   _prevTickTime :: Time
 ,   _currentLeader :: Maybe Proto.PeerName
-}
+} deriving (Show)
 makeLenses ''RaftState
 
 
@@ -167,7 +167,7 @@ data ProcessorMessage = Reply (IdFor Proto.ClientResponse) Proto.ClientResponse
 instance Show ProcessorMessage where
   show (Reply reqid resp) = "Reply " ++ show reqid ++ " " ++ show resp
   show (PeerReply reqid resp) = "PeerReply " ++ show reqid ++ " " ++ show resp
-  show (PeerRequest name req _) = "PeerRequest " ++ show name ++ " " ++ show req ++ " _"
+  show (PeerRequest name req _) = "PeerRequest " ++ show name ++ " " ++ show req ++ " Cb"
 
 newtype ProtoStateMachine a = ProtoStateMachine {
     runProto :: (RWS.RWST ProtocolEnv [ProcessorMessage] RaftState (WriterLoggingT Identity)) a
@@ -188,19 +188,23 @@ appendToLog command = do
     let entry = Proto.LogEntry thisTerm command
     (_, logIdx) <- getPrevLogTermIdx
     let idx = succ logIdx
-    logEntries .ix idx .= entry
+    logEntries %= Map.insert idx entry
     return idx
 
 processClientReqRespMessage :: Proto.ClientRequest -> IdFor Proto.ClientResponse -> ProtoStateMachine ()
 processClientReqRespMessage command pendingResponse = do
+    $(logDebugSH) ("processClientReqRespMessage", command, pendingResponse)
     role <- use currentRole
     case role of
         Leader leader -> do
             idx <- appendToLog command
+            $(logDebugSH) ("processClientReqRespMessage accepting", command, pendingResponse, "index", Proto.unLogIdx idx)
             leader' <- recordPendingClientRequest idx leader
             leader'' <- replicatePendingEntriesToFollowers leader'
             currentRole .= Leader leader''
+            $(logDebugSH) ("processClientReqRespMessage post", leader'')
         _ -> do
+            $(logDebugSH) ("processClientReqRespMessage refusing", command, pendingResponse)
             refuseClientRequest
 
     where
@@ -385,9 +389,9 @@ handleVoteResponse req sender _msg = do
     void $ error $ show msg
 
 
-handleAppendEntriesResponse :: HasCallStack => Proto.AppendEntriesReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
-handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
-    $(logDebugSH) ("handleAppendEntriesResponse", _msg)
+handleAppendEntriesResponse :: HasCallStack => Proto.LogIdx -> Proto.AppendEntriesReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
+handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = do
+    $(logDebugSH) ("handleAppendEntriesResponse", req, _msg)
     role <- use currentRole
     case role of
         Leader leader -> do
@@ -398,30 +402,21 @@ handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
             $(logWarnSH) ("append response recieved when non leader?", _msg)
     where
     whenLeader leader = do
-        -- FIXME: This is wrong, as it'll produce incorrect results when we
-        -- have multiple overlaping requests. We need to correlate these with the actually sent id.
-        -- Then again, this is invoked via callback, so should be trivial.
+      if Proto.aerSucceeded aer
+      then do
+          -- let followerPrevIdx' = Map.insert sender sentIdx $ view followerPrevIdx leader
+          committedIdx <- findCommittedIndex leader
 
-        case preview (followers . ix sender . lastSent) leader of
-            Just sentIdx -> do
-                if Proto.aerSucceeded aer
-                then do
-                    -- let followerPrevIdx' = Map.insert sender sentIdx $ view followerPrevIdx leader
-                    committedIdx <- findCommittedIndex leader
+          $(logDebugSH) ("committed index should be", committedIdx)
 
-                    $(logDebugSH) ("committed index should be", committedIdx)
+          return $ leader
+              & set (followers . ix sender . prevIdx) sentIdx
+              & set committed committedIdx
 
-                    return $ leader
-                        & set (followers . ix sender . prevIdx) sentIdx
-                        & set committed committedIdx
-
-                else do
-                    let toTry = Proto.LogIdx . (`div` 2) . Proto.unLogIdx $ sentIdx
-                    $(logDebugSH) ("Retry peer " , sender , " at : " , toTry)
-                    return $ leader & set (followers . ix sender . prevIdx) toTry
-            _ -> do
-                  $(logDebugSH) ("Response to an unsent message? from " , sender)
-                  return leader
+      else do
+          let toTry = Proto.LogIdx . (`div` 2) . Proto.unLogIdx $ sentIdx
+          $(logDebugSH) ("Retry peer " , sender , " at : " , toTry)
+          return $ leader & set (followers . ix sender . prevIdx) toTry
 
     findCommittedIndex :: HasCallStack => LeaderState -> ProtoStateMachine (Maybe Proto.LogIdx)
     findCommittedIndex st = do
@@ -443,12 +438,12 @@ handleAppendEntriesResponse _ sender _msg@(Proto.AppendResult aer) = do
         $(logDebugSH) ("Responding to requests: " , canRespond)
         forM_ (Map.toList canRespond) $ \(reqIdx, clid) -> do
             -- We should really actually run a state machine here. But ...
-            tell [Reply clid $ Right $ Proto.Bong $ show reqIdx]
+            tell [Reply clid $ Right $ Proto.Bong $ Proto.unLogIdx reqIdx]
 
         return $ leader & set pendingClientRequests unCommitted
 
 
-handleAppendEntriesResponse req sender _msg = do
+handleAppendEntriesResponse _ req sender _msg = do
     me <- view selfId
     let msg = Proto.unPeerName me ++ ": Unexpected response from " ++ show sender ++
                 " to append entries request:" ++ show req ++
@@ -530,22 +525,26 @@ replicatePendingEntriesToFollowers leader = do
     updatePeer :: LeaderState
                -> Proto.PeerName
                -> ProtoStateMachine LeaderState
-
     updatePeer st peer = do
         thisTerm <- use currentTerm
         myId <- view selfId
         (logTerm, logIdx) <- getPrevLogTermIdx
-        let peerLastSent = maybe logIdx id $ preview (followers . ix peer . lastSent) st
+        let peerState = maybe (LeaderFollowerState logIdx logIdx) id $ preview (followers . ix peer) st
+        let peerLastSent = view lastSent peerState
         entries <- use logEntries
         let peerPrevTerm = maybe logTerm Proto.logTerm $ Map.lookup peerLastSent entries
         -- Send everything _after_ their previous index
+        $(logDebugSH) ("Map.split", peerLastSent, "...", "=>", Map.split peerLastSent entries)
         let toSend = snd $ Map.split peerLastSent entries
-        let peerPrevIdx = maybe logIdx id $ preview (followers . ix peer . prevIdx) st
-        sendAppendEntriesRequest peer $ Proto.AppendEntriesReq thisTerm myId peerPrevTerm peerPrevIdx toSend
-        let lastSent' = maybe peerPrevIdx fst $ Map.lookupMax toSend
-        return $ st & set (followers . ix peer . lastSent) lastSent'
+        $(logDebugSH) ("sendingitems", Map.size toSend, "out of", Map.size entries)
+        let peerPrevIdx = view prevIdx peerState
+        let sentIdx = maybe peerPrevIdx fst $ Map.lookupMax $ toSend
+        sendAppendEntriesRequest sentIdx peer $ Proto.AppendEntriesReq thisTerm myId peerPrevTerm peerPrevIdx toSend
+        $(logDebugSH) ("post send to", peer, "lastSent", sentIdx)
+        let peerState' = peerState & set lastSent sentIdx
+        return $ st & over followers (Map.insert peer peerState')
 
 
-sendAppendEntriesRequest :: HasCallStack => Proto.PeerName -> Proto.AppendEntriesReq -> ProtoStateMachine ()
-sendAppendEntriesRequest peer req = do
-    tell [PeerRequest peer (Proto.AppendEntries req) $ handleAppendEntriesResponse req peer]
+sendAppendEntriesRequest :: HasCallStack => Proto.LogIdx -> Proto.PeerName -> Proto.AppendEntriesReq -> ProtoStateMachine ()
+sendAppendEntriesRequest sentIdx peer req = do
+    tell [PeerRequest peer (Proto.AppendEntries req) $ handleAppendEntriesResponse sentIdx req peer]

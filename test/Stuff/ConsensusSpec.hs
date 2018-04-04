@@ -27,6 +27,8 @@ import Control.Monad.Logger
 import Data.Ratio ((%))
 import GHC.Stack
 import Data.Hashable
+import Text.Show.Pretty
+import qualified Data.Text as Text
 
 import Lens.Micro.Platform
 
@@ -40,6 +42,9 @@ import Stuff.Types
 
 newtype WaitingCallback = WaitingCallback (PeerResponse -> ProtoStateMachine ())
 
+instance Show WaitingCallback where
+  show _ = "WaitingCallback"
+
 data InboxItem =
     RequestFromPeer PeerName PeerRequest
   | ResponseFromPeer PeerName WaitingCallback PeerResponse
@@ -48,22 +53,36 @@ data InboxItem =
 
 instance Show InboxItem where
   show (RequestFromPeer name req) = "RequestFromPeer " ++ show name ++ " " ++ show req
-  show (ResponseFromPeer name _ resp) = "ResponseFromPeer " ++ show name ++ " _ " ++ show resp
+  show (ResponseFromPeer name _ resp) = "ResponseFromPeer " ++ show name ++ " WaitingCallback " ++ show resp
   show (ClockTick t) = "ClockTick " ++ show t
-  show (ClientRequest rid req) = "Client " ++ show rid ++ " " ++ show req
+  show (ClientRequest rid req) = "ClientRequest " ++ show rid ++ " " ++ show req
+
+-- The IdFor fields for MessageOut should match the matching MessageIn 
+data MessageEvent =
+    MessageIn (IdFor MessageEvent) PeerName InboxItem
+  | MessageOut (IdFor MessageEvent) PeerName ProcessorMessage
+  deriving (Show)
 
 data NodeSim = NodeSim {
   _nodeEnv :: ProtocolEnv
 , _nodeState :: !RaftState
-, _nodeInbox :: Seq InboxItem
+, _nodeInbox :: Seq (IdFor MessageEvent, InboxItem)
 , _nodePendingResponses :: Map PeerName (Seq WaitingCallback)
-}
+} deriving (Show)
+
+data ClientSim = ClientSim {
+  _lastSeenLeader :: Maybe PeerName
+, _sentReqId :: Int
+} deriving (Show)
 
 data Network = Network {
   _nodes :: Map PeerName NodeSim
-}
+, _client :: ClientSim
+, _idCounter :: Int
+} deriving (Show)
 
 makeLenses ''NodeSim
+makeLenses ''ClientSim
 makeLenses ''Network
 
 allPeers :: Set PeerName
@@ -109,7 +128,7 @@ the node's next activation.
 -}
 
 data ProcessActivation =
-    Client PeerName (IdFor ClientResponse) ClientRequest
+    Client ClientRequest
   | Clock PeerName
   | Node PeerName
   deriving (Show)
@@ -123,20 +142,12 @@ clientCommand = Gen.choice
   , Gen.constant Ping
   ]
 
-aClientId :: Gen (IdFor ClientResponse)
-aClientId = IdFor <$> Gen.integral (Range.linear 0 100)
-
 processId :: Gen ProcessActivation
 processId = Gen.choice
   [ Node <$> peerName
   , Clock <$> peerName
-  , Client <$> peerName <*> aClientId <*> clientCommand
+  , Client <$> clientCommand
   ]
-
-data MessageEvent =
-    MessageIn PeerName InboxItem
-  | MessageOut PeerName ProcessorMessage
-  deriving (Show)
 
 ticksPerSecond :: Integer
 ticksPerSecond = 1000
@@ -150,38 +161,51 @@ timestamp len = do
 -- But, at the moment, clocks are instantanious and global, wheras they should
 -- be per process, really.
 
+simLength :: Integral a => a
+simLength = 100
+
 schedule :: Gen (Map Integer ProcessActivation)
-schedule = Gen.map (Range.linear 0 1000) $ ((,) <$> timestamp 100 <*> processId)
+schedule = Gen.map (Range.linear 0 (simLength * 10)) $ ((,) <$> timestamp simLength <*> processId)
 
 {-
 We know that _only_ leaders will emit AppendEntries events, so rather than
 inspecting the node state directly, we can listen for `AppendEntries` messages
 from nodes, and record the source against the term.
 -}
+timeouts :: Gen [Integer]
+timeouts = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> timestamp 1)
+  where
+  nnodes = Set.size allPeers
 
-runSimulation :: [Char] -> PropertyT IO [MessageEvent]
-runSimulation prefix = do
-      ts <- forAll timeouts
-      sched <- forAll schedule
-      let network = Network (allNodes $ map (% ticksPerSecond) ts)
-      let h = hash $ show (ts, sched)
-      let fname = prefix ++ show h
+runSimulation :: [Integer] -> Map Integer ProcessActivation -> String -> PropertyT IO [MessageEvent]
+runSimulation ts sched fname = do
       footnoteShow $ "Logging to: " ++ fname
 
+      let network = Network allNodes (ClientSim Nothing 0) 0
       evalIO $ do
+        runFileLoggingT fname $ do
+          $(logDebug) $ Text.pack $ ppShow ("timeouts", ts)
+          $(logDebug) $ Text.pack $ ppShow ("sched", sched)
         let simulation = forM (Map.toList sched) $ \(t, node) -> do
               msgs <- simulateIteration t node
               return msgs
-        mconcat <$> fst <$> State.runStateT (runFileLoggingT fname simulation) network
+        (msgs, network') <- State.runStateT (runFileLoggingT fname simulation) network
+        runFileLoggingT fname $ do
+          $(logDebug) $ Text.pack $ ppShow ("Network", network')
+          $(logDebug) $ Text.pack $ ppShow ("messages", network')
+        return $ mconcat $ msgs
 
   where
-    timeouts = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> timestamp 1)
-    nnodes = Set.size allPeers
-    allNodes ts = Map.fromList $ fmap (\(p, t) -> (p , makeNode p t)) $ zip (Set.toList allPeers) ts
+    allNodes = Map.fromList $ fmap (\(p, t) -> (p , makeNode p t)) $ zip (Set.toList allPeers) (map (% ticksPerSecond) ts)
 
 prop_simulateLeaderElection :: HasCallStack => Property
 prop_simulateLeaderElection = property $ do
-      messages <- runSimulation "/tmp/prop_simulateLeaderElection_"
+      ts <- forAll timeouts
+      sched <- forAll schedule
+      let h = hash $ show (ts, sched)
+      let fname = "/tmp/prop_simulateLeaderElection_" ++ show h
+
+      messages <- runSimulation ts sched fname
 
       let allLeaders = leadersByTerm messages
 
@@ -195,37 +219,54 @@ prop_simulateLeaderElection = property $ do
       leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
         -- let allLeaders = List.foldl' ... $
       leadersOf :: MessageEvent -> Map Term (Set PeerName)
-      leadersOf (MessageOut sender (PeerRequest _ (AppendEntries aer) _)) =
+      leadersOf (MessageOut _mid sender (PeerRequest _ (AppendEntries aer) _)) =
           Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
       leadersOf _ = Map.empty
 
 prop_bongsAreMonotonic :: HasCallStack => Property
 prop_bongsAreMonotonic = property $ do
-      messages <- runSimulation "/tmp/prop_bongsAreMonotonic"
+      ts <- forAll timeouts
+      sched <- forAll schedule
+      let h = hash $ show (ts, sched)
+      let fname = "/tmp/prop_bongsAreMonotonic" ++ show h
 
+      messages <- runSimulation ts sched fname
       let respValues = foldr findResponse [] messages
       test $ do
-          footnoteShow messages
-          respValues === List.sort respValues
+        runFileLoggingT fname $ do
+          $(logDebug) $ Text.pack $ ppShow ("messages", messages)
+          $(logDebug) $ Text.pack $ ppShow ("responses", respValues)
+          $(logDebug) $ Text.pack $ ppShow ("okay?", respValues == List.sort respValues)
+          -- footnoteShow messages
+        respValues === List.sort respValues
 
   where
-    findResponse (MessageOut _ (Reply _ (Right val))) r = val : r
+    findResponse (MessageOut _ _ (Reply _ (Right val))) r = val : r
     findResponse _ r = r
 
+nextId :: MonadState Network m => m (IdFor a)
+nextId = IdFor <$> (idCounter <<%= succ)
+    
 simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessActivation -> m [MessageEvent]
 simulateIteration n (Clock name) = do
     let t = n % ticksPerSecond
+    mid <- nextId
     $(logDebugSH) ("Clock", name, t)
-    (nodes . ix name . nodeInbox) %= (|> ClockTick t)
+    (nodes . ix name . nodeInbox) %= (|> (mid, ClockTick t))
     return []
 
 simulateIteration _ (Node name) = do
     simulateStep name
 
-simulateIteration n (Client peer rid cmd) = do
+simulateIteration n (Client cmd) = do
     let t = n % ticksPerSecond
-    $(logDebugSH) ("Client", peer, rid, t)
-    (nodes . ix peer . nodeInbox) %= (|> ClientRequest rid cmd)
+    rid <- IdFor <$> (client . sentReqId  <<%= succ)
+    mid <- nextId
+    use client >>= \st -> $(logDebugSH) ("simulateIteration", Client cmd, rid, st)
+    lastSeen <- use (client . lastSeenLeader)
+    let peer = fromMaybe (Set.toList allPeers !!  (fromInteger n `mod` Set.size allPeers)) lastSeen
+    $(logDebugSH) ("Client", peer, lastSeen, rid, t)
+    (nodes . ix peer . nodeInbox) %= (|> (mid, ClientRequest rid cmd))
     return []
 
 getQuiesecent :: (MonadLogger m, MonadState Network m) => PeerName -> m Bool
@@ -242,8 +283,8 @@ simulateStep thisNode = do
   nodes . ix thisNode . nodeInbox .= Seq.empty
 
   $(logDebugSH) ("Run", thisNode, inbox)
-  let actions = flip traverse_ inbox $ \it -> do
-                  $(logDebugSH) ("apply", thisNode, it)
+  let actions = flip traverse_ inbox $ \(mid, it) -> do
+                  $(logDebugSH) ("apply", thisNode, mid, it)
                   applyState it
 
   let (((), s', toSend), logs) = Identity.runIdentity $
@@ -255,27 +296,28 @@ simulateStep thisNode = do
 
   $(logDebugSH) ("Outputs from ", thisNode, toSend)
 
-  forM_ toSend $ \msg -> do
+  outs <- forM toSend $ \msg -> do
+    mid <- nextId
     case msg of
-      PeerRequest dst m cb -> sendPeerRequest dst m cb
-      PeerReply peerId m -> sendPeerReply peerId m
+      PeerRequest dst m cb -> sendPeerRequest mid dst m cb
+      PeerReply peerId m -> sendPeerReply mid peerId m
       Reply clientId m -> sendClientReply clientId m
+    return $ MessageOut mid thisNode msg
 
-  let ins = map (MessageIn thisNode) $ toList inbox
-  let outs = map (MessageOut thisNode) toSend
+  let ins = map (\(mid, msg) -> MessageIn mid thisNode msg) $ toList inbox
   return $ ins ++ outs
-
   where
 
-  sendPeerRequest dst m cb= do
+
+  sendPeerRequest mid dst m cb= do
         $(logDebugSH) (unPeerName thisNode, "->", unPeerName dst, "PeerRequest", m)
-        nodes . ix dst . nodeInbox %= (|> RequestFromPeer thisNode m)
+        nodes . ix dst . nodeInbox %= (|> (mid, RequestFromPeer thisNode m))
         nodes . ix thisNode . nodePendingResponses %= (Map.insertWith (flip mappend) dst $ Seq.singleton $ WaitingCallback cb)
         do
           p <-  use $ nodes . ix thisNode . nodePendingResponses
           $(logDebugSH) (unPeerName thisNode, "post sendPeerRequest", "num pending callbacks", fmap Seq.length p)
 
-  sendPeerReply peerId m = do
+  sendPeerReply mid peerId m = do
         let dst = nameOfPeerId peerId
         $(logDebugSH) (unPeerName dst, "<-", unPeerName thisNode, "PeerReply", m)
 
@@ -288,14 +330,21 @@ simulateStep thisNode = do
           Seq.EmptyL -> error "No waiting callback?"
           cb :< rest -> do
             (nodes . ix dst . nodePendingResponses . ix thisNode)  .= rest
-            nodes . ix dst . nodeInbox %= (|> ResponseFromPeer thisNode cb m)
+            nodes . ix dst . nodeInbox %= (|> (mid, ResponseFromPeer thisNode cb m))
         do
           p <-  use $ nodes . ix dst . nodePendingResponses
           $(logDebugSH) (unPeerName dst, "post sendPeerReply", "num pending callbacks", fmap Seq.length p)
         return ()
 
-  sendClientReply clientId m = do
-        $(logDebugSH) (thisNode, clientId, "sendClientReply", m)
+  sendClientReply clientId m@(Left (NotLeader leaderp)) = do
+        st <- use client
+        $(logDebugSH) (thisNode, clientId, "pre  sendClientReply", m, st)
+        client . lastSeenLeader .= leaderp
+        st' <- use client
+        $(logDebugSH) (thisNode, clientId, "post sendClientReply", m, st')
+  sendClientReply clientId m@(Right (Bong _)) = do
+        st <- use client
+        $(logDebugSH) (thisNode, clientId, "sendClientReply", m, st)
 
 nameOfPeerId :: IdFor PeerResponse -> PeerName
 nameOfPeerId (IdFor 0) = PeerName "a"
