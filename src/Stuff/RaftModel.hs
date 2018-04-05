@@ -33,12 +33,16 @@ import Control.Monad
 import Data.Functor.Identity (Identity)
 import Lens.Micro.Platform
 import qualified Data.Text as Text
+import Data.Hashable (Hashable)
 
 import GHC.Stack
+import GHC.Generics (Generic)
 import Stuff.Types
 
 newtype IdFor a = IdFor Int
-    deriving (Show, Eq, Ord)
+    deriving (Show, Eq, Ord, Generic)
+
+instance Hashable (IdFor a)
 
 {-
 
@@ -286,10 +290,11 @@ processPeerRequestMessage (Proto.RequestVote req) sender = do
         (_, LT, _) -> do
             $(logDebugSH) ("Refusing vote; candidate term", candidateTerm, ">= mine", thisTerm, "their head", Proto.rvHead req, "< ours", logIdx)
             refuseVote candidateTerm
+
         (_, _, Just v) -> do
             $(logDebugSH) ("Refusing vote; already voted for ", v)
             refuseVote candidateTerm
-        (_, _, Nothing) -> do
+        (_, _, _) -> do
             $(logDebugSH) ("Granting vote; candidate term", candidateTerm, "later than mine", thisTerm, "their head", Proto.rvHead req, ">= ours", logIdx)
             grantVote candidateTerm
 
@@ -370,7 +375,7 @@ processPeerRequestMessage
                     ackAppendEntries thisTerm
 
 handleVoteResponse :: HasCallStack => Proto.RequestVoteReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
-handleVoteResponse req _sender _msg@(Proto.VoteResult peerTerm granted) = do
+handleVoteResponse req sender _msg@(Proto.VoteResult peerTerm granted) = do
     $(logDebugSH) ("handleVoteResponse to", req, _msg)
     role <- use currentRole
     myTerm <- use currentTerm
@@ -379,29 +384,11 @@ handleVoteResponse req _sender _msg@(Proto.VoteResult peerTerm granted) = do
         _ | peerTerm > myTerm -> observeTerm peerTerm
         _ | peerTerm < myTerm -> $(logDebugSH) ("Ignoring vote for previous term")
         Candidate st -> do
-            whenCandidate myTerm st
+          when granted $ do
+            transitiontoLeaderWithEnoughVotes sender st
         _ -> do
             $(logDebugSH) ("vote recieved when non candidate?")
-    where
-    whenCandidate myTerm candidate = do
-        if granted
-        then do
-            let newCandidate = over votesForMe (Set.insert _sender) candidate
-            let currentVotes = view votesForMe newCandidate
 
-            neededVotes <- getMajority
-
-            $(logDebugSH) (
-                "In term: " , myTerm , " Vote ack for term: " , peerTerm ,
-                " needed: " , neededVotes , " have: " , currentVotes)
-
-            let newRole = if length currentVotes >= neededVotes
-                then Leader $ LeaderState Map.empty Nothing Map.empty
-                else Candidate newCandidate
-
-            currentRole .= newRole
-        else
-            return ()
 handleVoteResponse req sender _msg = do
     me <- view selfId
     let msg =
@@ -410,6 +397,24 @@ handleVoteResponse req sender _msg = do
     $(logWarnSH) msg
     void $ error $ show msg
 
+transitiontoLeaderWithEnoughVotes :: Proto.PeerName
+                                  -> CandidateState
+                                  -> ProtoStateMachine ()
+transitiontoLeaderWithEnoughVotes sender candidate = do
+            let newCandidate = over votesForMe (Set.insert sender) candidate
+            let currentVotes = view votesForMe newCandidate
+
+            neededVotes <- getMajority
+
+            myTerm <- use currentTerm
+            $(logDebugSH) (
+                "In term: " , myTerm , " needed: " , neededVotes , " have: " , currentVotes)
+
+            let newRole = if length currentVotes >= neededVotes
+                then Leader $ LeaderState Map.empty Nothing Map.empty
+                else Candidate newCandidate
+
+            currentRole .= newRole
 
 handleAppendEntriesResponse :: HasCallStack => Proto.LogIdx -> Proto.AppendEntriesReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine ()
 handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = do
@@ -502,7 +507,8 @@ processTick () (Tick t) = do
     transitionToCandidate :: HasCallStack => ProtoStateMachine ()
     transitionToCandidate = do
         myName <- view selfId
-        currentRole .= (Candidate $ CandidateState t $ Set.singleton myName)
+        let st = CandidateState t $ Set.singleton myName
+        currentRole .= (Candidate $ st)
         nextTerm <- succ <$> use currentTerm
         currentTerm .= nextTerm
         votedFor .= Just myName
@@ -514,6 +520,7 @@ processTick () (Tick t) = do
         let req = Proto.RequestVoteReq thisTerm myId logIdx
         sendRequestVotes req peers
         $(logDebugSH) ("transitionToCandidate new term: " , thisTerm)
+        transitiontoLeaderWithEnoughVotes myId st
 
 
     sendRequestVotes :: HasCallStack => Proto.RequestVoteReq -> Set Proto.PeerName -> ProtoStateMachine ()

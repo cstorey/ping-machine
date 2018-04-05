@@ -21,6 +21,7 @@ module Stuff.Proto
 import GHC.Generics
 import qualified Data.Binary as Binary
 import qualified Data.Map as Map
+import Data.Hashable (Hashable)
 
 data ClientRequest =
     Bing
@@ -59,6 +60,7 @@ instance Binary.Binary LogEntry
 newtype PeerName = PeerName { unPeerName :: String }
     deriving (Show, Eq, Ord, Generic)
 instance Binary.Binary PeerName
+instance Hashable PeerName
 
 data AppendEntriesReq = AppendEntriesReq {
   aeLeaderTerm :: Term

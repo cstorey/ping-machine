@@ -37,6 +37,7 @@ dependencies:
 - microlens-platform
 - monad-logger
 - text
+- hashable
 
 library:
   source-dirs: src
@@ -87,5 +88,5 @@ tests:
     - hspec
     - hspec-discover
     - hedgehog
-    - hashable
     - pretty-show
+    - bimap
