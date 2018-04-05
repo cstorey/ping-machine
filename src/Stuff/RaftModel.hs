@@ -290,7 +290,6 @@ processPeerRequestMessage (Proto.RequestVote req) sender = do
         (_, LT, _) -> do
             $(logDebugSH) ("Refusing vote; candidate term", candidateTerm, ">= mine", thisTerm, "their head", Proto.rvHead req, "< ours", logIdx)
             refuseVote candidateTerm
-
         (_, _, Just v) -> do
             $(logDebugSH) ("Refusing vote; already voted for ", v)
             refuseVote candidateTerm

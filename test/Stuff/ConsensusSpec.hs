@@ -3,7 +3,6 @@
 
 module Stuff.ConsensusSpec (
   tests
-, prop_simulateLeaderElection
 ) where
 
 import Data.Set (Set)
@@ -31,6 +30,7 @@ import GHC.Stack
 import Data.Hashable
 import Text.Show.Pretty
 import qualified Data.Text as Text
+import Control.Applicative ((<|>))
 
 import Lens.Micro.Platform
 
@@ -144,12 +144,15 @@ clientCommand = Gen.choice
   , Gen.constant Ping
   ]
 
-processId :: PeerMap -> Gen ProcessActivation
-processId allPeers = Gen.choice
+serverIds :: PeerMap -> Gen ProcessActivation
+serverIds allPeers = Gen.choice
   [ Node <$> peerName allPeers
   , Clock <$> peerName allPeers
   , Client <$> clientCommand
   ]
+
+clientIds :: Gen ProcessActivation
+clientIds = Client <$> clientCommand
 
 
 timestamp :: Integer -> Gen Integer
@@ -163,25 +166,23 @@ timestamp len = do
 
 -- The number of "seconds" that we run for.
 simLength :: Integral a => a
-simLength = 50
-
+simLength = 100
 ticksPerSecond :: Integer
-ticksPerSecond = 100
+ticksPerSecond = 1000
 eventsPerSecond :: Int
-eventsPerSecond = 100
+eventsPerSecond = 1
 
 aPeerName :: Gen PeerName
 aPeerName = PeerName <$> Gen.string (Range.linear 1 4) Gen.lower
 
-peers :: Gen (PeerMap)
-peers = Bimap.fromList <$> (zip <$> names <*> (map (IdFor . hash) <$> names))
+peers :: Int -> Gen (PeerMap)
+peers npeers = Bimap.fromList <$> (zip <$> names <*> (map (IdFor . hash) <$> names))
   where
     possibleNames = pure $ map (PeerName . show) ([0..] :: [Integer])
-    names = take <$> Gen.int (Range.linear 1 maxpeers) <*> possibleNames
-    maxpeers = 5
+    names = take <$> Gen.int (Range.singleton npeers) <*> possibleNames
 
-schedule :: PeerMap -> Gen (Map Integer ProcessActivation)
-schedule allPeers = Gen.map (Range.linear 0 (simLength * eventsPerSecond)) $ ((,) <$> timestamp simLength <*> processId allPeers)
+schedule :: Gen ProcessActivation -> Gen (Map Integer ProcessActivation)
+schedule pids = Gen.map (Range.linear 0 (simLength * eventsPerSecond)) $ ((,) <$> timestamp simLength <*> pids)
 
 {-
 We know that _only_ leaders will emit AppendEntries events, so rather than
@@ -214,11 +215,16 @@ runSimulation allPeers ts sched fname = do
   where
     allNodes = Map.fromList $ fmap (\(p, t) -> (p, makeNode allPeers p t)) $ zip (Bimap.keys allPeers) (map (% ticksPerSecond) ts)
 
-prop_simulateLeaderElection :: HasCallStack => Property
-prop_simulateLeaderElection = property $ do
-      allPeers <- forAll peers
+prop_simulateLeaderElection_2 :: HasCallStack => Property
+prop_simulateLeaderElection_2 = simulateLeaderElection 2
+prop_simulateLeaderElection_3 :: HasCallStack => Property
+prop_simulateLeaderElection_3 = simulateLeaderElection 3
+
+simulateLeaderElection :: HasCallStack => Int -> Property
+simulateLeaderElection n = property $ do
+      allPeers <- forAll $ peers n
       ts <- forAll $ timeouts allPeers
-      sched <- forAll $ schedule allPeers
+      sched <- forAll $ schedule $ serverIds allPeers
       let h = hash $ show (allPeers, ts, sched)
       let fname = "/tmp/prop_simulateLeaderElection_" ++ show h
 
@@ -240,11 +246,18 @@ prop_simulateLeaderElection = property $ do
           Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
       leadersOf _ = Map.empty
 
-prop_bongsAreMonotonic :: HasCallStack => Property
-prop_bongsAreMonotonic = property $ do
-      allPeers <- forAll peers
+prop_bongsAreMonotonic_1 :: HasCallStack => Property
+prop_bongsAreMonotonic_1 = bongsAreMonotonic 1
+prop_bongsAreMonotonic_2 :: HasCallStack => Property
+prop_bongsAreMonotonic_2 = bongsAreMonotonic 2
+prop_bongsAreMonotonic_3 :: HasCallStack => Property
+prop_bongsAreMonotonic_3 = bongsAreMonotonic 3
+
+bongsAreMonotonic :: HasCallStack => Int -> Property
+bongsAreMonotonic n = property $ do
+      allPeers <- forAll $ peers n
       ts <- forAll $ timeouts allPeers
-      sched <- forAll $ schedule allPeers
+      sched <- forAll $ schedule $ serverIds allPeers <|> clientIds
       let h = hash $ show (allPeers, ts, sched)
       let fname = "/tmp/prop_bongsAreMonotonic" ++ show h
 
