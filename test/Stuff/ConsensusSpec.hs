@@ -57,7 +57,7 @@ instance Show InboxItem where
   show (ClockTick t) = "ClockTick " ++ show t
   show (ClientRequest rid req) = "ClientRequest " ++ show rid ++ " " ++ show req
 
--- The IdFor fields for MessageOut should match the matching MessageIn 
+-- The IdFor fields for MessageOut should match the matching MessageIn
 data MessageEvent =
     MessageIn (IdFor MessageEvent) PeerName InboxItem
   | MessageOut (IdFor MessageEvent) PeerName ProcessorMessage
@@ -192,7 +192,6 @@ runSimulation ts sched fname = do
         (msgs, network') <- State.runStateT (runFileLoggingT fname simulation) network
         runFileLoggingT fname $ do
           $(logDebug) $ Text.pack $ ppShow ("Network", network')
-          $(logDebug) $ Text.pack $ ppShow ("messages", network')
         return $ mconcat $ msgs
 
   where
@@ -234,7 +233,7 @@ prop_bongsAreMonotonic = property $ do
       let respValues = foldr findResponse [] messages
       test $ do
         runFileLoggingT fname $ do
-          $(logDebug) $ Text.pack $ ppShow ("messages", messages)
+          -- $(logDebug) $ Text.pack $ ppShow ("messages", messages)
           $(logDebug) $ Text.pack $ ppShow ("responses", respValues)
           $(logDebug) $ Text.pack $ ppShow ("okay?", respValues == List.sort respValues)
           -- footnoteShow messages
@@ -246,7 +245,7 @@ prop_bongsAreMonotonic = property $ do
 
 nextId :: MonadState Network m => m (IdFor a)
 nextId = IdFor <$> (idCounter <<%= succ)
-    
+
 simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m) => Integer -> ProcessActivation -> m [MessageEvent]
 simulateIteration n (Clock name) = do
     let t = n % ticksPerSecond

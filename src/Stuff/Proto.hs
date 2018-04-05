@@ -29,7 +29,7 @@ data ClientRequest =
 instance Binary.Binary ClientRequest
 
 data ClientResult =
-    Bong Int
+    Bong (Maybe Int)
   deriving (Eq, Ord, Show, Generic)
 instance Binary.Binary ClientResult
 
@@ -43,7 +43,9 @@ type ClientResponse = Either ClientError ClientResult
 newtype Term = Term Int deriving (Show, Eq, Ord, Num, Generic, Enum)
 instance Binary.Binary Term
 
-newtype LogIdx = LogIdx { unLogIdx :: Int } deriving (Show, Eq, Ord, Num, Generic, Enum)
+-- Nothing signifies an empty log
+-- Just x signifies the value at position x
+newtype LogIdx = LogIdx { unLogIdx :: Maybe Int } deriving (Show, Eq, Ord, Generic)
 instance Binary.Binary LogIdx
 
 data LogEntry = LogEntry {

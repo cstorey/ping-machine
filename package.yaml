@@ -36,6 +36,7 @@ dependencies:
 - mtl
 - microlens-platform
 - monad-logger
+- text
 
 library:
   source-dirs: src
@@ -88,4 +89,3 @@ tests:
     - hedgehog
     - hashable
     - pretty-show
-    - text
