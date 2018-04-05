@@ -228,18 +228,20 @@ processClientReqRespMessage command pendingResponse = do
         return $ over pendingClientRequests (Map.insert idx pendingResponse) leader
 
 
-laterTermObserved :: HasCallStack => Proto.Term -> ProtoStateMachine ()
-laterTermObserved laterTerm = do
+observeTerm :: HasCallStack => Proto.Term -> ProtoStateMachine ()
+observeTerm laterTerm = do
     thisTerm <- use currentTerm
     formerRole <- use currentRole
-    $(logDebugSH) ("Later term observed", laterTerm, " > ", thisTerm)
 
-    case formerRole of
-        Leader leader -> whenLeader leader
-        _ -> return ()
+    when (thisTerm < laterTerm) $ do
+        $(logDebugSH) ("Later term observed", laterTerm, " > ", thisTerm)
+        currentTerm .= laterTerm
+        votedFor .= Nothing
 
-    currentTerm .= laterTerm
-    votedFor .= Nothing
+        case formerRole of
+            Leader leader -> whenLeader leader
+            _ -> return ()
+
 
     void $ stepDown
     where
@@ -276,17 +278,16 @@ processPeerRequestMessage (Proto.RequestVote req) sender = do
     vote <- use votedFor
     let candidateTerm = Proto.rvTerm req
     (_prevTerm, logIdx) <- getPrevLogTermIdx
+    observeTerm candidateTerm
     case () of
         _ | candidateTerm < thisTerm -> do
             $(logDebugSH) (candidateTerm, " < ", thisTerm)
             refuseVote thisTerm
         _ | candidateTerm > thisTerm && Maybe.isNothing vote && Proto.rvHead req >= logIdx -> do
-            laterTermObserved candidateTerm
             $(logDebugSH) ("Granting vote; candidate term", candidateTerm, "later than mine", thisTerm, "their head", Proto.rvHead req, ">= ours", logIdx)
             grantVote candidateTerm
 
         _ | candidateTerm > thisTerm -> do
-            laterTermObserved candidateTerm
             $(logDebugSH) ("Refusing vote; candidate term", candidateTerm, "later than mine", thisTerm, "their head", Proto.rvHead req, "< ours", logIdx)
             refuseVote candidateTerm
 
@@ -320,7 +321,7 @@ processPeerRequestMessage
         refuseAppendEntries thisTerm
     else
         if leaderTerm > thisTerm
-        then laterTermObserved leaderTerm
+        then observeTerm leaderTerm
         else
         do
             role <- use currentRole
@@ -382,7 +383,7 @@ handleVoteResponse req _sender _msg@(Proto.VoteResult peerTerm granted) = do
     myTerm <- use currentTerm
 
     case role of
-        _ | peerTerm > myTerm -> laterTermObserved peerTerm
+        _ | peerTerm > myTerm -> observeTerm peerTerm
         _ | peerTerm < myTerm -> $(logDebugSH) ("Ignoring vote for previous term")
         Candidate st -> do
             whenCandidate myTerm st
