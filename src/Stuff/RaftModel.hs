@@ -279,26 +279,19 @@ processPeerRequestMessage (Proto.RequestVote req) sender = do
     let candidateTerm = Proto.rvTerm req
     (_prevTerm, logIdx) <- getPrevLogTermIdx
     observeTerm candidateTerm
-    case () of
-        _ | candidateTerm < thisTerm -> do
-            $(logDebugSH) (candidateTerm, " < ", thisTerm)
+    case (candidateTerm `compare` thisTerm, Proto.rvHead req `compare` logIdx, vote) of
+        (LT, _, _) -> do
+            $(logDebugSH) ("Refusing vote; candidate term", candidateTerm, "earlier than mine", thisTerm)
             refuseVote thisTerm
-        _ | candidateTerm > thisTerm && Maybe.isNothing vote && Proto.rvHead req >= logIdx -> do
+        (_, LT, _) -> do
+            $(logDebugSH) ("Refusing vote; candidate term", candidateTerm, ">= mine", thisTerm, "their head", Proto.rvHead req, "< ours", logIdx)
+            refuseVote candidateTerm
+        (_, _, Just v) -> do
+            $(logDebugSH) ("Refusing vote; already voted for ", v)
+            refuseVote candidateTerm
+        (_, _, Nothing) -> do
             $(logDebugSH) ("Granting vote; candidate term", candidateTerm, "later than mine", thisTerm, "their head", Proto.rvHead req, ">= ours", logIdx)
             grantVote candidateTerm
-
-        _ | candidateTerm > thisTerm -> do
-            $(logDebugSH) ("Refusing vote; candidate term", candidateTerm, "later than mine", thisTerm, "their head", Proto.rvHead req, "< ours", logIdx)
-            refuseVote candidateTerm
-
-        _ | Maybe.isNothing vote && Proto.rvHead req >= logIdx -> do
-            $(logDebugSH) ("Granting vote; their head", Proto.rvHead req, ">= ours", logIdx)
-            grantVote candidateTerm
-        _ -> do
-            $(logDebugSH) ("Already voted for", vote)
-            refuseVote thisTerm
-
-    return ()
 
     where
         refuseVote :: HasCallStack => Proto.Term -> ProtoStateMachine ()
