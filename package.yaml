@@ -90,3 +90,4 @@ tests:
     - hedgehog
     - pretty-show
     - bimap
+    - data-ordlist
