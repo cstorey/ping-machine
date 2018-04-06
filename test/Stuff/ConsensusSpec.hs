@@ -209,30 +209,42 @@ processSchedule :: Gen ProcessSchedule
 processSchedule = Gen.shrink shrinkByMergingNeighbours gen
   where
   gen = Gen.list (Range.linear 0 (fromInteger $ simLength * eventsPerSecond))
-                    ((,) <$> interArrivalTime <*> processEvent)
-  invlambda = fromIntegral ticksPerSecond / fromIntegral eventsPerSecond
-  interArrivalTime :: Gen Integer
-  interArrivalTime = do
-    p <- Gen.float (Range.linearFrac 0.0 1.0)
-    let t = -log (1.0 - p) * invlambda
-    return $ round t
+                    ((,) <$> interArrivalTime eventsPerSecond <*> processEvent)
+
+interArrivalTime :: Integer -> Gen Integer
+interArrivalTime evPerSecond = do
+  p <- Gen.float (Range.linearFrac 0.0 1.0)
+  let t = -log (1.0 - p) * invlambda
+  return $ round t
+  where
+  invlambda = fromIntegral ticksPerSecond / fromIntegral evPerSecond
+
 shrinkByMergingNeighbours :: ProcessSchedule -> [ProcessSchedule]
 shrinkByMergingNeighbours s = join $ map go $ List.inits s `zip` List.tails s
   where
   go (pfx, (t0, a) : (t1, _) : rest) = [pfx ++ (t0+t1, a) : rest]
   go (_, _) = []
 
+inboxAndTick :: Gen ProcessSchedule
+inboxAndTick = do
+  t0 <- interArrivalTime 1
+  t1 <- interArrivalTime 1
+  return [(t0+1, Clock), (t1+1, Inbox)]
+
+
 processEvent :: Gen ProcessEvent
 processEvent = Gen.choice [ Gen.constant Clock, Gen.constant Inbox ]
 
 schedule :: [ProcessId] -> Gen SystemSchedule
--- schedule pids = Gen.map (Range.linear 0 (simLength * eventsPerSecond)) $ ((,) <$> timestamp simLength <*> pids)
-schedule pids = SystemSchedule . Map.fromList <$> allprocs
+schedule = scheduleOf processSchedule
+
+scheduleOf :: Gen ProcessSchedule -> [ProcessId] -> Gen SystemSchedule
+scheduleOf proc pids = SystemSchedule . Map.fromList <$> allprocs
   where
     allprocs :: Gen [(ProcessId, [(Integer, ProcessEvent)])]
     allprocs = sequence $ flip map pids $ aProc
     aProc :: ProcessId -> Gen (ProcessId, [(Integer, ProcessEvent)])
-    aProc p = (,) <$> Gen.constant p <*> processSchedule
+    aProc p = (,) <$> Gen.constant p <*> proc
 
 {-
 We know that _only_ leaders will emit AppendEntries events, so rather than
@@ -251,7 +263,8 @@ runSimulation allPeers ts (SystemSchedule sched) fname = do
       let byProc = map (\(p, s) -> map (\(t, e) -> (t, p, e)) $ toAbsTimes s) $ Map.toList sched :: [[(Integer,ProcessId,ProcessEvent)]]
 
       let toRun = List.mergeAll byProc
-      footnoteShow toRun
+      -- footnoteShow toRun
+
       assert $ List.length toRun == 0 || List.isSorted (map (\(t,_,_) -> t) toRun)
 
       let network = Network allNodes (ClientSim Nothing 0) 0
@@ -288,7 +301,6 @@ prop_leaderElectionOnlyElectsOneLeaderPerTerm_5 :: HasCallStack => Property
 prop_leaderElectionOnlyElectsOneLeaderPerTerm_5 = leaderElectionOnlyElectsOneLeaderPerTerm 5
 prop_leaderElectionOnlyElectsOneLeaderPerTerm_7 :: HasCallStack => Property
 prop_leaderElectionOnlyElectsOneLeaderPerTerm_7 = leaderElectionOnlyElectsOneLeaderPerTerm 7
-
 
 leaderElectionOnlyElectsOneLeaderPerTerm :: HasCallStack => Int -> Property
 leaderElectionOnlyElectsOneLeaderPerTerm n = property $ do
@@ -347,6 +359,89 @@ bongsAreMonotonic n = property $ do
   where
     findResponse (MessageOut _ _ (Reply _ (Right val))) r = val : r
     findResponse _ r = r
+
+-- I should just make this a plain test with relatively prime timeouts / schedule things.
+_prop_eventuallyElectsLeader_2 :: HasCallStack => Property
+_prop_eventuallyElectsLeader_2 = eventuallyElectsLeader 2
+_prop_eventuallyElectsLeader_3 :: HasCallStack => Property
+_prop_eventuallyElectsLeader_3 = eventuallyElectsLeader 3
+_prop_eventuallyElectsLeader_5 :: HasCallStack => Property
+_prop_eventuallyElectsLeader_5 = eventuallyElectsLeader 5
+_prop_eventuallyElectsLeader_7 :: HasCallStack => Property
+_prop_eventuallyElectsLeader_7 = eventuallyElectsLeader 7
+
+eventuallyElectsLeader :: HasCallStack => Int -> Property
+eventuallyElectsLeader n = property $ do
+  allPeers <- forAll $ peers n
+  ts <- forAll $ timeouts allPeers
+  sched <- forAll $ scheduleOf inboxAndTick $ nodeProcs allPeers
+  let h = hash $ show (allPeers, ts, sched)
+  let fname = "/tmp/prop_eventuallyElectsLeader_" ++ show n ++ "_" ++ show h
+
+  messages <- simulate allPeers ts sched fname
+
+  let allLeaders = leadersByTerm messages
+
+  test $ do
+    footnoteShow $ ("Leaders by term", allLeaders)
+    assert $ Map.size allLeaders > 0
+
+  where
+    leadersByTerm :: [MessageEvent] -> Map Term (Set PeerName)
+    leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
+      -- let allLeaders = List.foldl' ... $
+    leadersOf :: MessageEvent -> Map Term (Set PeerName)
+    leadersOf (MessageOut _mid sender (PeerRequest _ (AppendEntries aer) _)) =
+        Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
+    leadersOf _ = Map.empty
+
+    simulate :: PeerMap -> [Integer] -> SystemSchedule -> String -> PropertyT IO [MessageEvent]
+    simulate allPeers ts (SystemSchedule sched) fname = do
+      footnoteShow $ "Logging to: " ++ fname
+
+      let byProc = map (\(p, s) -> map (\(t, e) -> (t, p, e)) $ toAbsTimes $ cycle s)
+                    $ filter ((>0) . length . snd)
+                    $ Map.toList sched :: [[(Integer,ProcessId,ProcessEvent)]]
+
+      let toRun = List.takeWhile (\(t, _, _) -> t < ticksPerSecond * simLength) $ List.mergeAll byProc
+      assert $ List.length toRun == 0 || List.isSorted (map (\(t,_,_) -> t) toRun)
+
+      let network = Network (allNodes allPeers ts) (ClientSim Nothing 0) 0
+
+      evalIO $ do
+        runFileLoggingT fname $ do
+          $(logDebug) $ Text.pack $ ppShow ("allPeers", allPeers)
+          $(logDebug) $ Text.pack $ ppShow ("timeouts", ts)
+          $(logDebug) $ Text.pack $ ppShow ("sched", sched)
+
+        let runSched l = case l of
+              (t, p, ev) : rest -> do
+                msgs <- simulateIteration allPeers t p ev
+                if Map.null $ mconcat $ (map leadersOf msgs)
+                  then do
+                    res <- runSched rest
+                    return $ msgs ++ res
+                  else return msgs
+              [] -> return []
+
+        (msgs, network') <- State.runStateT (runFileLoggingT fname $ runSched toRun) network
+        runFileLoggingT fname $ do
+          $(logDebug) $ Text.pack $ ppShow ("Network", network')
+          $(logDebug) $ Text.pack $ ppShow ("Messages", msgs)
+        return $ msgs
+
+    allNodes allPeers ts = Map.fromList $ fmap (\(p, t) -> (p, makeNode allPeers p t)) $ zip (Bimap.keys allPeers) (map (% ticksPerSecond) ts)
+
+    toAbsTimes :: [(Integer, a)] -> [(Integer, a)]
+    toAbsTimes byInterval =
+      let lefts = scanl (+) 0 $ map fst byInterval
+          rights = map snd byInterval
+      in
+      lefts `zip` rights
+
+
+
+-- mechanics
 
 nextId :: MonadState Network m => m (IdFor a)
 nextId = IdFor <$> (idCounter <<%= succ)
