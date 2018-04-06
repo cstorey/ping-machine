@@ -215,18 +215,23 @@ runSimulation allPeers ts sched fname = do
   where
     allNodes = Map.fromList $ fmap (\(p, t) -> (p, makeNode allPeers p t)) $ zip (Bimap.keys allPeers) (map (% ticksPerSecond) ts)
 
-prop_simulateLeaderElection_2 :: HasCallStack => Property
-prop_simulateLeaderElection_2 = simulateLeaderElection 2
-prop_simulateLeaderElection_3 :: HasCallStack => Property
-prop_simulateLeaderElection_3 = simulateLeaderElection 3
+prop_leaderElectionOnlyElectsOneLeaderPerTerm_2 :: HasCallStack => Property
+prop_leaderElectionOnlyElectsOneLeaderPerTerm_2 = leaderElectionOnlyElectsOneLeaderPerTerm 2
+prop_leaderElectionOnlyElectsOneLeaderPerTerm_3 :: HasCallStack => Property
+prop_leaderElectionOnlyElectsOneLeaderPerTerm_3 = leaderElectionOnlyElectsOneLeaderPerTerm 3
+prop_leaderElectionOnlyElectsOneLeaderPerTerm_5 :: HasCallStack => Property
+prop_leaderElectionOnlyElectsOneLeaderPerTerm_5 = leaderElectionOnlyElectsOneLeaderPerTerm 5
+prop_leaderElectionOnlyElectsOneLeaderPerTerm_7 :: HasCallStack => Property
+prop_leaderElectionOnlyElectsOneLeaderPerTerm_7 = leaderElectionOnlyElectsOneLeaderPerTerm 7
 
-simulateLeaderElection :: HasCallStack => Int -> Property
-simulateLeaderElection n = property $ do
+
+leaderElectionOnlyElectsOneLeaderPerTerm :: HasCallStack => Int -> Property
+leaderElectionOnlyElectsOneLeaderPerTerm n = property $ do
       allPeers <- forAll $ peers n
       ts <- forAll $ timeouts allPeers
       sched <- forAll $ schedule $ serverIds allPeers
       let h = hash $ show (allPeers, ts, sched)
-      let fname = "/tmp/prop_simulateLeaderElection_" ++ show h
+      let fname = "/tmp/prop_leaderElectionOnlyElectsOneLeaderPerTerm_" ++ show h
 
       messages <- runSimulation allPeers ts sched fname
 
@@ -252,6 +257,9 @@ prop_bongsAreMonotonic_2 :: HasCallStack => Property
 prop_bongsAreMonotonic_2 = bongsAreMonotonic 2
 prop_bongsAreMonotonic_3 :: HasCallStack => Property
 prop_bongsAreMonotonic_3 = bongsAreMonotonic 3
+prop_bongsAreMonotonic_5 :: HasCallStack => Property
+prop_bongsAreMonotonic_5 = bongsAreMonotonic 5
+
 
 bongsAreMonotonic :: HasCallStack => Int -> Property
 bongsAreMonotonic n = property $ do
