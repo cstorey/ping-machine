@@ -273,7 +273,7 @@ getPrevLogTermIdx = do
 getMajority :: HasCallStack => ProtoStateMachine Int
 getMajority = do
     memberCount <- succ . length <$> view peerNames
-    return $ succ (memberCount `div` 2)
+    return $ (memberCount `div` 2)
 
 processPeerRequestMessage :: HasCallStack => Proto.PeerRequest -> IdFor Proto.PeerResponse -> ProtoStateMachine ()
 processPeerRequestMessage (Proto.RequestVote req) sender = do
