@@ -282,6 +282,74 @@ bongsAreMonotonic n = property $ do
     findResponse (MessageOut _ _ (Reply _ (Right val))) r = val : r
     findResponse _ r = r
 
+prop_eventuallyElectsLeader_2 :: HasCallStack => Property
+prop_eventuallyElectsLeader_2 = eventuallyElectsLeader 2
+prop_eventuallyElectsLeader_3 :: HasCallStack => Property
+prop_eventuallyElectsLeader_3 = eventuallyElectsLeader 3
+prop_eventuallyElectsLeader_5 :: HasCallStack => Property
+prop_eventuallyElectsLeader_5 = eventuallyElectsLeader 5
+prop_eventuallyElectsLeader_7 :: HasCallStack => Property
+prop_eventuallyElectsLeader_7 = eventuallyElectsLeader 7
+
+
+eventuallyElectsLeader :: HasCallStack => Int -> Property
+eventuallyElectsLeader n = property $ do
+      allPeers <- forAll $ peers n
+      ts <- forAll $ timeouts allPeers
+      sched <- forAll $ schedule $ serverIds allPeers
+      let h = hash $ show (allPeers, ts, sched)
+      let fname = "/tmp/prop_eventuallyElectsLeader_" ++ show h
+
+      -- At this point, we want to be able to have a _cyclic_ schedule per
+      -- node, so that they're not all running in lockstep. However, ClockTick
+      -- currently specify absolute time, so that'll need to be taken into
+      -- account. 1) Generate a finite sub-schedule per entity 2) Create a
+      -- lazy cyclic list of same 3) Merge into priority queue lazily
+
+      -- Per process: [(DelayTime, Event)]
+      -- Event = CheckInbox | Tick
+
+      messages <- simulate allPeers ts sched fname
+
+      let allLeaders = leadersByTerm messages
+
+      test $ do
+        footnoteShow $ ("Leaders by term", allLeaders)
+        forM_ (Map.toList allLeaders) $ \(_term, leaders) -> do
+          assert $ 1 >= Set.size leaders
+
+  where
+      leadersByTerm :: [MessageEvent] -> Map Term (Set PeerName)
+      leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
+        -- let allLeaders = List.foldl' ... $
+      leadersOf :: MessageEvent -> Map Term (Set PeerName)
+      leadersOf (MessageOut _mid sender (PeerRequest _ (AppendEntries aer) _)) =
+          Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
+      leadersOf _ = Map.empty
+
+      simulate :: PeerMap -> [Integer] -> Map Integer ProcessActivation -> String -> PropertyT IO [MessageEvent]
+      simulate allPeers ts sched fname = do
+            footnoteShow $ "Logging to: " ++ fname
+
+            let network = Network (allNodes allPeers ts) (ClientSim Nothing 0) 0
+            evalIO $ do
+              runFileLoggingT fname $ do
+                $(logDebug) $ Text.pack $ ppShow ("allPeers", allPeers)
+                $(logDebug) $ Text.pack $ ppShow ("timeouts", ts)
+                $(logDebug) $ Text.pack $ ppShow ("sched", sched)
+              let simulation = forM (Map.toList sched) $ \(t, node) -> do
+                    msgs <- simulateIteration allPeers t node
+                    return msgs
+              (msgs, network') <- State.runStateT (runFileLoggingT fname simulation) network
+              runFileLoggingT fname $ do
+                $(logDebug) $ Text.pack $ ppShow ("Network", network')
+              return $ mconcat $ msgs
+      allNodes allPeers ts = Map.fromList $ fmap (\(p, t) -> (p, makeNode allPeers p t)) $ zip (Bimap.keys allPeers) (map (% ticksPerSecond) ts)
+
+
+
+-- mechanics
+
 nextId :: MonadState Network m => m (IdFor a)
 nextId = IdFor <$> (idCounter <<%= succ)
 
