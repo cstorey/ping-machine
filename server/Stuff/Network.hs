@@ -19,6 +19,7 @@ import Data.List ((\\))
 import qualified Control.Concurrent as C
 import Control.Monad
 import qualified Control.Exception as E
+-- import GHC.Stack (HasCallStack)
 
 import Stuff.Types
 
@@ -96,6 +97,7 @@ listenFor :: S.AddrInfo -> IO S.Socket
 listenFor addr = do
     sock <- S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)
     S.setSocketOption sock S.ReuseAddr 1
+    putStrLn $ "Bind to: " ++ show addr
     S.bind sock (S.addrAddress addr)
     S.listen sock 10
     putStrLn . show =<< S.getSocketName sock
@@ -153,8 +155,9 @@ processOutgoingConnection reqQ respQ clientId (is, os) = do
                   k <- STM.readTQueue pendingResponses
                   STM.writeTQueue respQ $ k msg
                 responses pendingResponses
-            Nothing -> error $ "Well, I'm done: " ++ show clientId
-
+            Nothing -> do
+                putStrLn $ "EOF:" ++ show clientId
+                return ()
 
 runReqRespListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid)
     => IO xid

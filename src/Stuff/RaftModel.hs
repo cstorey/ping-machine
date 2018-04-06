@@ -273,7 +273,9 @@ getPrevLogTermIdx = do
 getMajority :: HasCallStack => ProtoStateMachine Int
 getMajority = do
     memberCount <- succ . length <$> view peerNames
-    return $ succ (memberCount `div` 2)
+    let majority  = succ (memberCount `div` 2)
+    $(logDebugSH) ("Majority", majority, memberCount)
+    return majority
 
 processPeerRequestMessage :: HasCallStack => Proto.PeerRequest -> IdFor Proto.PeerResponse -> ProtoStateMachine ()
 processPeerRequestMessage (Proto.RequestVote req) sender = do
@@ -329,7 +331,7 @@ processPeerRequestMessage
                     follower <- stepDown
                     whenFollower thisTerm follower
                 Leader _st -> do
-                    error ("appendEntries recieved when leader? " ++ show _msg)
+                    $(logWarnSH) ("appendEntries recieved when leader?", _msg)
 
     where
         refuseAppendEntries :: HasCallStack => Proto.Term -> ProtoStateMachine ()
@@ -407,7 +409,7 @@ transitiontoLeaderWithEnoughVotes sender candidate = do
 
             myTerm <- use currentTerm
             $(logDebugSH) (
-                "In term: " , myTerm , " needed: " , neededVotes , " have: " , currentVotes)
+                "In term: " , myTerm , " needed: " , neededVotes , " have: " , Set.size currentVotes, currentVotes)
 
             let newRole = if length currentVotes >= neededVotes
                 then Leader $ LeaderState Map.empty Nothing Map.empty

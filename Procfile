@@ -1,3 +1,5 @@
-node-a: stack exec -- stuff-server +RTS -t -T -s -S -RTS 9990 9991 9993 9995 | (mkdir -vp log/a/ && svlogd -ttt -v log/a/)
-node-b: stack exec -- stuff-server +RTS -t -T -s -S -RTS 9992 9993 9991 9995 | (mkdir -vp log/b/ && svlogd -ttt -v log/b/)
-node-c: stack exec -- stuff-server +RTS -t -T -s -S -RTS 9994 9995 9991 9993 | (mkdir -vp log/c/ && svlogd -ttt -v log/c/)
+node-a: stack exec -- stuff-server +RTS -t -T -s -S -RTS 9990 9991 9993 9995 9997 9999 # | (mkdir -vp log/a/ && svlogd -ttt -v log/a/)
+node-b: stack exec -- stuff-server +RTS -t -T -s -S -RTS 9992 9993 9991 9995 9997 9999 # | (mkdir -vp log/b/ && svlogd -ttt -v log/b/)
+node-c: stack exec -- stuff-server +RTS -t -T -s -S -RTS 9994 9995 9991 9993 9997 9999 # | (mkdir -vp log/c/ && svlogd -ttt -v log/c/)
+node-d: stack exec -- stuff-server +RTS -t -T -s -S -RTS 9996 9997 9991 9993 9995 9999 # | (mkdir -vp log/a/ && svlogd -ttt -v log/d/)
+node-e: stack exec -- stuff-server +RTS -t -T -s -S -RTS 9998 9999 9991 9993 9995 9997 # | (mkdir -vp log/b/ && svlogd -ttt -v log/e/)

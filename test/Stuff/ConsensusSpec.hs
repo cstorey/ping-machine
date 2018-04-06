@@ -175,11 +175,11 @@ eventsPerSecond = 1
 aPeerName :: Gen PeerName
 aPeerName = PeerName <$> Gen.string (Range.linear 1 4) Gen.lower
 
-peers :: Int -> Gen (PeerMap)
-peers npeers = Bimap.fromList <$> (zip <$> names <*> (map (IdFor . hash) <$> names))
+peers :: Int -> PeerMap
+peers npeers = Bimap.fromList $ zip names (map (IdFor . hash) names)
   where
-    possibleNames = pure $ map (PeerName . show) ([0..] :: [Integer])
-    names = take <$> Gen.int (Range.singleton npeers) <*> possibleNames
+    possibleNames = map (PeerName . show) ([0..] :: [Integer])
+    names = take npeers possibleNames
 
 schedule :: Gen ProcessActivation -> Gen (Map Integer ProcessActivation)
 schedule pids = Gen.map (Range.linear 0 (simLength * eventsPerSecond)) $ ((,) <$> timestamp simLength <*> pids)
@@ -210,6 +210,7 @@ runSimulation allPeers ts sched fname = do
         (msgs, network') <- State.runStateT (runFileLoggingT fname simulation) network
         runFileLoggingT fname $ do
           $(logDebug) $ Text.pack $ ppShow ("Network", network')
+          forM_ (mconcat msgs) $ $(logDebugSH)
         return $ mconcat $ msgs
 
   where
@@ -222,7 +223,7 @@ prop_simulateLeaderElection_3 = simulateLeaderElection 3
 
 simulateLeaderElection :: HasCallStack => Int -> Property
 simulateLeaderElection n = property $ do
-      allPeers <- forAll $ peers n
+      let allPeers = peers n
       ts <- forAll $ timeouts allPeers
       sched <- forAll $ schedule $ serverIds allPeers
       let h = hash $ show (allPeers, ts, sched)
@@ -255,7 +256,7 @@ prop_bongsAreMonotonic_3 = bongsAreMonotonic 3
 
 bongsAreMonotonic :: HasCallStack => Int -> Property
 bongsAreMonotonic n = property $ do
-      allPeers <- forAll $ peers n
+      let allPeers = peers n
       ts <- forAll $ timeouts allPeers
       sched <- forAll $ schedule $ serverIds allPeers <|> clientIds
       let h = hash $ show (allPeers, ts, sched)
