@@ -148,7 +148,6 @@ serverIds :: PeerMap -> Gen ProcessActivation
 serverIds allPeers = Gen.choice
   [ Node <$> peerName allPeers
   , Clock <$> peerName allPeers
-  , Client <$> clientCommand
   ]
 
 clientIds :: Gen ProcessActivation
