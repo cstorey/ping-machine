@@ -1,5 +1,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
+
 module Stuff.LinearizabilityCheckSpec (spec) where
 
 import           Test.Hspec
@@ -8,6 +10,9 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Foldable (foldl')
 import Control.Applicative ((<|>), empty)
+-- import Debug.Trace as Trace
+-- import qualified Data.Text.Lazy as Text
+-- import qualified Data.Text.Format as Text
 -- import qualified Data.Foldable as Foldable
 
 newtype Process = Process(Int)
@@ -30,6 +35,8 @@ data RegisterRet a =
     Ok
   | Val a
     deriving (Show, Eq, Ord)
+
+type ModelFun s req res = (s -> req -> (s, res))
 
 a, b, c :: Process
 a = Process 0
@@ -74,11 +81,12 @@ h6History =
   , (b, Call Read)
   , (b, Ret (Val 1))
   ]
-
-checkHistory :: forall req res . (Eq req, Eq res, Show req, Show res)
-             => [(Process, HistoryElement req res)]
+checkHistory :: forall req res s. (Eq req, Eq res, Show req, Show res, Show s)
+             => ModelFun s req res
+             -> s
+             -> [(Process, HistoryElement req res)]
              -> Either () [Linearization req res]
-checkHistory history = case go [] Map.empty Map.empty byProcess of
+checkHistory model initialState history = case go [] Map.empty Map.empty initialState byProcess of
     h : _ -> Right h
     _ -> Left ()
   where
@@ -88,12 +96,13 @@ checkHistory history = case go [] Map.empty Map.empty byProcess of
     go :: [Linearization req res]
        -> Map Process req
        -> Map Process res
+       -> s
        -> Map Process [HistoryElement req res]
        -> [[Linearization req res]] -- Set of potential options
-    go prev calls rets m = doneRule <|> callRule <|> linRule <|> retRule
+    go prev calls rets s histories = doneRule <|> callRule <|> linRule <|> retRule
 
       where
-      candidates = foldMap (\(p, h) -> map (\op -> (p, op)) $ take 1 h) $ Map.toList m
+      candidates = foldMap (\(p, h) -> map (\op -> (p, op)) $ take 1 h) $ Map.toList histories
       doneRule =
         if candidates == [] && Map.null calls && Map.null rets
         then return prev
@@ -102,24 +111,29 @@ checkHistory history = case go [] Map.empty Map.empty byProcess of
         -- From Testing from "Testing for Linearizability", Gavin Lowe
         -- rule `call`
       callRule = do
-        candidates >>= \case
-          (p, Call req) | Map.notMember p calls && Map.notMember p rets ->
-            go prev (Map.insert p req calls) rets $ Map.adjust (drop 1) p m
+        (p, op) <- candidates
+        case op of
+          Call req | Map.notMember p calls && Map.notMember p rets -> do
+            -- Trace.trace (Text.unpack $ Text.format "call@{}: req:{}" (Text.Shown p, Text.Shown req)) $ return ()
+            go prev (Map.insert p req calls) rets s $ Map.adjust (drop 1) p histories
           _ -> empty
 
       linRule = do
         -- Candidates means here that they have some history (in this case, we
         -- care about rets) outstanding.
         (p, _) <- candidates
-        req <- maybe empty pure $ (Map.lookup p calls :: Maybe req)
-        let (s', ret) = error "apply _req" s' -- apply _req
-        go (Op p req ret : prev) (Map.delete p calls) (Map.insert p ret rets) m
+        req <- maybe empty pure $ Map.lookup p calls
+        let (s', ret) = model s req
+        -- Trace.trace (Text.unpack $ Text.format "lin@{}: state: {}: req:{} -> expected:{}" (Text.Shown p, Text.Shown s, Text.Shown req, Text.Shown ret)) $ return ()
+        go (Op p req ret : prev) (Map.delete p calls) (Map.insert p ret rets) s' histories
 
       retRule = do
         (p, op) <- candidates
+        expected <- maybe empty pure $ Map.lookup p rets
         case op of
-          Ret _res | Map.member p rets ->
-            go prev calls (Map.delete p rets) $ Map.adjust (drop 1) p m
+          Ret res | res == expected -> do
+            -- Trace.trace (Text.unpack $ Text.format "ret@{}: res:{} == expected:{}" (Text.Shown p, Text.Shown res, Text.Shown expected)) $ return ()
+            go prev calls (Map.delete p rets) s $ Map.adjust (drop 1) p histories
           _ -> empty
 
 spec :: Spec
@@ -127,7 +141,14 @@ spec = do
   describe "Examples from Herlihy and Wing" $ do
     it "Linearizes h5" $ do
       pending
-      checkHistory h5History `shouldBe` Right h5Linearisation
+      (checkHistory register newRegister h5History :: Either () [Linearization (RegisterReq Int) (RegisterRet Int)]) `shouldBe` Right h5Linearisation
     it "Finds h6 Invalid" $ do
       pending
-      checkHistory h6History `shouldBe` Left ()
+      checkHistory register newRegister h6History `shouldBe` Left ()
+
+  where
+    newRegister :: Int
+    newRegister = (-1)
+    register :: ModelFun a (RegisterReq a) (RegisterRet a)
+    register state Read = (state, Val state)
+    register _ (Write x) = (x, Ok)

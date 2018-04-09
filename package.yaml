@@ -92,3 +92,4 @@ tests:
     - pretty-show
     - bimap
     - data-ordlist
+    - text-format
