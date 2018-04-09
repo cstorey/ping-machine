@@ -1,8 +1,9 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TemplateHaskell #-}
 
-module Stuff.ConsensusSpec (
-  tests
+module Stuff.ConsensusSpec
+( tests
+, spec
 ) where
 
 import Data.Set (Set)
@@ -40,6 +41,9 @@ import Lens.Micro.Platform
 import           Hedgehog
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
+
+import           HaskellWorks.Hspec.Hedgehog
+import           Test.Hspec
 
 import Stuff.RaftModel
 import Stuff.Proto
@@ -489,9 +493,9 @@ simulateStep allPeers thisNode = do
   nodes . ix thisNode . nodeInbox .= Seq.empty
 
   $(logDebugSH) ("Run", thisNode, inbox)
-  let actions = flip traverse_ inbox $ \(mid, it) -> do
-                  $(logDebugSH) ("apply", thisNode, mid, it)
-                  applyState allPeers it
+  let actions = flip traverse_ inbox $ \(mid, action) -> do
+                  $(logDebugSH) ("apply", thisNode, mid, action)
+                  applyState allPeers action
 
   let (((), s', toSend), logs) = Identity.runIdentity $
                                  Logger.runWriterLoggingT $
@@ -531,8 +535,8 @@ simulateStep allPeers thisNode = do
           p <-  use $ nodes . ix dst . nodePendingResponses
           $(logDebugSH) (unPeerName dst, "pre sendPeerReply", "num pending callbacks", fmap Seq.length p)
 
-        pending <- use (nodes . ix dst . nodePendingResponses . ix thisNode)
-        case Seq.viewl pending of
+        pendingCb <- use (nodes . ix dst . nodePendingResponses . ix thisNode)
+        case Seq.viewl pendingCb of
           Seq.EmptyL -> error "No waiting callback?"
           cb :< rest -> do
             (nodes . ix dst . nodePendingResponses . ix thisNode)  .= rest
@@ -563,3 +567,11 @@ peerIdOfName m name = m Bimap.! name
 
 tests :: Group
 tests = $$(discover)
+
+spec :: Spec
+spec = describe "Stuff.ConsensusSpec" $ do
+  forM_ [1..5] $ \nodeCount -> describe ("With " ++ show nodeCount ++ " nodes") $ do
+    it "should elect only one leader per term " $ do
+      require $ leaderElectionOnlyElectsOneLeaderPerTerm nodeCount
+    it "should produce monotonic bong responses" $ do
+      require $ bongsAreMonotonic nodeCount

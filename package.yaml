@@ -88,6 +88,7 @@ tests:
     - hspec
     - hspec-discover
     - hedgehog
+    - hw-hspec-hedgehog
     - pretty-show
     - bimap
     - data-ordlist
