@@ -296,18 +296,12 @@ runSimulation allPeers ts (SystemSchedule sched) fname = do
       lefts `zip` rights
 
 
-prop_leaderElectionOnlyElectsOneLeaderPerTerm_2 :: HasCallStack => Property
-prop_leaderElectionOnlyElectsOneLeaderPerTerm_2 = leaderElectionOnlyElectsOneLeaderPerTerm 2
+prop_leaderElectionOnlyElectsOneLeaderPerTerm :: HasCallStack => Property
+prop_leaderElectionOnlyElectsOneLeaderPerTerm = leaderElectionOnlyElectsOneLeaderPerTerm
 
-prop_leaderElectionOnlyElectsOneLeaderPerTerm_3 :: HasCallStack => Property
-prop_leaderElectionOnlyElectsOneLeaderPerTerm_3 = leaderElectionOnlyElectsOneLeaderPerTerm 3
-prop_leaderElectionOnlyElectsOneLeaderPerTerm_5 :: HasCallStack => Property
-prop_leaderElectionOnlyElectsOneLeaderPerTerm_5 = leaderElectionOnlyElectsOneLeaderPerTerm 5
-prop_leaderElectionOnlyElectsOneLeaderPerTerm_7 :: HasCallStack => Property
-prop_leaderElectionOnlyElectsOneLeaderPerTerm_7 = leaderElectionOnlyElectsOneLeaderPerTerm 7
-
-leaderElectionOnlyElectsOneLeaderPerTerm :: HasCallStack => Int -> Property
-leaderElectionOnlyElectsOneLeaderPerTerm n = property $ do
+leaderElectionOnlyElectsOneLeaderPerTerm :: HasCallStack => Property
+leaderElectionOnlyElectsOneLeaderPerTerm = property $ do
+      n <- forAll $ Gen.int (Range.linear 1 5)
       allPeers <- forAll $ peers n
       ts <- forAll $ timeouts allPeers
       sched <- forAll $ schedule $ nodeProcs allPeers
@@ -332,18 +326,13 @@ leaderElectionOnlyElectsOneLeaderPerTerm n = property $ do
           Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
       leadersOf _ = Map.empty
 
-prop_bongsAreMonotonic_1 :: HasCallStack => Property
-prop_bongsAreMonotonic_1 = bongsAreMonotonic 1
-prop_bongsAreMonotonic_2 :: HasCallStack => Property
-prop_bongsAreMonotonic_2 = bongsAreMonotonic 2
-prop_bongsAreMonotonic_3 :: HasCallStack => Property
-prop_bongsAreMonotonic_3 = bongsAreMonotonic 3
-prop_bongsAreMonotonic_5 :: HasCallStack => Property
-prop_bongsAreMonotonic_5 = bongsAreMonotonic 5
+prop_bongsAreMonotonic :: HasCallStack => Property
+prop_bongsAreMonotonic = bongsAreMonotonic
 
 
-bongsAreMonotonic :: HasCallStack => Int -> Property
-bongsAreMonotonic n = property $ do
+bongsAreMonotonic :: HasCallStack => Property
+bongsAreMonotonic = property $ do
+      n <- forAll $ Gen.int (Range.linear 1 5)
       allPeers <- forAll $ peers n
       ts <- forAll $ timeouts allPeers
       sched <- forAll $ schedule $ nodeProcs allPeers <|> clientProcs
@@ -570,8 +559,7 @@ tests = $$(discover)
 
 spec :: Spec
 spec = describe "Stuff.ConsensusSpec" $ do
-  forM_ [1..5] $ \nodeCount -> describe ("With " ++ show nodeCount ++ " nodes") $ do
-    it "should elect only one leader per term " $ do
-      require $ leaderElectionOnlyElectsOneLeaderPerTerm nodeCount
-    it "should produce monotonic bong responses" $ do
-      require $ bongsAreMonotonic nodeCount
+  it "should elect only one leader per term " $ do
+    require $ leaderElectionOnlyElectsOneLeaderPerTerm
+  it "should produce monotonic bong responses" $ do
+    require $ bongsAreMonotonic
