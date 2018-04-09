@@ -559,7 +559,7 @@ tests :: Group
 tests = $$(discover)
 
 spec :: Spec
-spec = describe "Stuff.ConsensusSpec" $ do
+spec = parallel $ do
   it "should elect a leader with a given schedule" $ do
     require $ eventuallyElectsLeader
   it "should elect only one leader per term " $ do
