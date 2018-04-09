@@ -260,6 +260,9 @@ timeouts allPeers = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> time
   where
   nnodes = Bimap.size allPeers
 
+peerCount :: Gen Int
+peerCount = Gen.int (Range.linear 1 5)
+
 runSimulation :: PeerMap -> [Integer] -> SystemSchedule -> String -> PropertyT IO [MessageEvent]
 runSimulation allPeers ts (SystemSchedule sched) fname = do
       footnoteShow $ "Logging to: " ++ fname
@@ -301,7 +304,7 @@ prop_leaderElectionOnlyElectsOneLeaderPerTerm = leaderElectionOnlyElectsOneLeade
 
 leaderElectionOnlyElectsOneLeaderPerTerm :: HasCallStack => Property
 leaderElectionOnlyElectsOneLeaderPerTerm = property $ do
-      n <- forAll $ Gen.int (Range.linear 1 5)
+      n <- forAll $ peerCount
       allPeers <- forAll $ peers n
       ts <- forAll $ timeouts allPeers
       sched <- forAll $ schedule $ nodeProcs allPeers
@@ -332,7 +335,7 @@ prop_bongsAreMonotonic = bongsAreMonotonic
 
 bongsAreMonotonic :: HasCallStack => Property
 bongsAreMonotonic = property $ do
-      n <- forAll $ Gen.int (Range.linear 1 5)
+      n <- forAll $ peerCount
       allPeers <- forAll $ peers n
       ts <- forAll $ timeouts allPeers
       sched <- forAll $ schedule $ nodeProcs allPeers <|> clientProcs
@@ -353,21 +356,13 @@ bongsAreMonotonic = property $ do
     findResponse (MessageOut _ _ (Reply _ (Right val))) r = val : r
     findResponse _ r = r
 
--- I should just make this a plain test with relatively prime timeouts / schedule things.
-_prop_eventuallyElectsLeader_2 :: HasCallStack => Property
-_prop_eventuallyElectsLeader_2 = eventuallyElectsLeader 2
-_prop_eventuallyElectsLeader_3 :: HasCallStack => Property
-_prop_eventuallyElectsLeader_3 = eventuallyElectsLeader 3
-_prop_eventuallyElectsLeader_5 :: HasCallStack => Property
-_prop_eventuallyElectsLeader_5 = eventuallyElectsLeader 5
-_prop_eventuallyElectsLeader_7 :: HasCallStack => Property
-_prop_eventuallyElectsLeader_7 = eventuallyElectsLeader 7
-
-eventuallyElectsLeader :: HasCallStack => Int -> Property
-eventuallyElectsLeader n = property $ do
+eventuallyElectsLeader :: HasCallStack => Property
+eventuallyElectsLeader = property $ do
+  -- we rely on AppendEntries items to guage when an election has happened.
+  n <- forAll $ Gen.int (Range.linear 2 23)
   allPeers <- forAll $ peers n
-  ts <- forAll $ timeouts allPeers
-  sched <- forAll $ scheduleOf inboxAndTick $ nodeProcs allPeers
+  let ts = replicate n 2000
+  let sched = SystemSchedule $ periodicSched allPeers
   let h = hash $ show (allPeers, ts, sched)
   let fname = "/tmp/prop_eventuallyElectsLeader_" ++ show n ++ "_" ++ show h
 
@@ -387,6 +382,12 @@ eventuallyElectsLeader n = property $ do
     leadersOf (MessageOut _mid sender (PeerRequest _ (AppendEntries aer) _)) =
         Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
     leadersOf _ = Map.empty
+
+    periodicSched :: PeerMap -> Map ProcessId [(Integer, ProcessEvent)]
+    periodicSched allPeers = Map.fromList $ zip (fmap Node $ Bimap.keys allPeers) $ map sched [1000..]
+      where
+        sched :: Integer -> [(Integer, ProcessEvent)]
+        sched n = [(0, Clock), (n, Inbox)]
 
     simulate :: PeerMap -> [Integer] -> SystemSchedule -> String -> PropertyT IO [MessageEvent]
     simulate allPeers ts (SystemSchedule sched) fname = do
@@ -559,6 +560,8 @@ tests = $$(discover)
 
 spec :: Spec
 spec = describe "Stuff.ConsensusSpec" $ do
+  it "should elect a leader with a given schedule" $ do
+    require $ eventuallyElectsLeader
   it "should elect only one leader per term " $ do
     require $ leaderElectionOnlyElectsOneLeaderPerTerm
   it "should produce monotonic bong responses" $ do
