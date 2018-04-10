@@ -14,6 +14,8 @@ import Debug.Trace as Trace
 import qualified Data.Text.Lazy as Text
 import qualified Data.Text.Format as Text
 import qualified Data.Text.Format.Params as Text
+import qualified Data.Sequence as Seq
+import Data.Sequence (Seq, (|>), ViewL(..))
 -- import qualified Data.Foldable as Foldable
 
 newtype Process = Process(Int)
@@ -37,12 +39,85 @@ data RegisterRet a =
   | RVal a
     deriving (Show, Eq, Ord)
 
+
+data FifoReq a =
+    FEnqueue a
+  | FDequeue
+    deriving (Show, Eq, Ord)
+data FifoRet a =
+    FOk
+  | FVal a
+  | FEmpty
+    deriving (Show, Eq, Ord)
+
 type ModelFun s req res = (s -> req -> (s, res))
 
 a, b, c :: Process
 a = Process 0
 b = Process 1
 c = Process 2
+
+
+h1History :: [(Process, HistoryElement (FifoReq String) (FifoRet String))]
+h1History =
+  [ (a, Call $ FEnqueue "x")
+  , (b, Call $ FEnqueue "y")
+  , (b, Ret $ FOk)
+  , (a, Ret $ FOk)
+  , (b, Call $ FDequeue)
+  , (b, Ret $ FVal "x")
+  , (a, Call $ FDequeue)
+  , (a, Ret $ FVal "y")
+  ]
+
+h1Linearisation :: [(Integer, Linearization (FifoReq String) (FifoRet String))]
+h1Linearisation =
+  [(0,Op a (FEnqueue "x") FOk)
+  , (1,Op b (FEnqueue "y") FOk)
+  , (4,Op b FDequeue (FVal "x"))
+  , (6,Op a FDequeue (FVal "y"))
+  ]
+
+
+-- Invalid
+h2History :: [(Process, HistoryElement (FifoReq String) (FifoRet String))]
+h2History =
+  [ (a, Call $ FEnqueue "x")
+  , (a, Ret $ FOk)
+  , (b, Call $ FEnqueue "y")
+  , (a, Call $ FDequeue)
+  , (b, Ret $ FOk)
+  , (a, Ret $ FVal "y")
+  ]
+
+-- Acceptable
+h3History :: [(Process, HistoryElement (FifoReq String) (FifoRet String))]
+h3History =
+  [ (a, Call $ FEnqueue "x")
+  , (b, Call $ FDequeue)
+  , (a, Ret $ FOk)
+  , (b, Ret $ FVal "x")
+  ]
+
+h3Linearisation :: [(Integer, Linearization (FifoReq String) (FifoRet String))]
+h3Linearisation =
+  [ (0,Op a (FEnqueue "x") FOk)
+  , (1,Op b FDequeue (FVal "x"))
+  ]
+
+-- Invalid
+h4History :: [(Process, HistoryElement (FifoReq String) (FifoRet String))]
+h4History =
+  [ (a, Call $ FEnqueue "x")
+  , (b, Call $ FEnqueue "y")
+  , (a, Ret $ FOk)
+  , (b, Ret $ FOk)
+
+  , (b, Call $ FDequeue)
+  , (c, Call $ FDequeue)
+  , (b, Ret $ FVal "y")
+  , (c, Ret $ FVal "y")
+  ]
 
 -- Acceptable
 h5History :: [(Process, HistoryElement (RegisterReq Int) (RegisterRet Int))]
@@ -160,6 +235,14 @@ _s = Text.Shown
 spec :: Spec
 spec = do
   describe "Examples from Herlihy and Wing" $ do
+    it "Linearizes h1" $ do
+      checkHistory fifo newFifo h1History `shouldBe` Right h1Linearisation
+    xit "Finds h2 Invalid" $ do
+      checkHistory fifo newFifo h2History `shouldBe` Left ()
+    it "Linearizes h3" $ do
+      checkHistory fifo newFifo h3History `shouldBe` Right h3Linearisation
+    it "Finds h4 Invalid" $ do
+      checkHistory fifo newFifo h4History `shouldBe` Left ()
     it "Linearizes h5" $ do
       checkHistory register newRegister h5History `shouldBe` Right h5Linearisation
     xit "Finds h6 Invalid" $ do
@@ -179,3 +262,10 @@ spec = do
     register :: ModelFun a (RegisterReq a) (RegisterRet a)
     register state RRead = (state, RVal state)
     register _ (RWrite x) = (x, ROk)
+
+    newFifo = Seq.empty
+    fifo :: ModelFun (Seq a) (FifoReq a) (FifoRet a)
+    fifo state (FEnqueue x) = (state |> x, FOk)
+    fifo state FDequeue = case Seq.viewl state of
+      val :< rest -> (rest, FVal val)
+      EmptyL -> (state, FEmpty)
