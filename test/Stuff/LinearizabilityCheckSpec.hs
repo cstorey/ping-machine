@@ -28,13 +28,13 @@ data Linearization req resp = Op Process req resp
     deriving (Show, Eq, Ord)
 
 data RegisterReq a =
-    Write a
-  | Read
+    RWrite a
+  | RRead
     deriving (Show, Eq, Ord)
 
 data RegisterRet a =
-    Ok
-  | Val a
+    ROk
+  | RVal a
     deriving (Show, Eq, Ord)
 
 type ModelFun s req res = (s -> req -> (s, res))
@@ -47,40 +47,40 @@ c = Process 2
 -- Acceptable
 h5History :: [(Process, HistoryElement (RegisterReq Int) (RegisterRet Int))]
 h5History =
-  [ (a, Call (Write 0))
-  , (a, Ret Ok)
-  , (b, Call (Write 1))
-  , (a, Call Read)
-  , (a, Ret (Val 1))
-  , (c, Call (Write 0))
-  , (c, Ret Ok)
-  , (b, Ret Ok)
-  , (b, Call Read)
-  , (b, Ret (Val 0))
+  [ (a, Call (RWrite 0))
+  , (a, Ret ROk)
+  , (b, Call (RWrite 1))
+  , (a, Call RRead)
+  , (a, Ret (RVal 1))
+  , (c, Call (RWrite 0))
+  , (c, Ret ROk)
+  , (b, Ret ROk)
+  , (b, Call RRead)
+  , (b, Ret (RVal 0))
   ]
 
 h5Linearisation :: [(Integer, Linearization (RegisterReq Int) (RegisterRet Int))]
 h5Linearisation =
-  [ (0, Op a (Write 0) Ok) -- 0-1
-  , (2, Op b (Write 1) Ok) -- 2-7
-  , (3, Op a Read (Val 1)) -- 3-4
-  , (5, Op c (Write 0) Ok) -- 5-6
-  , (8, Op b Read (Val 0)) -- 8-9
+  [ (0, Op a (RWrite 0) ROk) -- 0-1
+  , (2, Op b (RWrite 1) ROk) -- 2-7
+  , (3, Op a RRead (RVal 1)) -- 3-4
+  , (5, Op c (RWrite 0) ROk) -- 5-6
+  , (8, Op b RRead (RVal 0)) -- 8-9
   ]
 
 -- Not acceptable
 h6History :: [(Process, HistoryElement (RegisterReq Int) (RegisterRet Int))]
 h6History =
-  [ (a, Call (Write 0))
-  , (a, Ret Ok)
-  , (b, Call (Write 1))
-  , (a, Call Read)
-  , (a, Ret (Val 1))
-  , (c, Call (Write 0))
-  , (c, Ret Ok)
-  , (b, Ret Ok)
-  , (b, Call Read)
-  , (b, Ret (Val 1))
+  [ (a, Call (RWrite 0))
+  , (a, Ret ROk)
+  , (b, Call (RWrite 1))
+  , (a, Call RRead)
+  , (a, Ret (RVal 1))
+  , (c, Call (RWrite 0))
+  , (c, Ret ROk)
+  , (b, Ret ROk)
+  , (b, Call RRead)
+  , (b, Ret (RVal 1))
   ]
 checkHistory :: forall req res s. (Eq req, Eq res, Show req, Show res, Show s)
              => ModelFun s req res
@@ -166,10 +166,10 @@ spec = do
       {-
         If I say `shouldBe` Right h5Linearisation; we see:
 
-        expected: Right [Op (Process 0) (Write 0) Ok,Op (Process 1) (Write 1) Ok,Op (Process 0) Read (Val 1),Op (Process 2) (Write 0) Ok,Op (Process 1) Read (Val 0)]
-        but got:  Right [Op (Process 0) (Write 0) Ok,Op (Process 1) (Write 1) Ok,Op (Process 0) Read (Val 1),Op (Process 1) Read (Val 1),Op (Process 2) (Write 0) Ok]
+        expected: Right [Op (Process 0) (RWrite 0) ROk,Op (Process 1) (RWrite 1) ROk,Op (Process 0) RRead (RVal 1),Op (Process 2) (RWrite 0) ROk,Op (Process 1) RRead (RVal 0)]
+        but got:  Right [Op (Process 0) (RWrite 0) ROk,Op (Process 1) (RWrite 1) ROk,Op (Process 0) RRead (RVal 1),Op (Process 1) RRead (RVal 1),Op (Process 2) (RWrite 0) ROk]
 
-        So the final Write from `c` and Read from `b` end up getting re-ordered. So, clearly, we have a missing constraint on the concrete ordering.
+        So the final RWrite from `c` and RRead from `b` end up getting re-ordered. So, clearly, we have a missing constraint on the concrete ordering.
       -}
       checkHistory register newRegister h6History `shouldBe` Left ()
 
@@ -177,5 +177,5 @@ spec = do
     newRegister :: Int
     newRegister = (-1)
     register :: ModelFun a (RegisterReq a) (RegisterRet a)
-    register state Read = (state, Val state)
-    register _ (Write x) = (x, Ok)
+    register state RRead = (state, RVal state)
+    register _ (RWrite x) = (x, ROk)
