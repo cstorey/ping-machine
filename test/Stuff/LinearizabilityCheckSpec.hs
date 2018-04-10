@@ -8,7 +8,6 @@ import           Test.Hspec
 
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Foldable (foldl')
 import Control.Applicative ((<|>), empty)
 import Debug.Trace as Trace
 import qualified Data.Text.Lazy as Text
@@ -70,16 +69,16 @@ h1History =
   , (a, Ret $ FVal "y")
   ]
 
-h1Linearisation :: [(Integer, Linearization (FifoReq String) (FifoRet String))]
+h1Linearisation :: [Linearization (FifoReq String) (FifoRet String)]
 h1Linearisation =
-  [(0,Op a (FEnqueue "x") FOk)
-  , (1,Op b (FEnqueue "y") FOk)
-  , (4,Op b FDequeue (FVal "x"))
-  , (6,Op a FDequeue (FVal "y"))
+  [ Op a (FEnqueue "x") FOk
+  , Op b (FEnqueue "y") FOk
+  , Op b FDequeue (FVal "x")
+  , Op a FDequeue (FVal "y")
   ]
 
 
--- Invalid
+-- Invalid; as enqueue of "y" happens strictly after "x"
 h2History :: [(Process, HistoryElement (FifoReq String) (FifoRet String))]
 h2History =
   [ (a, Call $ FEnqueue "x")
@@ -99,13 +98,13 @@ h3History =
   , (b, Ret $ FVal "x")
   ]
 
-h3Linearisation :: [(Integer, Linearization (FifoReq String) (FifoRet String))]
+h3Linearisation :: [Linearization (FifoReq String) (FifoRet String)]
 h3Linearisation =
-  [ (0,Op a (FEnqueue "x") FOk)
-  , (1,Op b FDequeue (FVal "x"))
+  [ Op a (FEnqueue "x") FOk
+  , Op b FDequeue (FVal "x")
   ]
 
--- Invalid
+-- Invalid; "y" shuold not be dequeued twice.
 h4History :: [(Process, HistoryElement (FifoReq String) (FifoRet String))]
 h4History =
   [ (a, Call $ FEnqueue "x")
@@ -134,16 +133,16 @@ h5History =
   , (b, Ret (RVal 0))
   ]
 
-h5Linearisation :: [(Integer, Linearization (RegisterReq Int) (RegisterRet Int))]
+h5Linearisation :: [Linearization (RegisterReq Int) (RegisterRet Int)]
 h5Linearisation =
-  [ (0, Op a (RWrite 0) ROk) -- 0-1
-  , (2, Op b (RWrite 1) ROk) -- 2-7
-  , (3, Op a RRead (RVal 1)) -- 3-4
-  , (5, Op c (RWrite 0) ROk) -- 5-6
-  , (8, Op b RRead (RVal 0)) -- 8-9
+  [  Op a (RWrite 0) ROk
+  ,  Op b (RWrite 1) ROk
+  ,  Op a RRead (RVal 1)
+  ,  Op c (RWrite 0) ROk
+  ,  Op b RRead (RVal 0)
   ]
 
--- Not acceptable
+-- Invalid; `c`'s `(Write 0) -> Ok` happens strictly before `b`'s `Read -> Val 1`
 h6History :: [(Process, HistoryElement (RegisterReq Int) (RegisterRet Int))]
 h6History =
   [ (a, Call (RWrite 0))
@@ -161,68 +160,68 @@ checkHistory :: forall req res s. (Eq req, Eq res, Show req, Show res, Show s)
              => ModelFun s req res
              -> s
              -> [(Process, HistoryElement req res)]
-             -> Either () [(Integer, Linearization req res)]
-checkHistory model initialState history = case go Map.empty Map.empty initialState byProcess of
-    h : _ -> Right h
+             -> Either () [Linearization req res]
+checkHistory model initialState h = case go Map.empty Map.empty initialState 0 h of
+    lin : _ -> Right lin
     _ -> Left ()
   where
-    byProcess :: Map Process [(Integer, HistoryElement req res)]
-    byProcess = foldl' (flip $ \(t, p, op) -> Map.insertWith (flip mappend) p [(t, op)]) Map.empty $ zipWith flatten3 [0..] history
-
-    flatten3 :: a -> (b,c) -> (a,b,c)
-    flatten3 x (y,z) = (x,y,z)
-
-    go :: Map Process (Integer, req)
-       -> Map Process (Integer, req, res)
+    go :: Map Process req
+       -> Map Process (req, res)
        -> s
-       -> Map Process [(Integer, HistoryElement req res)]
-       -> [[(Integer, Linearization req res)]] -- Set of potential options
-    go calls rets s histories = doneRule <|> callRule <|> linRule <|> retRule
-
+       -> Int
+       -> [(Process, HistoryElement req res)]
+       -> [[Linearization req res]] -- Set of potential options
+    go calls rets s depth history = doneRule <|> observationRule <|> linRule
       where
-      candidates = foldMap (\(p, h) -> map (\(t, op) -> (t, p, op)) $ take 1 h) $ Map.toList histories
+      _spaces = take (depth * 2) $ cycle " "
       doneRule = do
         -- Trace.traceM (Text.unpack $ Text.format "done? calls:{}; rets: {}; pending:{}" (Text.Shown $ Map.size calls, Text.Shown $ Map.size rets, Text.Shown $ Map.map length histories))
-        if candidates == [] && Map.null calls && Map.null rets
+        if history == [] && Map.null calls && Map.null rets
         then return []
         else empty
 
         -- From Testing from "Testing for Linearizability", Gavin Lowe
         -- rule `call`
-      callRule = do
-        (t, p, op) <- candidates
+      observationRule = do
+        -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
+        (p, op) : future <- pure history
+        -- _trace "{}observation History: this:{}; future:{}" (_spaces, _s (p, op), _s future)
         case op of
           Call req | Map.notMember p calls && Map.notMember p rets -> do
-            -- _trace "call:{}@{}: req:{}" (_s p, _s t, _s req)
-            go (Map.insert p (t, req) calls) rets s $ Map.adjust (drop 1) p histories
-          _ -> empty
+            -- _trace "{}call:{}: req:{}" (_spaces, _s p, _s req)
+            rest <- go (Map.insert p req calls) rets s (succ depth) future
+            -- _trace "buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
+            -- _trace "{}call:{}: req:{}; <- {}" (_spaces, _s p, _s req, _s rest)
+            return rest
+          Ret res -> do
+            (_call, expected) <- maybe empty pure $ Map.lookup p rets
+            if (res == expected)
+            then do
+              -- _trace "{}Ret:{}; {} -> {}" (_spaces, _s p, _s _call, _s res)
+              rest <- go calls (Map.delete p rets) s (succ depth) future
+              -- Something something check for wall-clock time.
+              -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
+              -- _trace "{}Ret:{}; {} - {}; <- {}..." (_spaces, _s p, _s _call, _s res, _s rest)
+              return $ rest
+            else do
+              -- _trace "{}Ret: no matching linearization: {}" (_spaces, _s res)
+              empty
+          _other -> do
+            -- _trace "{}???: {}" (_spaces, _s _other)
+            empty
 
       linRule = do
-        -- Candidates means here that they have some history (in this case, we
-        -- care about rets) outstanding.
-        (_, p, _) <- candidates
-        (startTime, req) <- maybe empty pure $ Map.lookup p calls
+        -- _trace "{}linRule{}" (_spaces, ("" :: String))
+        -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
+        (p, req) <- Map.toList calls
+        --  (startTime, req) <- maybe empty pure $ Map.lookup p calls
         let (s', ret) = model s req
         -- _trace "lin@{}: state: {}: req:{} -> expected:{}" (_s p, _s s, _s req, _s ret)
-        rest <- go (Map.delete p calls) (Map.insert p (startTime, req, ret) rets) s' histories
+        rest <- go (Map.delete p calls) (Map.insert p (req, ret) rets) s' (succ depth) history
         let lin = Op p req ret
-        -- _trace "lin:{}: req:{} -> expected:{}; <- {} : {}" (_s p, _s req, _s ret, _s (startTime, lin), _s rest)
-        return $ (startTime, lin) : rest
-
-      retRule = do
-        (_endTime, p, op) <- candidates
-        (_startTime, _call, expected) <- maybe empty pure $ Map.lookup p rets
-        case op of
-          Ret res | res == expected -> do
-            -- Trace.traceM (Text.unpack $ Text.format "ret@{}: res:{} == expected:{}" (Text.Shown p, Text.Shown res, Text.Shown expected))
-            rest <- go calls (Map.delete p rets) s $ Map.adjust (drop 1) p histories
-            -- Something something check for wall-clock time.
-            -- _trace "Ret:{}; {}:{} - {}:{}; <- {}..." (_s p, _s _startTime, _s _call, _s _endTime, _s res, _s rest)
-            return $ rest
-          Ret _res -> do
-            -- Trace.traceM (Text.unpack $ Text.format "ret@{}: res:{} != expected:{}" (Text.Shown p, Text.Shown _res, Text.Shown expected))
-            empty
-          _ -> empty
+        -- _trace "buf: calls:{}; rets: {}" (_s calls, _s rets)
+        -- _trace "lin:{}: req:{} -> expected:{}; <- {} : {}" (_s p, _s req, _s ret, _s lin, _s rest)
+        return $ lin : rest
 
 _trace :: (Text.Params ps0, Applicative f) => Text.Format -> ps0 -> f ()
 _trace fmt ps = Trace.traceM (Text.unpack $ f fmt ps)
@@ -237,7 +236,7 @@ spec = do
   describe "Examples from Herlihy and Wing" $ do
     it "Linearizes h1" $ do
       checkHistory fifo newFifo h1History `shouldBe` Right h1Linearisation
-    xit "Finds h2 Invalid" $ do
+    it "Finds h2 Invalid" $ do
       checkHistory fifo newFifo h2History `shouldBe` Left ()
     it "Linearizes h3" $ do
       checkHistory fifo newFifo h3History `shouldBe` Right h3Linearisation
@@ -245,15 +244,7 @@ spec = do
       checkHistory fifo newFifo h4History `shouldBe` Left ()
     it "Linearizes h5" $ do
       checkHistory register newRegister h5History `shouldBe` Right h5Linearisation
-    xit "Finds h6 Invalid" $ do
-      {-
-        If I say `shouldBe` Right h5Linearisation; we see:
-
-        expected: Right [Op (Process 0) (RWrite 0) ROk,Op (Process 1) (RWrite 1) ROk,Op (Process 0) RRead (RVal 1),Op (Process 2) (RWrite 0) ROk,Op (Process 1) RRead (RVal 0)]
-        but got:  Right [Op (Process 0) (RWrite 0) ROk,Op (Process 1) (RWrite 1) ROk,Op (Process 0) RRead (RVal 1),Op (Process 1) RRead (RVal 1),Op (Process 2) (RWrite 0) ROk]
-
-        So the final RWrite from `c` and RRead from `b` end up getting re-ordered. So, clearly, we have a missing constraint on the concrete ordering.
-      -}
+    it "Finds h6 Invalid" $ do
       checkHistory register newRegister h6History `shouldBe` Left ()
 
   where
