@@ -186,26 +186,22 @@ checkHistory model initialState h = case go Map.empty Map.empty initialState 0 h
         -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
         (p, op) : future <- pure history
         -- _trace "{}observation History: this:{}; future:{}" (_spaces, _s (p, op), _s future)
-        case op of
-          Call req | Map.notMember p calls && Map.notMember p rets -> do
+        let call = Map.lookup p calls
+        let ret = Map.lookup p rets
+        case (op, call, ret) of
+          (Call req, Nothing, Nothing) -> do
             -- _trace "{}call:{}: req:{}" (_spaces, _s p, _s req)
             rest <- go (Map.insert p req calls) rets s (succ depth) future
             -- _trace "buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
             -- _trace "{}call:{}: req:{}; <- {}" (_spaces, _s p, _s req, _s rest)
             return rest
-          Ret res -> do
-            (_call, expected) <- maybe empty pure $ Map.lookup p rets
-            if (res == expected)
-            then do
-              -- _trace "{}Ret:{}; {} -> {}" (_spaces, _s p, _s _call, _s res)
-              rest <- go calls (Map.delete p rets) s (succ depth) future
-              -- Something something check for wall-clock time.
-              -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
-              -- _trace "{}Ret:{}; {} - {}; <- {}..." (_spaces, _s p, _s _call, _s res, _s rest)
-              return $ rest
-            else do
-              -- _trace "{}Ret: no matching linearization: {}" (_spaces, _s res)
-              empty
+          (Ret res, Nothing, Just (_call, expected)) | (res == expected) -> do
+            -- _trace "{}Ret:{}; {} -> {}" (_spaces, _s p, _s _call, _s res)
+            rest <- go calls (Map.delete p rets) s (succ depth) future
+            -- Something something check for wall-clock time.
+            -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
+            -- _trace "{}Ret:{}; {} - {}; <- {}..." (_spaces, _s p, _s _call, _s res, _s rest)
+            return $ rest
           _other -> do
             -- _trace "{}???: {}" (_spaces, _s _other)
             empty
