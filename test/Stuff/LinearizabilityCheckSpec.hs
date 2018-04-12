@@ -15,7 +15,9 @@ import qualified Data.Text.Format as Text
 import qualified Data.Text.Format.Params as Text
 import qualified Data.Sequence as Seq
 import Data.Sequence (Seq, (|>), ViewL(..))
--- import qualified Data.Foldable as Foldable
+
+import Control.Monad.Amb (Amb)
+import qualified Control.Monad.Amb as Amb
 
 newtype Process = Process(Int)
     deriving (Show, Eq, Ord)
@@ -161,7 +163,7 @@ checkHistory :: forall req res s. (Eq req, Eq res, Show req, Show res, Show s)
              -> s
              -> [(Process, HistoryElement req res)]
              -> Either () [Linearization req res]
-checkHistory model initialState h = case go Map.empty Map.empty initialState 0 h of
+checkHistory model initialState h = case Amb.allValues $ go Map.empty Map.empty initialState 0 h of
     lin : _ -> Right lin
     _ -> Left ()
   where
@@ -170,10 +172,11 @@ checkHistory model initialState h = case go Map.empty Map.empty initialState 0 h
        -> s
        -> Int
        -> [(Process, HistoryElement req res)]
-       -> [[Linearization req res]] -- Set of potential options
+       -> Amb [Linearization req res] [Linearization req res] -- Set of potential options
     go calls rets s depth history = doneRule <|> observationRule <|> linRule
       where
       _spaces = take (depth * 2) $ cycle " "
+      doneRule :: Amb [Linearization req res] [Linearization req res]
       doneRule = do
         -- Trace.traceM (Text.unpack $ Text.format "done? calls:{}; rets: {}; pending:{}" (Text.Shown $ Map.size calls, Text.Shown $ Map.size rets, Text.Shown $ Map.map length histories))
         if history == [] && Map.null calls && Map.null rets
@@ -182,34 +185,40 @@ checkHistory model initialState h = case go Map.empty Map.empty initialState 0 h
 
         -- From Testing from "Testing for Linearizability", Gavin Lowe
         -- rule `call`
+      observationRule :: Amb [Linearization req res] [Linearization req res]
       observationRule = do
         -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
-        (p, op) : future <- pure history
-        -- _trace "{}observation History: this:{}; future:{}" (_spaces, _s (p, op), _s future)
-        let call = Map.lookup p calls
-        let ret = Map.lookup p rets
-        case (op, call, ret) of
-          (Call req, Nothing, Nothing) -> do
-            -- _trace "{}call:{}: req:{}" (_spaces, _s p, _s req)
-            rest <- go (Map.insert p req calls) rets s (succ depth) future
-            -- _trace "buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
-            -- _trace "{}call:{}: req:{}; <- {}" (_spaces, _s p, _s req, _s rest)
-            return rest
-          (Ret res, Nothing, Just (_call, expected)) | (res == expected) -> do
-            -- _trace "{}Ret:{}; {} -> {}" (_spaces, _s p, _s _call, _s res)
-            rest <- go calls (Map.delete p rets) s (succ depth) future
-            -- Something something check for wall-clock time.
-            -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
-            -- _trace "{}Ret:{}; {} - {}; <- {}..." (_spaces, _s p, _s _call, _s res, _s rest)
-            return $ rest
-          _other -> do
-            -- _trace "{}???: {}" (_spaces, _s _other)
-            empty
+        case history of
+          (p, op) : future -> do
+            -- _trace "{}observation History: this:{}; future:{}" (_spaces, _s (p, op), _s future)
+            let call = Map.lookup p calls
+            let ret = Map.lookup p rets
+            case (op, call, ret) of
+              (Call req, Nothing, Nothing) -> do
+                -- _trace "{}call:{}: req:{}" (_spaces, _s p, _s req)
+                rest <- go (Map.insert p req calls) rets s (succ depth) future
+                -- _trace "buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
+                -- _trace "{}call:{}: req:{}; <- {}" (_spaces, _s p, _s req, _s rest)
+                return rest
+              (Ret res, Nothing, Just (_call, expected)) | (res == expected) -> do
+                -- _trace "{}Ret:{}; {} -> {}" (_spaces, _s p, _s _call, _s res)
+                rest <- go calls (Map.delete p rets) s (succ depth) future
+                -- Something something check for wall-clock time.
+                -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
+                -- _trace "{}Ret:{}; {} - {}; <- {}..." (_spaces, _s p, _s _call, _s res, _s rest)
+                return $ rest
+              _other -> do
+                -- _trace "{}???: {}" (_spaces, _s _other)
+                empty
+          [] -> do
+                -- _trace "{}noFuture: {}" (_spaces, "" :: String)
+                empty
 
+      linRule :: Amb [Linearization req res] [Linearization req res]
       linRule = do
         -- _trace "{}linRule{}" (_spaces, ("" :: String))
         -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
-        (p, req) <- Map.toList calls
+        (p, req) <- Amb.amb $ Map.toList calls
         --  (startTime, req) <- maybe empty pure $ Map.lookup p calls
         let (s', ret) = model s req
         -- _trace "lin@{}: state: {}: req:{} -> expected:{}" (_s p, _s s, _s req, _s ret)

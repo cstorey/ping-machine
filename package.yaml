@@ -93,3 +93,4 @@ tests:
     - bimap
     - data-ordlist
     - text-format
+    - nondeterminism
