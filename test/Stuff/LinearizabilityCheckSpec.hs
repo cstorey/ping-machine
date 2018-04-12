@@ -9,15 +9,15 @@ import           Test.Hspec
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Control.Applicative ((<|>), empty)
+-- import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Except (throwE, Except, runExcept)
+import Data.Foldable (asum)
 import Debug.Trace as Trace
 import qualified Data.Text.Lazy as Text
 import qualified Data.Text.Format as Text
 import qualified Data.Text.Format.Params as Text
 import qualified Data.Sequence as Seq
 import Data.Sequence (Seq, (|>), ViewL(..))
-
-import Control.Monad.Amb (Amb)
-import qualified Control.Monad.Amb as Amb
 
 newtype Process = Process(Int)
     deriving (Show, Eq, Ord)
@@ -163,20 +163,18 @@ checkHistory :: forall req res s. (Eq req, Eq res, Show req, Show res, Show s)
              -> s
              -> [(Process, HistoryElement req res)]
              -> Either () [Linearization req res]
-checkHistory model initialState h = case Amb.allValues $ go Map.empty Map.empty initialState 0 h of
-    lin : _ -> Right lin
-    _ -> Left ()
+checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialState 0 h
   where
     go :: Map Process req
        -> Map Process (req, res)
        -> s
        -> Int
        -> [(Process, HistoryElement req res)]
-       -> Amb [Linearization req res] [Linearization req res] -- Set of potential options
+       -> Except () [Linearization req res]
     go calls rets s depth history = doneRule <|> observationRule <|> linRule
       where
       _spaces = take (depth * 2) $ cycle " "
-      doneRule :: Amb [Linearization req res] [Linearization req res]
+      doneRule ::  Except () [Linearization req res]
       doneRule = do
         -- Trace.traceM (Text.unpack $ Text.format "done? calls:{}; rets: {}; pending:{}" (Text.Shown $ Map.size calls, Text.Shown $ Map.size rets, Text.Shown $ Map.map length histories))
         if history == [] && Map.null calls && Map.null rets
@@ -185,7 +183,7 @@ checkHistory model initialState h = case Amb.allValues $ go Map.empty Map.empty 
 
         -- From Testing from "Testing for Linearizability", Gavin Lowe
         -- rule `call`
-      observationRule :: Amb [Linearization req res] [Linearization req res]
+      observationRule :: Except () [Linearization req res]
       observationRule = do
         -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
         case history of
@@ -197,7 +195,7 @@ checkHistory model initialState h = case Amb.allValues $ go Map.empty Map.empty 
               (Call req, Nothing, Nothing) -> do
                 -- _trace "{}call:{}: req:{}" (_spaces, _s p, _s req)
                 rest <- go (Map.insert p req calls) rets s (succ depth) future
-                -- _trace "buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
+                -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
                 -- _trace "{}call:{}: req:{}; <- {}" (_spaces, _s p, _s req, _s rest)
                 return rest
               (Ret res, Nothing, Just (_call, expected)) | (res == expected) -> do
@@ -209,24 +207,27 @@ checkHistory model initialState h = case Amb.allValues $ go Map.empty Map.empty 
                 return $ rest
               _other -> do
                 -- _trace "{}???: {}" (_spaces, _s _other)
-                empty
+                throwE () -- $ show _other
           [] -> do
                 -- _trace "{}noFuture: {}" (_spaces, "" :: String)
-                empty
+                throwE () -- "No future"
 
-      linRule :: Amb [Linearization req res] [Linearization req res]
+      linRule :: Except () [Linearization req res]
       linRule = do
         -- _trace "{}linRule{}" (_spaces, ("" :: String))
         -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
-        (p, req) <- Amb.amb $ Map.toList calls
-        --  (startTime, req) <- maybe empty pure $ Map.lookup p calls
-        let (s', ret) = model s req
-        -- _trace "lin@{}: state: {}: req:{} -> expected:{}" (_s p, _s s, _s req, _s ret)
-        rest <- go (Map.delete p calls) (Map.insert p (req, ret) rets) s' (succ depth) history
-        let lin = Op p req ret
-        -- _trace "buf: calls:{}; rets: {}" (_s calls, _s rets)
-        -- _trace "lin:{}: req:{} -> expected:{}; <- {} : {}" (_s p, _s req, _s ret, _s lin, _s rest)
-        return $ lin : rest
+        rs <- asum $ flip map (Map.toList calls) $ \(p, req) -> do
+          --  (startTime, req) <- maybe empty pure $ Map.lookup p calls
+          let (s', ret) = model s req
+          -- _trace "lin@{}: state: {}: req:{} -> expected:{}" (_s p, _s s, _s req, _s ret)
+          rest <- go (Map.delete p calls) (Map.insert p (req, ret) rets) s' (succ depth) history
+          let lin = Op p req ret
+          -- _trace "buf: calls:{}; rets: {}" (_s calls, _s rets)
+          -- _trace "lin:{}: req:{} -> expected:{}; <- {} : {}" (_s p, _s req, _s ret, _s lin, _s rest)
+          return $ lin : rest
+
+        -- _trace "{}linCandidates: {}" (_spaces, _s rs)
+        return rs
 
 _trace :: (Text.Params ps0, Applicative f) => Text.Format -> ps0 -> f ()
 _trace fmt ps = Trace.traceM (Text.unpack $ f fmt ps)
