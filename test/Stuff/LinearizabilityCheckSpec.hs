@@ -10,7 +10,7 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import Control.Applicative ((<|>), empty)
 -- import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Except (throwE, Except, runExcept)
+import Control.Monad.Trans.Except (throwE, catchE, Except, runExcept)
 import Data.Foldable (asum)
 import Data.Semigroup ((<>), Semigroup)
 import Debug.Trace as Trace
@@ -54,14 +54,31 @@ data FifoRet a =
 
 type ModelFun s req res = (s -> req -> (s, res))
 
-data NotLinearizable = NotLinearizable
+data NotLinearizableReason req res =
+    ModelMismatch req res res
+  | NonMatchInObservable (HistoryElement req res)
+  | ExpectingOp
   deriving (Show, Eq, Ord)
 
-instance Semigroup NotLinearizable where
-  _ <> _ = NotLinearizable
+data NotLinearizable req res = NotLinearizable {
+  reason :: NotLinearizableReason req res
+, linPrefix :: [Linearization req res]
+}
+  deriving (Show, Eq, Ord)
 
-instance Monoid NotLinearizable where
-  mempty = NotLinearizable
+-- We want to find the "best" error here, so this is kinda heuristic?
+instance (Show a, Show b) => Semigroup (NotLinearizable a b) where
+  x <> y = case ((length $ linPrefix x) `compare` (length $ linPrefix y), reason x, reason y) of
+    (GT, _, _) -> x
+    (LT, _, _) -> y
+    (EQ, ModelMismatch _ _ _, _) -> x
+    (EQ, _, ModelMismatch _ _ _) -> y
+    (EQ, NonMatchInObservable _, _) -> x
+    (EQ, _, NonMatchInObservable _) -> y
+    (EQ, _, _) -> y
+
+instance (Show a, Show b) => Monoid (NotLinearizable a b) where
+  mempty = NotLinearizable ExpectingOp []
   mappend = (<>)
 
 a, b, c :: Process
@@ -173,7 +190,7 @@ checkHistory :: forall req res s. (Eq req, Eq res, Show req, Show res, Show s)
              => ModelFun s req res
              -> s
              -> [(Process, HistoryElement req res)]
-             -> Either NotLinearizable [Linearization req res]
+             -> Either (NotLinearizable req res) [Linearization req res]
 checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialState 0 h
   where
     go :: Map Process req
@@ -181,11 +198,10 @@ checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialSt
        -> s
        -> Int
        -> [(Process, HistoryElement req res)]
-       -> Except NotLinearizable [Linearization req res]
+       -> Except (NotLinearizable req res) [Linearization req res]
     go calls rets s depth history = doneRule <|> observationRule <|> linRule
       where
       _spaces = take (depth * 2) $ cycle " "
-      doneRule ::  Except NotLinearizable [Linearization req res]
       doneRule = do
         -- Trace.traceM (Text.unpack $ Text.format "done? calls:{}; rets: {}; pending:{}" (Text.Shown $ Map.size calls, Text.Shown $ Map.size rets, Text.Shown $ Map.map length histories))
         if history == [] && Map.null calls && Map.null rets
@@ -194,7 +210,6 @@ checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialSt
 
         -- From Testing from "Testing for Linearizability", Gavin Lowe
         -- rule `call`
-      observationRule :: Except NotLinearizable [Linearization req res]
       observationRule = do
         -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
         case history of
@@ -216,14 +231,15 @@ checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialSt
                 -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
                 -- _trace "{}Ret:{}; {} - {}; <- {}..." (_spaces, _s p, _s _call, _s res, _s rest)
                 return $ rest
-              _other -> do
+              (Ret res, Nothing, Just (_call, expected)) -> do
+                throwE $ NotLinearizable (ModelMismatch _call expected res) []
+              _ -> do
                 -- _trace "{}???: {}" (_spaces, _s _other)
-                throwE NotLinearizable -- $ show _other
+                throwE $ NotLinearizable (NonMatchInObservable op) []
           [] -> do
                 -- _trace "{}noFuture: {}" (_spaces, "" :: String)
-                throwE NotLinearizable -- "No future"
+                throwE $ NotLinearizable (ExpectingOp) []
 
-      linRule :: Except NotLinearizable [Linearization req res]
       linRule = do
         -- _trace "{}linRule{}" (_spaces, ("" :: String))
         -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
@@ -231,14 +247,18 @@ checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialSt
           --  (startTime, req) <- maybe empty pure $ Map.lookup p calls
           let (s', ret) = model s req
           -- _trace "lin@{}: state: {}: req:{} -> expected:{}" (_s p, _s s, _s req, _s ret)
-          rest <- go (Map.delete p calls) (Map.insert p (req, ret) rets) s' (succ depth) history
           let lin = Op p req ret
+          rest <- go (Map.delete p calls) (Map.insert p (req, ret) rets) s' (succ depth) history
+            `catchE` prefixErrorWith lin
+
           -- _trace "buf: calls:{}; rets: {}" (_s calls, _s rets)
           -- _trace "lin:{}: req:{} -> expected:{}; <- {} : {}" (_s p, _s req, _s ret, _s lin, _s rest)
           return $ lin : rest
 
         -- _trace "{}linCandidates: {}" (_spaces, _s rs)
         return rs
+      prefixErrorWith :: Linearization req res -> NotLinearizable req res -> Except (NotLinearizable req res) a
+      prefixErrorWith lin err = throwE $ err { linPrefix = lin : linPrefix err }
 
 _trace :: (Text.Params ps0, Applicative f) => Text.Format -> ps0 -> f ()
 _trace fmt ps = Trace.traceM (Text.unpack $ f fmt ps)
@@ -256,16 +276,36 @@ spec = do
     it "Finds h2 Invalid" $ do
       let result = checkHistory fifo newFifo h2History
       result `shouldSatisfy` isFailure
+      -- These bits might be terribly fragile.
+      err <- either return (fail . show) $ result
+
+      linPrefix err `shouldStartWith` [Op (Process 0) (FEnqueue "x") FOk,Op (Process 0) FDequeue (FVal "x"),Op (Process 1) (FEnqueue "y") FOk]
+      reason err `shouldBe` ModelMismatch FDequeue (FVal "x") (FVal "y")
+
     it "Linearizes h3" $ do
       checkHistory fifo newFifo h3History `shouldBe` Right h3Linearisation
     it "Finds h4 Invalid" $ do
       let result = checkHistory fifo newFifo h4History
       result `shouldSatisfy` isFailure
+      -- These bits might be terribly fragile.
+      err <- either return (fail . show) $ result
+      linPrefix err `shouldBe` [
+        Op (Process 0) (FEnqueue "x") FOk,Op (Process 1) (FEnqueue "y") FOk,
+        Op (Process 1) FDequeue (FVal "x"),Op (Process 2) FDequeue (FVal "y")]
+      reason err `shouldBe` ModelMismatch FDequeue (FVal "x") (FVal "y")
+
     it "Linearizes h5" $ do
       checkHistory register newRegister h5History `shouldBe` Right h5Linearisation
     it "Finds h6 Invalid" $ do
       let result = checkHistory register newRegister h6History
       result `shouldSatisfy` isFailure
+      -- These bits might be terribly fragile.
+      err <- either return (fail . show) $ result
+      linPrefix err `shouldBe` [
+          Op (Process 0) (RWrite 0) ROk,Op (Process 1) (RWrite 1) ROk,
+          Op (Process 0) RRead (RVal 1), Op (Process 2) (RWrite 0) ROk,
+          Op (Process 1) RRead (RVal 0)]
+      reason err `shouldBe` ModelMismatch RRead (RVal 0) (RVal 1)
 
   where
     newRegister :: Int
