@@ -12,6 +12,7 @@ import Control.Applicative ((<|>), empty)
 -- import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (throwE, Except, runExcept)
 import Data.Foldable (asum)
+import Data.Semigroup ((<>), Semigroup)
 import Debug.Trace as Trace
 import qualified Data.Text.Lazy as Text
 import qualified Data.Text.Format as Text
@@ -52,6 +53,16 @@ data FifoRet a =
     deriving (Show, Eq, Ord)
 
 type ModelFun s req res = (s -> req -> (s, res))
+
+data NotLinearizable = NotLinearizable
+  deriving (Show, Eq, Ord)
+
+instance Semigroup NotLinearizable where
+  _ <> _ = NotLinearizable
+
+instance Monoid NotLinearizable where
+  mempty = NotLinearizable
+  mappend = (<>)
 
 a, b, c :: Process
 a = Process 0
@@ -162,7 +173,7 @@ checkHistory :: forall req res s. (Eq req, Eq res, Show req, Show res, Show s)
              => ModelFun s req res
              -> s
              -> [(Process, HistoryElement req res)]
-             -> Either () [Linearization req res]
+             -> Either NotLinearizable [Linearization req res]
 checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialState 0 h
   where
     go :: Map Process req
@@ -170,11 +181,11 @@ checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialSt
        -> s
        -> Int
        -> [(Process, HistoryElement req res)]
-       -> Except () [Linearization req res]
+       -> Except NotLinearizable [Linearization req res]
     go calls rets s depth history = doneRule <|> observationRule <|> linRule
       where
       _spaces = take (depth * 2) $ cycle " "
-      doneRule ::  Except () [Linearization req res]
+      doneRule ::  Except NotLinearizable [Linearization req res]
       doneRule = do
         -- Trace.traceM (Text.unpack $ Text.format "done? calls:{}; rets: {}; pending:{}" (Text.Shown $ Map.size calls, Text.Shown $ Map.size rets, Text.Shown $ Map.map length histories))
         if history == [] && Map.null calls && Map.null rets
@@ -183,7 +194,7 @@ checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialSt
 
         -- From Testing from "Testing for Linearizability", Gavin Lowe
         -- rule `call`
-      observationRule :: Except () [Linearization req res]
+      observationRule :: Except NotLinearizable [Linearization req res]
       observationRule = do
         -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
         case history of
@@ -207,12 +218,12 @@ checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialSt
                 return $ rest
               _other -> do
                 -- _trace "{}???: {}" (_spaces, _s _other)
-                throwE () -- $ show _other
+                throwE NotLinearizable -- $ show _other
           [] -> do
                 -- _trace "{}noFuture: {}" (_spaces, "" :: String)
-                throwE () -- "No future"
+                throwE NotLinearizable -- "No future"
 
-      linRule :: Except () [Linearization req res]
+      linRule :: Except NotLinearizable [Linearization req res]
       linRule = do
         -- _trace "{}linRule{}" (_spaces, ("" :: String))
         -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
@@ -243,15 +254,18 @@ spec = do
     it "Linearizes h1" $ do
       checkHistory fifo newFifo h1History `shouldBe` Right h1Linearisation
     it "Finds h2 Invalid" $ do
-      checkHistory fifo newFifo h2History `shouldBe` Left ()
+      let result = checkHistory fifo newFifo h2History
+      result `shouldSatisfy` isFailure
     it "Linearizes h3" $ do
       checkHistory fifo newFifo h3History `shouldBe` Right h3Linearisation
     it "Finds h4 Invalid" $ do
-      checkHistory fifo newFifo h4History `shouldBe` Left ()
+      let result = checkHistory fifo newFifo h4History
+      result `shouldSatisfy` isFailure
     it "Linearizes h5" $ do
       checkHistory register newRegister h5History `shouldBe` Right h5Linearisation
     it "Finds h6 Invalid" $ do
-      checkHistory register newRegister h6History `shouldBe` Left ()
+      let result = checkHistory register newRegister h6History
+      result `shouldSatisfy` isFailure
 
   where
     newRegister :: Int
@@ -266,3 +280,5 @@ spec = do
     fifo state FDequeue = case Seq.viewl state of
       val :< rest -> (rest, FVal val)
       EmptyL -> (state, FEmpty)
+
+    isFailure = either (const True) (const False)
