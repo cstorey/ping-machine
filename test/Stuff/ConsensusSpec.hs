@@ -362,11 +362,10 @@ eventuallyElectsLeader = property $ do
   n <- forAll $ Gen.int (Range.linear 2 23)
   allPeers <- forAll $ peers n
   let ts = replicate n 2000
-  let sched = SystemSchedule $ periodicSched allPeers
-  let h = hash $ show (allPeers, ts, sched)
+  let h = hash $ show (allPeers, ts)
   let fname = "/tmp/prop_eventuallyElectsLeader_" ++ show n ++ "_" ++ show h
 
-  messages <- simulate allPeers ts sched fname
+  messages <- simulateUntil allPeers ts fname $ not . Map.null . mconcat . map leadersOf
 
   let allLeaders = leadersByTerm messages
 
@@ -383,56 +382,87 @@ eventuallyElectsLeader = property $ do
         Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
     leadersOf _ = Map.empty
 
-    periodicSched :: PeerMap -> Map ProcessId [(Integer, ProcessEvent)]
-    periodicSched allPeers = Map.fromList $ zip (fmap Node $ Bimap.keys allPeers) $ map sched [1000..]
+eventuallyRepliesToClient :: HasCallStack => Property
+eventuallyRepliesToClient = property $ do
+  -- we rely on AppendEntries items to guage when an election has happened.
+  n <- forAll $ Gen.int (Range.linear 2 23)
+  allPeers <- forAll $ peers n
+  let ts = replicate n 2000
+  let h = hash $ show (allPeers, ts)
+  let fname = "/tmp/prop_eventuallyRepliesToClient_" ++ show n ++ "_" ++ show h
+
+  messages <- simulateUntil allPeers ts fname $ ((>0) . length . filter hasClientReply)
+
+  let responses = filter hasClientReply messages
+
+  test $ do
+    footnoteShow $ ("Responses", responses)
+    assert $ length responses > 0
+
+  where
+    hasClientReply :: MessageEvent -> Bool
+    hasClientReply (MessageOut _ _ (Reply _ (Right _))) = True
+    hasClientReply _ = False
+
+simulateUntil :: PeerMap -> [Integer] -> String -> ([MessageEvent] -> Bool) -> PropertyT IO [MessageEvent]
+simulateUntil allPeers ts fname enough = do
+  footnoteShow $ "Logging to: " ++ fname
+
+  let sched = periodicSched
+  let byProc = map (\(p, s) -> map (\(t, e) -> (t, p, e)) $ toAbsTimes $ cycle s)
+                $ filter ((>0) . length . snd)
+                $ Map.toList sched :: [[(Integer,ProcessId,ProcessEvent)]]
+
+  let toRun = List.takeWhile (\(t, _, _) -> t < ticksPerSecond * simLength) $ List.mergeAll byProc
+  assert $ List.length toRun == 0 || List.isSorted (map (\(t,_,_) -> t) toRun)
+
+  let network = Network allNodes (ClientSim Nothing 0) 0
+
+  evalIO $ do
+    runFileLoggingT fname $ do
+      $(logDebug) $ Text.pack $ ppShow ("allPeers", allPeers)
+      $(logDebug) $ Text.pack $ ppShow ("timeouts", ts)
+      $(logDebug) $ Text.pack $ ppShow ("sched", sched)
+
+    let runSched l = case l of
+          (t, p, ev) : rest -> do
+            $(logDebugSH) ("Iterate at", t, p)
+            msgs <- simulateIteration allPeers t p ev
+            $(logDebugSH) ("msgs", msgs)
+            $(logDebugSH) ("enough", enough msgs)
+            if not (enough msgs)
+            then do
+              $(logDebugSH) ("Repeat at", t, p)
+              res <- runSched rest
+              return $ msgs ++ res
+            else do
+              $(logDebugSH) ("Finished at", t, p)
+              return msgs
+          [] -> return []
+
+    (msgs, network') <- State.runStateT (runFileLoggingT fname $ runSched toRun) network
+    runFileLoggingT fname $ do
+      $(logDebug) $ Text.pack $ ppShow ("toRun", toRun)
+      $(logDebug) $ Text.pack $ ppShow ("Network", network')
+      $(logDebug) $ Text.pack $ ppShow ("Messages", msgs)
+    return $ msgs
+
+    where
+    allNodes = Map.fromList $ fmap (\(p, t) -> (p, makeNode allPeers p t)) $ zip (Bimap.keys allPeers) (map (% ticksPerSecond) ts)
+
+    periodicSched :: Map ProcessId [(Integer, ProcessEvent)]
+    periodicSched = Map.fromList $ zip processes $ map sched [1000..]
       where
         sched :: Integer -> [(Integer, ProcessEvent)]
         sched n = [(0, Clock), (n, Inbox)]
 
-    simulate :: PeerMap -> [Integer] -> SystemSchedule -> String -> PropertyT IO [MessageEvent]
-    simulate allPeers ts (SystemSchedule sched) fname = do
-      footnoteShow $ "Logging to: " ++ fname
-
-      let byProc = map (\(p, s) -> map (\(t, e) -> (t, p, e)) $ toAbsTimes $ cycle s)
-                    $ filter ((>0) . length . snd)
-                    $ Map.toList sched :: [[(Integer,ProcessId,ProcessEvent)]]
-
-      let toRun = List.takeWhile (\(t, _, _) -> t < ticksPerSecond * simLength) $ List.mergeAll byProc
-      assert $ List.length toRun == 0 || List.isSorted (map (\(t,_,_) -> t) toRun)
-
-      let network = Network (allNodes allPeers ts) (ClientSim Nothing 0) 0
-
-      evalIO $ do
-        runFileLoggingT fname $ do
-          $(logDebug) $ Text.pack $ ppShow ("allPeers", allPeers)
-          $(logDebug) $ Text.pack $ ppShow ("timeouts", ts)
-          $(logDebug) $ Text.pack $ ppShow ("sched", sched)
-
-        let runSched l = case l of
-              (t, p, ev) : rest -> do
-                msgs <- simulateIteration allPeers t p ev
-                if Map.null $ mconcat $ (map leadersOf msgs)
-                  then do
-                    res <- runSched rest
-                    return $ msgs ++ res
-                  else return msgs
-              [] -> return []
-
-        (msgs, network') <- State.runStateT (runFileLoggingT fname $ runSched toRun) network
-        runFileLoggingT fname $ do
-          $(logDebug) $ Text.pack $ ppShow ("Network", network')
-          $(logDebug) $ Text.pack $ ppShow ("Messages", msgs)
-        return $ msgs
-
-    allNodes allPeers ts = Map.fromList $ fmap (\(p, t) -> (p, makeNode allPeers p t)) $ zip (Bimap.keys allPeers) (map (% ticksPerSecond) ts)
-
+    processes = (fmap Node $ Bimap.keys allPeers) ++ [Client]
     toAbsTimes :: [(Integer, a)] -> [(Integer, a)]
     toAbsTimes byInterval =
       let lefts = scanl (+) 0 $ map fst byInterval
           rights = map snd byInterval
       in
       lefts `zip` rights
-
 
 
 -- mechanics
@@ -560,8 +590,10 @@ tests = $$(discover)
 
 spec :: Spec
 spec = parallel $ do
-  it "should elect a leader with a given schedule" $ do
+  it "eventually elects a leader with a fixed schedule" $ do
     require $ eventuallyElectsLeader
+  it "eventually replies to client with a fixed schedule" $ do
+    require $ eventuallyRepliesToClient
   it "should elect only one leader per term " $ do
     require $ leaderElectionOnlyElectsOneLeaderPerTerm
   it "should produce monotonic bong responses" $ do
