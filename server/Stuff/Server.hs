@@ -43,11 +43,11 @@ main = S.withSocketsDo $ do
     -- peers.
     let race = Async.race_
     withTicker ticks $ \ticker ->
-        (runReqRespListener (ClientID <$> nextId) clientAddr clientReqQ)
-            `race` (runReqRespListener (PeerID <$> nextId) peerListenAddr peerReqInQ)
-            `race` (runOutgoing (Proto.PeerName <$> peerPorts) requestToPeers peerRespQ)
-            `race` (Async.wait $ waiter ticker)
-            `race` (runModel myName clientReqQ peerReqInQ peerRespQ ticks requestToPeers Models.bingBongModel (0 :: Int))
+      withReqRespListener (ClientID <$> nextId) clientAddr clientReqQ $ \_clientListener -> do
+        withReqRespListener (PeerID <$> nextId) peerListenAddr peerReqInQ $ \_peerListener -> do
+          (runOutgoing (Proto.PeerName <$> peerPorts) requestToPeers peerRespQ)
+          `race` (Async.wait $ waiter ticker)
+          `race` (runModel myName clientReqQ peerReqInQ peerRespQ ticks requestToPeers Models.bingBongModel (0 :: Int))
 
 nextId :: IO Int
 nextId = STM.atomically nextIdSTM

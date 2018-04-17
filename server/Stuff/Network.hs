@@ -1,6 +1,6 @@
 module Stuff.Network
 ( runOutgoing
-, runReqRespListener
+, withReqRespListener
 , resolve
 )
 where
@@ -13,6 +13,7 @@ import qualified System.IO.Streams.Binary  as BStreams
 import Data.Binary (Binary)
 import qualified Data.Binary as Binary
 import qualified Control.Concurrent.STM as STM
+import Control.Concurrent.Async (Async)
 import qualified Control.Concurrent.Async as Async
 import qualified Data.Map as Map
 import qualified Debug.Trace as Trace
@@ -25,6 +26,11 @@ import Stuff.Types
 
 oneSecondMicroSeconds :: Int
 oneSecondMicroSeconds = 1000000
+
+
+data Listener = Listener {
+  _listenerThreadId :: Async ()
+}
 
 -- Supervisor
 runOutgoing :: (Binary req, Show req)
@@ -158,13 +164,19 @@ processOutgoingConnection reqQ respQ clientId (is, os) = do
             Nothing -> error $ "Well, I'm done: " ++ show clientId
 
 
-runReqRespListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid)
+withReqRespListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid)
     => IO xid
     -> S.AddrInfo
     -> RequestsQ req resp
-    -> IO ()
-runReqRespListener newId addr reqs =
-    E.bracket (listenFor addr) S.close (runAcceptor newId $ handleReqRespConn reqs)
+    -> (Listener -> IO a)
+    -> IO a
+withReqRespListener newId addr reqs action =
+    E.bracket (listenFor addr) S.close $ \sock -> do
+      Async.withAsync (go sock) $ \tid -> do
+        Async.link tid
+        action $ Listener tid
+    where
+    go = runAcceptor newId $ handleReqRespConn reqs
 
 handleReqRespConn :: (Show req, Show resp, Show xid)
             => RequestsQ req resp

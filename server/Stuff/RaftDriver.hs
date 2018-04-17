@@ -33,12 +33,12 @@ type STMPendingRespMap resp = STM.TVar (Map.Map (IdFor resp) (STM.TMVar resp))
 type LoggedSTM a = Logger.WriterLoggingT STM.STM a
 
 data Driver st req resp = Driver {
-  driverPendingClientResponses :: STMPendingRespMap (Proto.ClientResponse resp)
+  driverState                  :: STM.TVar (RaftState req resp)
+, driverProtocolEnv            :: STM (ProtocolEnv st req resp)
+, driverLogs                   :: STM.TVar [LogLine]
+, driverPendingClientResponses :: STMPendingRespMap (Proto.ClientResponse resp)
 , driverPeerOuts               :: STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse (ProtoStateMachine st req resp ())
 , driverPendingPeerResponses   :: STMPendingRespMap Proto.PeerResponse
-, driverState                  :: STM.TVar (RaftState req resp)
-, driverLogs                   :: STM.TVar [LogLine]
-, driverProtocolEnv            :: STM (ProtocolEnv st req resp)
 , driverModelQ                 :: RequestsQ req (Proto.ClientResponse resp)
 , driverPeerReqInQ             :: RequestsQ (Proto.PeerRequest req) Proto.PeerResponse
 , driverTicks                  :: RequestsInQ () Tick
@@ -83,23 +83,27 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts modelFn initState =
 
     let protocolEnv = mkProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout <*> pure initState <*> pure modelFn
 
-    run $ Driver pendingClientResponses peerOuts pendingPeerResponses stateRef logVar protocolEnv modelQ peerReqInQ ticks peerRespInQ
+    run $ Driver stateRef protocolEnv logVar pendingClientResponses peerOuts pendingPeerResponses  modelQ peerReqInQ ticks peerRespInQ
+
+
 
 run :: (Show req, Show resp) => Driver st req resp -> IO ()
 run self = forever $ do
-        (_st', logs) <- STM.atomically $ do
-            outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
-            sendMessages (driverPendingClientResponses self) (driverPeerOuts self) (driverPendingPeerResponses self) outputs
-            st' <- STM.readTVar (driverState self)
-            logs <- STM.swapTVar (driverLogs self) []
-            return (st', logs)
-        Logger.runStderrLoggingT $ forM_ logs $ \(loc, src, lvl, s) -> Logger.monadLoggerLog loc src lvl s
-
+        STM.atomically once
+        Logger.runStderrLoggingT $ logFromVar (driverLogs self)
     where
-    processClientMessage   = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM (driverState self) (driverProtocolEnv self) (driverPendingClientResponses self) (driverModelQ self) processClientReqRespMessage
-    processPeerRequest     = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM (driverState self) (driverProtocolEnv self) (driverPendingPeerResponses self) (driverPeerReqInQ self) processPeerRequestMessage
-    processTickMessage     = runLoggerSTM (driverLogs self) $ processMessageSTM        (driverState self) (driverProtocolEnv self) (driverTicks self) processTick
-    processPeerResponse    = runLoggerSTM (driverLogs self) $ processRespMessageSTM    (driverState self) (driverProtocolEnv self) (driverPeerRespInQ self)
+    processClientMessage   = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM self (driverPendingClientResponses self) (driverModelQ self) processClientReqRespMessage
+    processPeerRequest     = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM self (driverPendingPeerResponses self) (driverPeerReqInQ self) processPeerRequestMessage
+    processTickMessage     = runLoggerSTM (driverLogs self) $ processMessageSTM        self (driverTicks self) processTick
+    processPeerResponse    = runLoggerSTM (driverLogs self) $ processRespMessageSTM    self (driverPeerRespInQ self)
+
+    once                   = do
+                                outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
+                                sendMessages (driverPendingClientResponses self) (driverPeerOuts self) (driverPendingPeerResponses self) outputs
+
+    logFromVar logVar = do 
+          logs <- lift $ STM.atomically $ STM.swapTVar logVar []
+          forM_ logs $ \(loc, src, lvl, s) -> Logger.monadLoggerLog loc src lvl s
 
 type LogLine = (Logger.Loc,Logger.LogSource,Logger.LogLevel,Logger.LogStr)
 
@@ -109,37 +113,34 @@ runLoggerSTM out action = do
   STM.modifyTVar' out (++ logs)
   return a
 
-processMessageSTM :: STM.TVar (RaftState req resp)
-                  -> STM.STM (ProtocolEnv st req resp)
+processMessageSTM :: Driver st req resp
                   -> RequestsInQ xid ins
                   -> (xid -> ins -> ProtoStateMachine st req resp ())
                   -> Logger.WriterLoggingT STM.STM [ProcessorMessage st req resp]
-processMessageSTM stateRef envSTM reqQ process = do
+processMessageSTM self reqQ process = do
     (sender, m) <- lift $ STM.readTQueue reqQ
     case m of
         Just msg -> do
-            snd <$> (processActions envSTM stateRef $ process sender msg)
+            snd <$> (processActions self $ process sender msg)
         Nothing -> return []
 
-processRespMessageSTM :: STM.TVar (RaftState req resp)
-                               -> STM.STM (ProtocolEnv st req resp)
-                               -> STM.TQueue (ProtoStateMachine st req resp ())
-                               -> LoggedSTM [ProcessorMessage st req resp]
-processRespMessageSTM stateRef envSTM reqQ = do
+processRespMessageSTM :: Driver st req resp
+                         -> STM.TQueue (ProtoStateMachine st req resp ())
+                         -> LoggedSTM [ProcessorMessage st req resp]
+processRespMessageSTM self reqQ = do
     action <- lift $ STM.readTQueue reqQ
-    snd <$> processActions envSTM stateRef action
+    snd <$> processActions self action
 
-processReqRespMessageSTM :: STM.TVar (RaftState req resp)
-                  -> STM.STM (ProtocolEnv st req resp)
+processReqRespMessageSTM :: Driver st req resp
                   -> STMPendingRespMap outs
                   -> RequestsQ ins outs
                   -> (ins -> IdFor outs -> ProtoStateMachine st req resp ())
                   -> LoggedSTM [ProcessorMessage st req resp]
-processReqRespMessageSTM stateRef envSTM pendingResponses reqQ process = do
+processReqRespMessageSTM self pendingResponses reqQ process = do
   (msg, pendingResponse) <- lift $ STM.readTQueue reqQ
   reqId <- lift $ IdFor <$> nextIdSTM
   lift $ STM.modifyTVar pendingResponses $ Map.insert reqId pendingResponse
-  ((), toSend) <- processActions envSTM stateRef $ process msg reqId
+  ((), toSend) <- processActions self $ process msg reqId
   return toSend
 
 sendMessages :: (Show resp)
@@ -169,11 +170,14 @@ sendMessages pendingClientResponses peerRequests pendingPeerResponses toSend = d
                   STM.writeTQueue q $ (msg, k)
                 Nothing -> error "what?"
 
-processActions :: STM (ProtocolEnv st req resp) -> STM.TVar (RaftState req resp) -> ProtoStateMachine st req resp a -> LoggedSTM (a, [ProcessorMessage st req resp])
-processActions envSTM stateRef actions = do
+processActions :: Driver st req resp -> ProtoStateMachine st req resp a -> LoggedSTM (a, [ProcessorMessage st req resp])
+processActions self actions = do
   env <- lift $ envSTM
   s <- lift $ STM.readTVar stateRef
   let ((a, s', toSend), logs) = Identity.runIdentity $ Logger.runWriterLoggingT $ RWS.runRWST (runProto actions) env s
   forM_ logs $ \(loc, src, lvl, logmsg) -> Logger.monadLoggerLog loc src lvl logmsg
   lift $ STM.writeTVar stateRef s'
   return (a, toSend)
+  where
+  stateRef = (driverState self) 
+  envSTM = (driverProtocolEnv self)
