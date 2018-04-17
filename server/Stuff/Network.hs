@@ -39,7 +39,9 @@ data Outgoing = Outgoing {
 -- Supervisor
 withOutgoing :: (Binary req, Show req)
             => [Proto.PeerName]
+            -- Requests from the model to the outside world
             -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse r
+            -- "Responses"
             -> STM.TQueue r
             -> (Outgoing -> IO a)
             -> IO a

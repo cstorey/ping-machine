@@ -28,6 +28,8 @@ import Control.Monad.Trans.Class (lift)
 
 import Stuff.Types
 import Stuff.RaftModel
+import Stuff.Ticker (Ticker)
+import qualified Stuff.Ticker as Ticker
 
 type STMPendingRespMap resp = STM.TVar (Map.Map (IdFor resp) (STM.TMVar resp))
 type LoggedSTM a = Logger.WriterLoggingT STM.STM a
@@ -41,7 +43,7 @@ data Driver st req resp = Driver {
 , driverPendingPeerResponses   :: STMPendingRespMap Proto.PeerResponse
 , driverModelQ                 :: RequestsQ req (Proto.ClientResponse resp)
 , driverPeerReqInQ             :: RequestsQ (Proto.PeerRequest req) Proto.PeerResponse
-, driverTicks                  :: RequestsInQ () Tick
+, driverTicker                  :: Ticker
 , driverPeerRespInQ            :: STM.TQueue (ProtoStateMachine st req resp ())
 }
 
@@ -61,12 +63,12 @@ runModel :: (Show req, Show resp)
             -> RequestsQ req (Proto.ClientResponse resp)
             -> RequestsQ (Proto.PeerRequest req) Proto.PeerResponse
             -> STM.TQueue (ProtoStateMachine st req resp ())
-            -> RequestsInQ () Tick
+            -> Ticker
             -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse (ProtoStateMachine st req resp ())
             -> Models.ModelFun st req resp
             -> st
             -> IO ()
-runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts modelFn initState = do
+runModel myName modelQ peerReqInQ peerRespInQ ticker peerOuts modelFn initState = do
     stateRef <- STM.newTVarIO $ mkRaftState :: IO (STM.TVar (RaftState req resp))
     -- incoming requests _from_ clients
     pendingClientResponses <- STM.newTVarIO $ Map.empty :: IO (STM.TVar (Map z x))
@@ -83,7 +85,7 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts modelFn initState =
 
     let protocolEnv = mkProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout <*> pure initState <*> pure modelFn
 
-    run $ Driver stateRef protocolEnv logVar pendingClientResponses peerOuts pendingPeerResponses  modelQ peerReqInQ ticks peerRespInQ
+    run $ Driver stateRef protocolEnv logVar pendingClientResponses peerOuts pendingPeerResponses  modelQ peerReqInQ ticker peerRespInQ
 
 
 
@@ -94,7 +96,7 @@ run self = forever $ do
     where
     processClientMessage   = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM self (driverPendingClientResponses self) (driverModelQ self) processClientReqRespMessage
     processPeerRequest     = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM self (driverPendingPeerResponses self) (driverPeerReqInQ self) processPeerRequestMessage
-    processTickMessage     = runLoggerSTM (driverLogs self) $ processMessageSTM        self (driverTicks self) processTick
+    processTickMessage     = runLoggerSTM (driverLogs self) $ tickerSTM        self (driverTicker self) processTick
     processPeerResponse    = runLoggerSTM (driverLogs self) $ processRespMessageSTM    self (driverPeerRespInQ self)
 
     once                   = do
@@ -113,12 +115,12 @@ runLoggerSTM out action = do
   STM.modifyTVar' out (++ logs)
   return a
 
-processMessageSTM :: Driver st req resp
-                  -> RequestsInQ xid ins
-                  -> (xid -> ins -> ProtoStateMachine st req resp ())
+tickerSTM :: Driver st req resp
+                  -> Ticker
+                  -> (() -> Tick -> ProtoStateMachine st req resp ())
                   -> Logger.WriterLoggingT STM.STM [ProcessorMessage st req resp]
-processMessageSTM self reqQ process = do
-    (sender, m) <- lift $ STM.readTQueue reqQ
+tickerSTM self ticker process = do
+    (sender, m) <- lift $ Ticker.tickerReceive ticker
     case m of
         Just msg -> do
             snd <$> (processActions self $ process sender msg)
@@ -181,3 +183,5 @@ processActions self actions = do
   where
   stateRef = (driverState self) 
   envSTM = (driverProtocolEnv self)
+
+
