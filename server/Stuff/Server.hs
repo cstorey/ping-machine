@@ -26,16 +26,14 @@ main = S.withSocketsDo $ do
     let myName = Proto.PeerName peerPort
     clientAddr <- resolve clientPort
     peerListenAddr <- resolve peerPort
-    clientReqQ <- STM.atomically STM.newTQueue:: IO (RequestsQ (Models.BingBongReq) (Proto.ClientResponse Models.BingBongRet))
-    peerReqInQ <- STM.atomically STM.newTQueue :: IO (RequestsQ (Proto.PeerRequest Models.BingBongReq) Proto.PeerResponse)
     peerRespQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (m ()))
     requestToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STMReqChanMap Proto.PeerName (Proto.PeerRequest Models.BingBongReq) Proto.PeerResponse (m ()))
 
     withTicker $ \ticker ->
-      withReqRespListener (ClientID <$> nextId) clientAddr clientReqQ $ \_clientListener -> do
-        withReqRespListener (PeerID <$> nextId) peerListenAddr peerReqInQ $ \_peerListener -> do
+      withReqRespListener (ClientID <$> nextId) clientAddr $ \clientListener -> do
+        withReqRespListener (PeerID <$> nextId) peerListenAddr $ \peerListener -> do
           withOutgoing (Proto.PeerName <$> peerPorts) requestToPeers peerRespQ $ \_outgoing -> do
-            (runModel myName clientReqQ peerReqInQ peerRespQ ticker requestToPeers Models.bingBongModel (0 :: Int))
+            (runModel myName clientListener (listenerRequests peerListener) peerRespQ ticker requestToPeers Models.bingBongModel (0 :: Int))
 
 nextId :: IO Int
 nextId = STM.atomically nextIdSTM

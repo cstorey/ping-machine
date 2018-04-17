@@ -2,6 +2,7 @@ module Stuff.Network
 ( withOutgoing
 , withReqRespListener
 , resolve
+, Listener(..)
 )
 where
 
@@ -23,14 +24,11 @@ import Control.Monad
 import qualified Control.Exception as E
 
 import Stuff.Types
+import Stuff.RaftDriver (Listener(..))
 
 oneSecondMicroSeconds :: Int
 oneSecondMicroSeconds = 1000000
 
-
-data Listener = Listener {
-  _listenerThreadId :: Async ()
-}
 
 data Outgoing = Outgoing {
   _outgoingThreadId :: Async ()
@@ -178,16 +176,16 @@ processOutgoingConnection reqQ respQ clientId (is, os) = do
 withReqRespListener :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp, Show xid)
     => IO xid
     -> S.AddrInfo
-    -> RequestsQ req resp
-    -> (Listener -> IO a)
+    -> (Listener req resp -> IO a)
     -> IO a
-withReqRespListener newId addr reqs action =
+withReqRespListener newId addr action =
     E.bracket (listenFor addr) S.close $ \sock -> do
-      Async.withAsync (go sock) $ \tid -> do
+      reqs <- STM.newTQueueIO
+      Async.withAsync (go reqs sock) $ \tid -> do
         Async.link tid
-        action $ Listener tid
+        action $ Listener reqs
     where
-    go = runAcceptor newId $ handleReqRespConn reqs
+    go reqs = runAcceptor newId $ handleReqRespConn reqs
 
 handleReqRespConn :: (Show req, Show resp, Show xid)
             => RequestsQ req resp
