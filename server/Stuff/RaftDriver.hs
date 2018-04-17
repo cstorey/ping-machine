@@ -32,6 +32,21 @@ import Stuff.RaftModel
 type STMPendingRespMap resp = STM.TVar (Map.Map (IdFor resp) (STM.TMVar resp))
 type LoggedSTM a = Logger.WriterLoggingT STM.STM a
 
+data Driver st req resp = Driver {
+  driverEnv                    :: STM (ProtocolEnv st req resp)
+, driverPendingClientResponses :: STMPendingRespMap (Proto.ClientResponse resp)
+, driverPeerOuts               :: STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse (ProtoStateMachine st req resp ())
+, driverPendingPeerResponses   :: STMPendingRespMap Proto.PeerResponse
+, driverState                  :: STM.TVar (RaftState req resp)
+, driverLogs                   :: STM.TVar [LogLine]
+, driverProtocolEnv            :: STM (ProtocolEnv st req resp)
+, driverModelQ                 :: RequestsQ req (Proto.ClientResponse resp)
+, driverPeerReqInQ             :: RequestsQ (Proto.PeerRequest req) Proto.PeerResponse
+, driverTicks                  :: RequestsInQ () Tick
+, driverPeerRespInQ            :: STM.TQueue (ProtoStateMachine st req resp ())
+}
+
+
 nextIds :: STM.TVar Int
 nextIds = System.IO.Unsafe.unsafePerformIO $ STM.newTVarIO 0
 {-# NOINLINE nextIds #-}
@@ -68,24 +83,28 @@ runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts modelFn initState =
     putStrLn $ show ("Election timeout is", elTimeout, "append entries", aeTimeout)
 
     let protocolEnv = mkProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout <*> pure initState <*> pure modelFn
-    let processClientMessage = runLoggerSTM logVar $ processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
-    let processPeerRequest = runLoggerSTM logVar $ processReqRespMessageSTM stateRef protocolEnv pendingPeerResponses peerReqInQ processPeerRequestMessage
-    let processTickMessage = runLoggerSTM logVar $ processMessageSTM stateRef protocolEnv ticks processTick
-    let processPeerResponse = runLoggerSTM logVar $ processRespMessageSTM stateRef protocolEnv peerRespInQ
 
+    run $ Driver protocolEnv pendingClientResponses peerOuts pendingPeerResponses stateRef logVar protocolEnv modelQ peerReqInQ ticks peerRespInQ
 
-    forever $ do
+run :: (Show req, Show resp) => Driver st req resp -> IO ()
+run self = forever $ do
         when False $ do
-            env <- STM.atomically protocolEnv
+            env <- STM.atomically $ driverEnv self
             putStrLn $ "Env: " ++ show env
         (_st', outputs, logs) <- STM.atomically $ do
             outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
-            sendMessages pendingClientResponses peerOuts pendingPeerResponses outputs
-            st' <- STM.readTVar stateRef
-            logs <- STM.swapTVar logVar []
+            sendMessages (driverPendingClientResponses self) (driverPeerOuts self) (driverPendingPeerResponses self) outputs
+            st' <- STM.readTVar (driverState self)
+            logs <- STM.swapTVar (driverLogs self) []
             return (st', outputs, logs)
         Logger.runStderrLoggingT $ forM_ logs $ \(loc, src, lvl, s) -> Logger.monadLoggerLog loc src lvl s
         when False $ putStrLn $ "sent: " ++ show outputs
+
+    where
+    processClientMessage   = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM (driverState self) (driverProtocolEnv self) (driverPendingClientResponses self) (driverModelQ self) processClientReqRespMessage
+    processPeerRequest     = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM (driverState self) (driverProtocolEnv self) (driverPendingPeerResponses self) (driverPeerReqInQ self) processPeerRequestMessage
+    processTickMessage     = runLoggerSTM (driverLogs self) $ processMessageSTM (driverState self) (driverProtocolEnv self) (driverTicks self) processTick
+    processPeerResponse    = runLoggerSTM (driverLogs self) $ processRespMessageSTM (driverState self) (driverProtocolEnv self) (driverPeerRespInQ self)
 
 type LogLine = (Logger.Loc,Logger.LogSource,Logger.LogLevel,Logger.LogStr)
 
