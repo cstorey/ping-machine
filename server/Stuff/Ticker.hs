@@ -15,7 +15,7 @@ import Stuff.Types
 
 data Ticker = Ticker {
   waiter :: Async.Async ()
-, tickerReceive :: STM ((), Maybe Tick)
+, tickerReceive :: STM Tick
 }
 
 now :: IO Time
@@ -31,10 +31,10 @@ withTicker f = do
   where
   receive = STM.readTQueue 
 
-runTicker :: STM.TQueue ((), Maybe Tick) -> IO ()
+runTicker :: STM.TQueue Tick -> IO ()
 runTicker ticks = void $ forever $ do
     t <- now
-    STM.atomically $ STM.writeTQueue ticks ((), Just $ Tick t)
+    STM.atomically $ STM.writeTQueue ticks $ Tick t
     putStrLn $ "Tick: " ++ show t
     sleepTime <- Random.getStdRandom $ Random.randomR (oneSec `div` 2, oneSec * 3 `div` 2 )
     C.threadDelay sleepTime

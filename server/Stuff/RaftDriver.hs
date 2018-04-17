@@ -120,11 +120,8 @@ tickerSTM :: Driver st req resp
                   -> (() -> Tick -> ProtoStateMachine st req resp ())
                   -> Logger.WriterLoggingT STM.STM [ProcessorMessage st req resp]
 tickerSTM self ticker process = do
-    (sender, m) <- lift $ Ticker.tickerReceive ticker
-    case m of
-        Just msg -> do
-            snd <$> (processActions self $ process sender msg)
-        Nothing -> return []
+    m <- lift $ Ticker.tickerReceive ticker
+    snd <$> (processActions self $ process () m)
 
 processRespMessageSTM :: Driver st req resp
                          -> STM.TQueue (ProtoStateMachine st req resp ())
