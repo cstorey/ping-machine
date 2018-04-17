@@ -14,7 +14,6 @@ import qualified System.IO.Streams.Binary  as BStreams
 import Data.Binary (Binary)
 import qualified Data.Binary as Binary
 import qualified Control.Concurrent.STM as STM
-import Control.Concurrent.Async (Async)
 import qualified Control.Concurrent.Async as Async
 import qualified Data.Map as Map
 import qualified Debug.Trace as Trace
@@ -24,34 +23,32 @@ import Control.Monad
 import qualified Control.Exception as E
 
 import Stuff.Types
-import Stuff.RaftDriver (Listener(..))
+import Stuff.RaftDriver (Listener(..), Outgoing(..))
 
 oneSecondMicroSeconds :: Int
 oneSecondMicroSeconds = 1000000
 
 
-data Outgoing = Outgoing {
-  _outgoingThreadId :: Async ()
-}
-
 -- Supervisor
 withOutgoing :: (Binary req, Show req)
             => [Proto.PeerName]
-            -- Requests from the model to the outside world
-            -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse r
-            -- "Responses"
-            -> STM.TQueue r
-            -> (Outgoing -> IO a)
+            -> (Outgoing req r -> IO a)
             -> IO a
-withOutgoing seedPeers peers peerRespQ rest = do
+withOutgoing seedPeers rest = do
+    -- "Responses"
+    peerRespQ <- STM.atomically STM.newTQueue
+    -- Requests from the model to the outside world
+    peers <- STM.newTVarIO $ Map.empty
+
     putStrLn $ "peers:" ++ show seedPeers
     processes <- STM.atomically $ STM.newTVar $ Map.empty
-    Async.withAsync (go processes) $ \tid -> do
+    let outgoing = Outgoing peers peerRespQ
+    Async.withAsync (go outgoing processes) $ \tid -> do
       Async.link tid
-      rest $ Outgoing tid
+      rest $ outgoing
 
     where
-    go processes = void $ forever $ do
+    go (Outgoing peers peerRespQ) processes = void $ forever $ do
         runningProcesses <- Map.elems <$> STM.readTVarIO processes
         let toStart = (seedPeers \\ runningProcesses)
         putStrLn $ "To start: " ++ show toStart
