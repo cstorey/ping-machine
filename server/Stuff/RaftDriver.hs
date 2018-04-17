@@ -43,7 +43,7 @@ data Driver st req resp = Driver {
 , driverPeerOuts               :: STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse (ProtoStateMachine st req resp ())
 , driverPendingPeerResponses   :: STMPendingRespMap Proto.PeerResponse
 , driverClients                :: Listener req (Proto.ClientResponse resp)
-, driverPeerReqInQ             :: RequestsQ (Proto.PeerRequest req) Proto.PeerResponse
+, driverPeers                  :: Listener (Proto.PeerRequest req) Proto.PeerResponse
 , driverTicker                 :: Ticker
 , driverPeerRespInQ            :: STM.TQueue (ProtoStateMachine st req resp ())
 }
@@ -65,14 +65,14 @@ nextIdSTM = do
 runModel :: (Show req, Show resp)
             => Proto.PeerName
             -> Listener req (Proto.ClientResponse resp)
-            -> RequestsQ (Proto.PeerRequest req) Proto.PeerResponse
+            -> Listener (Proto.PeerRequest req) Proto.PeerResponse
             -> STM.TQueue (ProtoStateMachine st req resp ())
             -> Ticker
             -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse (ProtoStateMachine st req resp ())
             -> Models.ModelFun st req resp
             -> st
             -> IO ()
-runModel myName clients peerReqInQ peerRespInQ ticker peerOuts modelFn initState = do
+runModel myName clients peers peerRespInQ ticker peerOuts modelFn initState = do
     stateRef <- STM.newTVarIO $ mkRaftState :: IO (STM.TVar (RaftState req resp))
     -- incoming requests _from_ clients
     pendingClientResponses <- STM.newTVarIO $ Map.empty :: IO (STM.TVar (Map z x))
@@ -89,7 +89,7 @@ runModel myName clients peerReqInQ peerRespInQ ticker peerOuts modelFn initState
 
     let protocolEnv = mkProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout <*> pure initState <*> pure modelFn
 
-    run $ Driver stateRef protocolEnv logVar pendingClientResponses peerOuts pendingPeerResponses clients peerReqInQ ticker peerRespInQ
+    run $ Driver stateRef protocolEnv logVar pendingClientResponses peerOuts pendingPeerResponses clients peers ticker peerRespInQ
 
 
 
@@ -98,9 +98,9 @@ run self = forever $ do
         STM.atomically once
         Logger.runStderrLoggingT $ logFromVar (driverLogs self)
     where
-    processClientMessage   = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM self (driverPendingClientResponses self) (listenerRequests $ driverClients self) processClientReqRespMessage
-    processPeerRequest     = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM self (driverPendingPeerResponses self) (driverPeerReqInQ self) processPeerRequestMessage
-    processTickMessage     = runLoggerSTM (driverLogs self) $ tickerSTM        self (driverTicker self) processTick
+    processClientMessage   = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM self (driverPendingClientResponses self) (driverClients self) processClientReqRespMessage
+    processPeerRequest     = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM self (driverPendingPeerResponses self)   (driverPeers self) processPeerRequestMessage
+    processTickMessage     = runLoggerSTM (driverLogs self) $ tickerSTM                self (driverTicker self) processTick
     processPeerResponse    = runLoggerSTM (driverLogs self) $ processRespMessageSTM    self (driverPeerRespInQ self)
 
     once                   = do
@@ -136,11 +136,11 @@ processRespMessageSTM self reqQ = do
 
 processReqRespMessageSTM :: Driver st req resp
                   -> STMPendingRespMap outs
-                  -> RequestsQ ins outs
+                  -> Listener ins outs
                   -> (ins -> IdFor outs -> ProtoStateMachine st req resp ())
                   -> LoggedSTM [ProcessorMessage st req resp]
-processReqRespMessageSTM self pendingResponses reqQ process = do
-  (msg, pendingResponse) <- lift $ STM.readTQueue reqQ
+processReqRespMessageSTM self pendingResponses listener process = do
+  (msg, pendingResponse) <- lift $ STM.readTQueue $ listenerRequests listener
   reqId <- lift $ IdFor <$> nextIdSTM
   lift $ STM.modifyTVar pendingResponses $ Map.insert reqId pendingResponse
   ((), toSend) <- processActions self $ process msg reqId

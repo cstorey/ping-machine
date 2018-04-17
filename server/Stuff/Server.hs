@@ -33,7 +33,7 @@ main = S.withSocketsDo $ do
       withReqRespListener (ClientID <$> nextId) clientAddr $ \clientListener -> do
         withReqRespListener (PeerID <$> nextId) peerListenAddr $ \peerListener -> do
           withOutgoing (Proto.PeerName <$> peerPorts) requestToPeers peerRespQ $ \_outgoing -> do
-            (runModel myName clientListener (listenerRequests peerListener) peerRespQ ticker requestToPeers Models.bingBongModel (0 :: Int))
+            (runModel myName clientListener peerListener peerRespQ ticker requestToPeers Models.bingBongModel (0 :: Int))
 
 nextId :: IO Int
 nextId = STM.atomically nextIdSTM
