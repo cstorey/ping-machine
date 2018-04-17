@@ -38,16 +38,12 @@ main = S.withSocketsDo $ do
     peerRespQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (m ()))
     ticks <- STM.atomically STM.newTQueue :: IO (STM.TQueue ((),Maybe Tick))
     requestToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STMReqChanMap Proto.PeerName (Proto.PeerRequest Models.BingBongReq) Proto.PeerResponse (m ()))
-    -- We also need to start a peer manager. This will start a single process
-    -- for each known peer, attempt to connect, then relay messages to/from
-    -- peers.
-    let race = Async.race_
-    withTicker ticks $ \ticker ->
+
+    withTicker ticks $ \_ticker ->
       withReqRespListener (ClientID <$> nextId) clientAddr clientReqQ $ \_clientListener -> do
         withReqRespListener (PeerID <$> nextId) peerListenAddr peerReqInQ $ \_peerListener -> do
-          (runOutgoing (Proto.PeerName <$> peerPorts) requestToPeers peerRespQ)
-          `race` (Async.wait $ waiter ticker)
-          `race` (runModel myName clientReqQ peerReqInQ peerRespQ ticks requestToPeers Models.bingBongModel (0 :: Int))
+          withOutgoing (Proto.PeerName <$> peerPorts) requestToPeers peerRespQ $ \_outgoing -> do
+            (runModel myName clientReqQ peerReqInQ peerRespQ ticks requestToPeers Models.bingBongModel (0 :: Int))
 
 nextId :: IO Int
 nextId = STM.atomically nextIdSTM
@@ -57,7 +53,9 @@ data Ticker = Ticker {
 }
 
 withTicker :: STM.TQueue ((), Maybe Tick) -> (Ticker  -> IO a) -> IO a
-withTicker ticks f = Async.withAsync (runTicker ticks) $ \ticker -> f $ Ticker ticker
+withTicker ticks f = Async.withAsync (runTicker ticks) $ \ticker -> do
+  Async.link ticker
+  f $ Ticker ticker
 
 runTicker :: STM.TQueue ((), Maybe Tick) -> IO ()
 runTicker ticks = void $ forever $ do

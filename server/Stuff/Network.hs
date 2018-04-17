@@ -1,5 +1,5 @@
 module Stuff.Network
-( runOutgoing
+( withOutgoing
 , withReqRespListener
 , resolve
 )
@@ -32,17 +32,26 @@ data Listener = Listener {
   _listenerThreadId :: Async ()
 }
 
+data Outgoing = Outgoing {
+  _outgoingThreadId :: Async ()
+}
+
 -- Supervisor
-runOutgoing :: (Binary req, Show req)
+withOutgoing :: (Binary req, Show req)
             => [Proto.PeerName]
             -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse r
             -> STM.TQueue r
-            -> IO ()
-runOutgoing seedPeers peers peerRespQ = do
+            -> (Outgoing -> IO a)
+            -> IO a
+withOutgoing seedPeers peers peerRespQ rest = do
     putStrLn $ "peers:" ++ show seedPeers
     processes <- STM.atomically $ STM.newTVar $ Map.empty
+    Async.withAsync (go processes) $ \tid -> do
+      Async.link tid
+      rest $ Outgoing tid
 
-    void $ forever $ do
+    where
+    go processes = void $ forever $ do
         runningProcesses <- Map.elems <$> STM.readTVarIO processes
         let toStart = (seedPeers \\ runningProcesses)
         putStrLn $ "To start: " ++ show toStart
