@@ -9,12 +9,14 @@ where
 
 
 import qualified Stuff.Proto as Proto
+import qualified Stuff.Models as Models
 
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Monad.Logger as Logger
 import qualified Data.Functor.Identity as Identity
 import qualified Control.Concurrent.STM as STM
 import           Control.Concurrent.STM (STM)
+import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Control.Applicative ((<|>))
@@ -40,29 +42,32 @@ nextIdSTM = do
     STM.writeTVar nextIds (succ n)
     return n
 
-runModel :: Proto.PeerName
-            -> RequestsQ Proto.ClientRequest Proto.ClientResponse
-            -> RequestsQ Proto.PeerRequest Proto.PeerResponse
-            -> STM.TQueue (ProtoStateMachine ())
+runModel :: (Show req, Show resp)
+            => Proto.PeerName
+            -> RequestsQ req (Proto.ClientResponse resp)
+            -> RequestsQ (Proto.PeerRequest req) Proto.PeerResponse
+            -> STM.TQueue (ProtoStateMachine st req resp ())
             -> RequestsInQ () Tick
-            -> STMReqChanMap Proto.PeerName Proto.PeerRequest Proto.PeerResponse (ProtoStateMachine ())
+            -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse (ProtoStateMachine st req resp ())
+            -> Models.ModelFun st req resp
+            -> st
             -> IO ()
-runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts = do
-    stateRef <- STM.atomically $ STM.newTVar $ mkRaftState
+runModel myName modelQ peerReqInQ peerRespInQ ticks peerOuts modelFn initState = do
+    stateRef <- STM.newTVarIO $ mkRaftState :: IO (STM.TVar (RaftState req resp))
     -- incoming requests _from_ clients
-    pendingClientResponses <- STM.atomically $ STM.newTVar $ Map.empty
+    pendingClientResponses <- STM.newTVarIO $ Map.empty :: IO (STM.TVar (Map z x))
     -- requests _from_ peers that are due a response
     -- map of ids of requests from peer to their pending responses.
-    pendingPeerResponses <- STM.atomically $ STM.newTVar $ Map.empty
+    pendingPeerResponses <- STM.newTVarIO $ Map.empty :: IO (STM.TVar (Map k a))
     -- Responses that we are awaiting _from_ peers.
 
-    logVar <- STM.atomically $ STM.newTVar []
+    logVar <- STM.newTVarIO [] :: IO (STM.TVar [y])
 
     elTimeout <- (% 1000) <$> Random.randomRIO (2500, 3500) :: IO Time
     let aeTimeout = 1 :: Time
     putStrLn $ show ("Election timeout is", elTimeout, "append entries", aeTimeout)
 
-    let protocolEnv = mkProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout
+    let protocolEnv = mkProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar peerOuts) <*> pure elTimeout <*> pure aeTimeout <*> pure initState <*> pure modelFn
     let processClientMessage = runLoggerSTM logVar $ processReqRespMessageSTM stateRef protocolEnv pendingClientResponses modelQ processClientReqRespMessage
     let processPeerRequest = runLoggerSTM logVar $ processReqRespMessageSTM stateRef protocolEnv pendingPeerResponses peerReqInQ processPeerRequestMessage
     let processTickMessage = runLoggerSTM logVar $ processMessageSTM stateRef protocolEnv ticks processTick
@@ -90,11 +95,11 @@ runLoggerSTM out action = do
   STM.modifyTVar' out (++ logs)
   return a
 
-processMessageSTM :: STM.TVar RaftState
-                  -> STM.STM ProtocolEnv
-                  -> RequestsInQ xid req
-                  -> (xid -> req -> ProtoStateMachine ())
-                  -> Logger.WriterLoggingT STM.STM [ProcessorMessage]
+processMessageSTM :: STM.TVar (RaftState req resp)
+                  -> STM.STM (ProtocolEnv st req resp)
+                  -> RequestsInQ xid ins
+                  -> (xid -> ins -> ProtoStateMachine st req resp ())
+                  -> Logger.WriterLoggingT STM.STM [ProcessorMessage st req resp]
 processMessageSTM stateRef envSTM reqQ process = do
     (sender, m) <- lift $ STM.readTQueue reqQ
     case m of
@@ -102,20 +107,20 @@ processMessageSTM stateRef envSTM reqQ process = do
             snd <$> (processActions envSTM stateRef $ process sender msg)
         Nothing -> return []
 
-processRespMessageSTM :: STM.TVar RaftState
-                               -> STM.STM ProtocolEnv
-                               -> STM.TQueue (ProtoStateMachine ())
-                               -> LoggedSTM [ProcessorMessage]
+processRespMessageSTM :: STM.TVar (RaftState req resp)
+                               -> STM.STM (ProtocolEnv st req resp)
+                               -> STM.TQueue (ProtoStateMachine st req resp ())
+                               -> LoggedSTM [ProcessorMessage st req resp]
 processRespMessageSTM stateRef envSTM reqQ = do
     action <- lift $ STM.readTQueue reqQ
     snd <$> processActions envSTM stateRef action
 
-processReqRespMessageSTM :: STM.TVar RaftState
-                  -> STM.STM ProtocolEnv
-                  -> STMPendingRespMap resp
-                  -> RequestsQ req resp
-                  -> (req -> IdFor resp -> ProtoStateMachine ())
-                  -> LoggedSTM [ProcessorMessage]
+processReqRespMessageSTM :: STM.TVar (RaftState req resp)
+                  -> STM.STM (ProtocolEnv st req resp)
+                  -> STMPendingRespMap outs
+                  -> RequestsQ ins outs
+                  -> (ins -> IdFor outs -> ProtoStateMachine st req resp ())
+                  -> LoggedSTM [ProcessorMessage st req resp]
 processReqRespMessageSTM stateRef envSTM pendingResponses reqQ process = do
   (msg, pendingResponse) <- lift $ STM.readTQueue reqQ
   reqId <- lift $ IdFor <$> nextIdSTM
@@ -123,10 +128,11 @@ processReqRespMessageSTM stateRef envSTM pendingResponses reqQ process = do
   ((), toSend) <- processActions envSTM stateRef $ process msg reqId
   return toSend
 
-sendMessages :: STMPendingRespMap Proto.ClientResponse
-             -> STMReqChanMap Proto.PeerName Proto.PeerRequest Proto.PeerResponse (ProtoStateMachine ())
+sendMessages :: (Show resp)
+             => STMPendingRespMap (Proto.ClientResponse resp)
+             -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse (ProtoStateMachine st req resp ())
              -> STMPendingRespMap Proto.PeerResponse
-             -> [ProcessorMessage]
+             -> [ProcessorMessage st req resp]
              -> STM.STM ()
 sendMessages pendingClientResponses peerRequests pendingPeerResponses toSend = do
             forM_ toSend $ \msg' -> do
@@ -149,7 +155,7 @@ sendMessages pendingClientResponses peerRequests pendingPeerResponses toSend = d
                   STM.writeTQueue q $ (msg, k)
                 Nothing -> error "what?"
 
-processActions :: STM ProtocolEnv -> STM.TVar RaftState -> ProtoStateMachine a -> LoggedSTM (a, [ProcessorMessage])
+processActions :: STM (ProtocolEnv st req resp) -> STM.TVar (RaftState req resp) -> ProtoStateMachine st req resp a -> LoggedSTM (a, [ProcessorMessage st req resp])
 processActions envSTM stateRef actions = do
   env <- lift $ envSTM
   s <- lift $ STM.readTVar stateRef

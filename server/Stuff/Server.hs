@@ -4,6 +4,7 @@
 module Stuff.Server where
 
 import qualified Stuff.Proto as Proto
+import qualified Stuff.Models as Models
 
 import           System.IO (BufferMode(..), hSetBuffering, stdout, stderr)
 import qualified Network.Socket            as S
@@ -32,11 +33,11 @@ main = S.withSocketsDo $ do
     let myName = Proto.PeerName peerPort
     clientAddr <- resolve clientPort
     peerListenAddr <- resolve peerPort
-    clientReqQ <- STM.atomically STM.newTQueue:: IO (RequestsQ Proto.ClientRequest Proto.ClientResponse)
-    peerReqInQ <- STM.atomically STM.newTQueue :: IO (RequestsQ Proto.PeerRequest Proto.PeerResponse)
+    clientReqQ <- STM.atomically STM.newTQueue:: IO (RequestsQ (Models.BingBongReq) (Proto.ClientResponse Models.BingBongRet))
+    peerReqInQ <- STM.atomically STM.newTQueue :: IO (RequestsQ (Proto.PeerRequest Models.BingBongReq) Proto.PeerResponse)
     peerRespQ <- STM.atomically STM.newTQueue :: IO (STM.TQueue (m ()))
     ticks <- STM.atomically STM.newTQueue :: IO (STM.TQueue ((),Maybe Tick))
-    requestToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STMReqChanMap Proto.PeerName Proto.PeerRequest Proto.PeerResponse (m ()))
+    requestToPeers <- STM.atomically $ STM.newTVar $ Map.empty :: IO (STMReqChanMap Proto.PeerName (Proto.PeerRequest Models.BingBongReq) Proto.PeerResponse (m ()))
     -- We also need to start a peer manager. This will start a single process
     -- for each known peer, attempt to connect, then relay messages to/from
     -- peers.
@@ -46,7 +47,7 @@ main = S.withSocketsDo $ do
             `race` (runReqRespListener (PeerID <$> nextId) peerListenAddr peerReqInQ)
             `race` (runOutgoing (Proto.PeerName <$> peerPorts) requestToPeers peerRespQ)
             `race` (Async.wait $ waiter ticker)
-            `race` (runModel myName clientReqQ peerReqInQ peerRespQ ticks requestToPeers )
+            `race` (runModel myName clientReqQ peerReqInQ peerRespQ ticks requestToPeers Models.bingBongModel (0 :: Int))
 
 nextId :: IO Int
 nextId = STM.atomically nextIdSTM

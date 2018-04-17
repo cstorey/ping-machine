@@ -10,6 +10,7 @@ import qualified Stuff.Proto as Proto
 import qualified Network.Socket            as S
 import qualified System.IO.Streams         as Streams
 import qualified System.IO.Streams.Binary  as BStreams
+import Data.Binary (Binary)
 import qualified Data.Binary as Binary
 import qualified Control.Concurrent.STM as STM
 import qualified Control.Concurrent.Async as Async
@@ -26,8 +27,9 @@ oneSecondMicroSeconds :: Int
 oneSecondMicroSeconds = 1000000
 
 -- Supervisor
-runOutgoing :: [Proto.PeerName]
-            -> STMReqChanMap Proto.PeerName Proto.PeerRequest Proto.PeerResponse r
+runOutgoing :: (Binary req, Show req)
+            => [Proto.PeerName]
+            -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse r
             -> STM.TQueue r
             -> IO ()
 runOutgoing seedPeers peers peerRespQ = do

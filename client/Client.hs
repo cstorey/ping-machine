@@ -3,6 +3,7 @@
 module Client where
 
 import qualified Stuff.Proto as Proto
+import qualified Stuff.Models as Models
 
 import qualified Control.Exception as E
 import Network.Socket hiding (recv)
@@ -42,9 +43,9 @@ talk sock = do
     (is, os) <- streamsOf sock
     go is os
 
-go :: Streams.InputStream Proto.ClientResponse -> Streams.OutputStream Proto.ClientRequest -> IO ()
+go :: Streams.InputStream (Proto.ClientResponse Models.BingBongRet) -> Streams.OutputStream Models.BingBongReq -> IO ()
 go is os = do
-    Streams.write (Just Proto.Bing) os
+    Streams.write (Just Models.Bing) os
     putStrLn "Sent"
     msg <- Streams.read is
     putStr "Received: "

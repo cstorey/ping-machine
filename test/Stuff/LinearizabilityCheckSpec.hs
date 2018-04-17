@@ -20,6 +20,8 @@ import qualified Data.Text.Format.Params as Text
 import qualified Data.Sequence as Seq
 import Data.Sequence (Seq, (|>), ViewL(..))
 
+import Stuff.Models
+
 newtype Process = Process(Int)
     deriving (Show, Eq, Ord)
 
@@ -30,29 +32,6 @@ data HistoryElement req resp =
 
 data Linearization req resp = Op Process req resp
     deriving (Show, Eq, Ord)
-
-data RegisterReq a =
-    RWrite a
-  | RRead
-    deriving (Show, Eq, Ord)
-
-data RegisterRet a =
-    ROk
-  | RVal a
-    deriving (Show, Eq, Ord)
-
-
-data FifoReq a =
-    FEnqueue a
-  | FDequeue
-    deriving (Show, Eq, Ord)
-data FifoRet a =
-    FOk
-  | FVal a
-  | FEmpty
-    deriving (Show, Eq, Ord)
-
-type ModelFun s req res = (s -> req -> (s, res))
 
 data NotLinearizableReason req res =
     ModelMismatch req res res
@@ -243,7 +222,7 @@ checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialSt
       linRule = do
         -- _trace "{}linRule{}" (_spaces, ("" :: String))
         -- _trace "{}buf: calls:{}; rets: {}" (_spaces, _s calls, _s rets)
-        rs <- asum $ flip map (Map.toList calls) $ \(p, req) -> do
+        rs <- asum $ flip fmap (Map.toList calls) $ \(p, req) -> do
           --  (startTime, req) <- maybe empty pure $ Map.lookup p calls
           let (s', ret) = model s req
           -- _trace "lin@{}: state: {}: req:{} -> expected:{}" (_s p, _s s, _s req, _s ret)

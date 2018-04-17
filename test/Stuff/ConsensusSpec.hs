@@ -1,12 +1,12 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Stuff.ConsensusSpec
 ( tests
 , spec
 ) where
 
-import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -47,48 +47,50 @@ import           Test.Hspec
 
 import Stuff.RaftModel
 import Stuff.Proto
+import Stuff.Models
 import Stuff.Types
 
-newtype WaitingCallback = WaitingCallback (PeerResponse -> ProtoStateMachine ())
+newtype WaitingCallback st req resp = WaitingCallback (PeerResponse -> ProtoStateMachine st req resp ())
 
 type PeerMap = Bimap PeerName (IdFor PeerResponse)
 
-instance Show WaitingCallback where
+instance Show (WaitingCallback st req resp) where
   show _ = "WaitingCallback"
 
-data InboxItem =
-    RequestFromPeer PeerName PeerRequest
-  | ResponseFromPeer PeerName WaitingCallback PeerResponse
+data InboxItem st req resp =
+    RequestFromPeer PeerName (PeerRequest req)
+  | ResponseFromPeer PeerName (WaitingCallback st req resp) PeerResponse
   | ClockTick Time
-  | ClientRequest (IdFor ClientResponse) ClientRequest
+  | ClientRequest (IdFor (ClientResponse resp)) req
 
-instance Show InboxItem where
+instance (Show req) => Show (InboxItem st req resp) where
   show (RequestFromPeer name req) = "RequestFromPeer " ++ show name ++ " " ++ show req
   show (ResponseFromPeer name _ resp) = "ResponseFromPeer " ++ show name ++ " WaitingCallback " ++ show resp
   show (ClockTick t) = "ClockTick " ++ show t
   show (ClientRequest rid req) = "ClientRequest " ++ show rid ++ " " ++ show req
 
 -- The IdFor fields for MessageOut should match the matching MessageIn
-data MessageEvent =
-    MessageIn (IdFor MessageEvent) PeerName InboxItem
-  | MessageOut (IdFor MessageEvent) PeerName ProcessorMessage
+data MessageEvent st req resp =
+    MessageIn (IdFor (MessageEvent st req resp)) PeerName (InboxItem st req resp)
+  | MessageOut (IdFor (MessageEvent st req resp)) PeerName (ProcessorMessage st req resp)
   deriving (Show)
 
-data NodeSim = NodeSim {
-  _nodeEnv :: ProtocolEnv
-, _nodeState :: !RaftState
-, _nodeInbox :: Seq (IdFor MessageEvent, InboxItem)
-, _nodePendingResponses :: Map PeerName (Seq WaitingCallback)
+data NodeSim st req resp = NodeSim {
+  _nodeEnv :: ProtocolEnv st req resp
+, _nodeState :: !(RaftState req resp)
+, _nodeInbox :: Seq (IdFor (MessageEvent st req resp), (InboxItem st req resp))
+, _nodePendingResponses :: Map PeerName (Seq (WaitingCallback st req resp))
 } deriving (Show)
 
-data ClientSim = ClientSim {
+data ClientSim req = ClientSim {
   _lastSeenLeader :: Maybe PeerName
 , _sentReqId :: Int
+, _newCommand :: req
 } deriving (Show)
 
-data Network = Network {
-  _nodes :: Map PeerName NodeSim
-, _client :: ClientSim
+data Network st req resp = Network {
+  _nodes :: Map PeerName (NodeSim st req resp)
+, _client :: ClientSim req
 , _idCounter :: Int
 } deriving (Show)
 
@@ -96,14 +98,14 @@ makeLenses ''NodeSim
 makeLenses ''ClientSim
 makeLenses ''Network
 
-makeNode :: PeerMap -> PeerName -> Time -> NodeSim
-makeNode allPeers self elTimeout = NodeSim newnodeEnv mkRaftState Seq.empty Map.empty
+makeNode :: PeerMap -> PeerName -> Time -> ModelFun st req resp -> st -> NodeSim st req resp
+makeNode allPeers self elTimeout modelFn initSt = NodeSim newnodeEnv mkRaftState Seq.empty Map.empty
   where
-    newnodeEnv = (mkProtocolEnv self (Set.difference names $ Set.singleton self) elTimeout (elTimeout / 3.0) :: ProtocolEnv)
+    newnodeEnv = mkProtocolEnv self (Set.difference names $ Set.singleton self) elTimeout (elTimeout / 3.0) initSt modelFn
     names = Set.fromList $ Bimap.keys allPeers
 
 
-applyState :: HasCallStack => Bimap PeerName (IdFor PeerResponse) -> InboxItem -> ProtoStateMachine ()
+applyState :: (HasCallStack, Show req, Show resp) => Bimap PeerName (IdFor PeerResponse) -> InboxItem st req resp -> ProtoStateMachine st req resp ()
 applyState _ (ClockTick t) = do
   processTick () $ Tick t
 
@@ -171,7 +173,7 @@ clientProcs = [Client]
 peerName :: PeerMap -> Gen PeerName
 peerName allPeers = Gen.element $ Bimap.keys allPeers
 
-clientCommand :: Gen ClientRequest
+clientCommand :: Gen BingBongReq
 clientCommand = Gen.choice
   [ Gen.constant Bing
   , Gen.constant Ping
@@ -263,8 +265,8 @@ timeouts allPeers = Gen.list (Range.constant nnodes nnodes) $ ((+ 2500) <$> time
 peerCount :: Gen Int
 peerCount = Gen.int (Range.linear 1 5)
 
-runSimulation :: PeerMap -> [Integer] -> SystemSchedule -> String -> PropertyT IO [MessageEvent]
-runSimulation allPeers ts (SystemSchedule sched) fname = do
+runSimulation :: (Show req, Show resp, Show st) => PeerMap -> [Integer] -> SystemSchedule -> req -> ModelFun st req resp -> st -> String -> PropertyT IO [MessageEvent st req resp]
+runSimulation allPeers ts (SystemSchedule sched) aCmd modelFn initSt fname = do
       footnoteShow $ "Logging to: " ++ fname
 
       let byProc = map (\(p, s) -> map (\(t, e) -> (t, p, e)) $ toAbsTimes s) $ Map.toList sched :: [[(Integer,ProcessId,ProcessEvent)]]
@@ -274,7 +276,7 @@ runSimulation allPeers ts (SystemSchedule sched) fname = do
 
       assert $ List.length toRun == 0 || List.isSorted (map (\(t,_,_) -> t) toRun)
 
-      let network = Network allNodes (ClientSim Nothing 0) 0
+      let network = Network allNodes (ClientSim Nothing 0 aCmd) 0
       evalIO $ do
         runFileLoggingT fname $ do
           $(logDebug) $ Text.pack $ ppShow ("allPeers", allPeers)
@@ -289,7 +291,7 @@ runSimulation allPeers ts (SystemSchedule sched) fname = do
         return $ mconcat $ msgs
 
   where
-    allNodes = Map.fromList $ fmap (\(p, t) -> (p, makeNode allPeers p t)) $ zip (Bimap.keys allPeers) (map (% ticksPerSecond) ts)
+    allNodes = Map.fromList $ fmap (\(p, t) -> (p, makeNode allPeers p t modelFn initSt)) $ zip (Bimap.keys allPeers) (map (% ticksPerSecond) ts)
 
     toAbsTimes :: [(Integer, a)] -> [(Integer, a)]
     toAbsTimes byInterval =
@@ -302,7 +304,7 @@ runSimulation allPeers ts (SystemSchedule sched) fname = do
 prop_leaderElectionOnlyElectsOneLeaderPerTerm :: HasCallStack => Property
 prop_leaderElectionOnlyElectsOneLeaderPerTerm = leaderElectionOnlyElectsOneLeaderPerTerm
 
-leaderElectionOnlyElectsOneLeaderPerTerm :: HasCallStack => Property
+leaderElectionOnlyElectsOneLeaderPerTerm :: (HasCallStack) => Property
 leaderElectionOnlyElectsOneLeaderPerTerm = property $ do
       n <- forAll $ peerCount
       allPeers <- forAll $ peers n
@@ -311,7 +313,7 @@ leaderElectionOnlyElectsOneLeaderPerTerm = property $ do
       let h = hash $ show (allPeers, ts, sched)
       let fname = "/tmp/prop_leaderElectionOnlyElectsOneLeaderPerTerm_" ++ show h
 
-      messages <- runSimulation allPeers ts sched fname
+      messages <- runSimulation allPeers ts sched Bing bingBongModel 0 fname :: PropertyT IO [MessageEvent Int BingBongReq BingBongRet]
 
       let allLeaders = leadersByTerm messages
 
@@ -321,10 +323,8 @@ leaderElectionOnlyElectsOneLeaderPerTerm = property $ do
           assert $ 1 >= Set.size leaders
 
   where
-      leadersByTerm :: [MessageEvent] -> Map Term (Set PeerName)
       leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
         -- let allLeaders = List.foldl' ... $
-      leadersOf :: MessageEvent -> Map Term (Set PeerName)
       leadersOf (MessageOut _mid sender (PeerRequest _ (AppendEntries aer) _)) =
           Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
       leadersOf _ = Map.empty
@@ -342,7 +342,7 @@ bongsAreMonotonic = property $ do
       let h = hash $ show (allPeers, ts, sched)
       let fname = "/tmp/prop_bongsAreMonotonic" ++ show h
 
-      messages <- runSimulation allPeers ts sched fname
+      messages <- runSimulation allPeers ts sched Bing bingBongModel 0 fname :: PropertyT IO [MessageEvent Int BingBongReq BingBongRet]
       let respValues = foldr findResponse [] messages
       test $ do
         runFileLoggingT fname $ do
@@ -365,7 +365,8 @@ eventuallyElectsLeader = property $ do
   let h = hash $ show (allPeers, ts)
   let fname = "/tmp/prop_eventuallyElectsLeader_" ++ show n ++ "_" ++ show h
 
-  messages <- simulateUntil allPeers ts fname $ not . Map.null . mconcat . map leadersOf
+  messages <- simulateUntil allPeers ts fname Bing bingBongModel 0 $ not . Map.null . mconcat . map leadersOf
+  let _ = messages :: [MessageEvent Int BingBongReq BingBongRet]
 
   let allLeaders = leadersByTerm messages
 
@@ -374,10 +375,8 @@ eventuallyElectsLeader = property $ do
     assert $ Map.size allLeaders > 0
 
   where
-    leadersByTerm :: [MessageEvent] -> Map Term (Set PeerName)
     leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
       -- let allLeaders = List.foldl' ... $
-    leadersOf :: MessageEvent -> Map Term (Set PeerName)
     leadersOf (MessageOut _mid sender (PeerRequest _ (AppendEntries aer) _)) =
         Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
     leadersOf _ = Map.empty
@@ -391,7 +390,8 @@ eventuallyRepliesToClient = property $ do
   let h = hash $ show (allPeers, ts)
   let fname = "/tmp/prop_eventuallyRepliesToClient_" ++ show n ++ "_" ++ show h
 
-  messages <- simulateUntil allPeers ts fname $ ((>0) . length . filter hasClientReply)
+  messages <- simulateUntil allPeers ts fname Bing bingBongModel 0 $ ((>0) . length . filter hasClientReply)
+  let _ = messages :: [MessageEvent Int BingBongReq BingBongRet]
 
   let responses = filter hasClientReply messages
 
@@ -400,12 +400,13 @@ eventuallyRepliesToClient = property $ do
     assert $ length responses > 0
 
   where
-    hasClientReply :: MessageEvent -> Bool
+    hasClientReply :: MessageEvent st req resp -> Bool
     hasClientReply (MessageOut _ _ (Reply _ (Right _))) = True
     hasClientReply _ = False
 
-simulateUntil :: PeerMap -> [Integer] -> String -> ([MessageEvent] -> Bool) -> PropertyT IO [MessageEvent]
-simulateUntil allPeers ts fname enough = do
+simulateUntil :: (Show req, Show resp, Show st)
+              => PeerMap -> [Integer] -> String -> req -> ModelFun st req resp -> st -> ([MessageEvent st req resp] -> Bool) -> PropertyT IO [MessageEvent st req resp]
+simulateUntil allPeers ts fname aCmd modelFn initSt enough = do
   footnoteShow $ "Logging to: " ++ fname
 
   let sched = periodicSched
@@ -416,7 +417,7 @@ simulateUntil allPeers ts fname enough = do
   let toRun = List.takeWhile (\(t, _, _) -> t < ticksPerSecond * simLength) $ List.mergeAll byProc
   assert $ List.length toRun == 0 || List.isSorted (map (\(t,_,_) -> t) toRun)
 
-  let network = Network allNodes (ClientSim Nothing 0) 0
+  let network = Network allNodes (ClientSim Nothing 0 aCmd) 0
 
   evalIO $ do
     runFileLoggingT fname $ do
@@ -448,7 +449,7 @@ simulateUntil allPeers ts fname enough = do
     return $ msgs
 
     where
-    allNodes = Map.fromList $ fmap (\(p, t) -> (p, makeNode allPeers p t)) $ zip (Bimap.keys allPeers) (map (% ticksPerSecond) ts)
+    allNodes = Map.fromList $ fmap (\(p, t) -> (p, makeNode allPeers p t modelFn initSt)) $ zip (Bimap.keys allPeers) (map (% ticksPerSecond) ts)
 
     periodicSched :: Map ProcessId [(Integer, ProcessEvent)]
     periodicSched = Map.fromList $ zip processes $ map sched [1000..]
@@ -467,15 +468,15 @@ simulateUntil allPeers ts fname enough = do
 
 -- mechanics
 
-nextId :: MonadState Network m => m (IdFor a)
+nextId :: MonadState (Network st req resp) m => m (IdFor a)
 nextId = IdFor <$> (idCounter <<%= succ)
 
-simulateIteration :: (HasCallStack, MonadLogger m, MonadState Network m)
+simulateIteration :: (HasCallStack, MonadLogger m, MonadState (Network st req resp) m, Show req, Show resp)
                   => PeerMap
                   -> Integer
                   -> ProcessId
                   -> ProcessEvent
-                  -> m [MessageEvent]
+                  -> m [MessageEvent st req resp]
 simulateIteration _ n (Node name) Clock = do
     let t = n % ticksPerSecond
     mid <- nextId
@@ -488,7 +489,7 @@ simulateIteration allPeers _t (Node name) Inbox = do
 
 simulateIteration allPeers n Client Clock = do
     let t = n % ticksPerSecond
-    let cmd = Bing
+    cmd <- use (client . newCommand)
     rid <- IdFor <$> (client . sentReqId  <<%= succ)
     mid <- nextId
     use client >>= \st -> $(logDebugSH) ("simulateIteration", Client, rid, st)
@@ -499,17 +500,17 @@ simulateIteration allPeers n Client Clock = do
     return []
 simulateIteration _allPeers _n Client Inbox = return []
 
-getQuiesecent :: (MonadLogger m, MonadState Network m) => PeerName -> m Bool
+getQuiesecent :: (Show req, MonadLogger m, MonadState (Network st req resp) m) => PeerName -> m Bool
 getQuiesecent name = do
   inboxes <- toListOf (nodes . ix name . nodeInbox) <$> get
   $(logDebugSH) ("Inbox", name, inboxes)
   return $ all Seq.null $ inboxes
 
 
-simulateStep :: (HasCallStack, MonadLogger m, MonadState Network m) => PeerMap -> PeerName -> m [MessageEvent]
+simulateStep :: forall st req resp m . (Show req, Show resp, HasCallStack, MonadLogger m, MonadState (Network st req resp) m) => PeerMap -> PeerName -> m [MessageEvent st req resp]
 simulateStep allPeers thisNode = do
-  node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get
-  let inbox = view nodeInbox node
+  node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get :: m (NodeSim st req resp)
+  let inbox = view nodeInbox node :: Seq (IdFor (MessageEvent st req resp), InboxItem st req resp)
   nodes . ix thisNode . nodeInbox .= Seq.empty
 
   $(logDebugSH) ("Run", thisNode, inbox)
@@ -572,7 +573,7 @@ simulateStep allPeers thisNode = do
         client . lastSeenLeader .= leaderp
         st' <- use client
         $(logDebugSH) (thisNode, clientId, "post sendClientReply", m, st')
-  sendClientReply clientId m@(Right (Bong _)) = do
+  sendClientReply clientId m@(Right _) = do
         st <- use client
         $(logDebugSH) (thisNode, clientId, "sendClientReply", m, st)
 
