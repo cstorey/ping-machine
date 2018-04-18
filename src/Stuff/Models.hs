@@ -2,6 +2,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Stuff.Models 
 ( ModelFun
+, Model(..)
 , RegisterReq(..)
 , RegisterRet(..)
 , FifoReq(..)
@@ -14,6 +15,12 @@ import Data.Binary (Binary)
 import GHC.Generics (Generic)
 
 type ModelFun s req res = (s -> req -> (s, res))
+
+
+data Model st req resp = Model {
+  modelStep :: ModelFun st req resp
+, modelInit :: st
+}
 
 data RegisterReq a =
     RWrite a
@@ -46,5 +53,8 @@ data BingBongRet =
   deriving (Eq, Ord, Show, Generic)
 instance Binary BingBongRet
 
-bingBongModel :: ModelFun Int BingBongReq BingBongRet 
-bingBongModel n _ = (succ n, Bong (Just n))
+bingBongModel :: Model Int BingBongReq BingBongRet 
+bingBongModel = Model { 
+  modelStep = \n _ -> (succ n, Bong (Just n))
+, modelInit = 0
+}

@@ -112,8 +112,7 @@ data ProtocolEnv st req resp = ProtocolEnv {
     _peerNames :: PeerSet,
     _electionTimeout :: Time,
     __appendEntriesPeriod :: Time
-,   _modelInitState :: st
-,   _modelTransition :: Models.ModelFun st req resp
+,   _model :: Models.Model st req resp
 }
 
 instance (Show req, Show resp) => Show (ProtocolEnv st req resp) where
@@ -189,7 +188,7 @@ predIdx (Proto.LogIdx Nothing) = Proto.LogIdx $ Nothing
 predIdx (Proto.LogIdx (Just 0)) = Proto.LogIdx $ Nothing
 predIdx (Proto.LogIdx (Just x)) = Proto.LogIdx $ Just $ pred x
 
-mkProtocolEnv :: Proto.PeerName -> PeerSet -> Time -> Time -> st -> Models.ModelFun st req resp -> ProtocolEnv st req resp
+mkProtocolEnv :: Proto.PeerName -> PeerSet -> Time -> Time -> Models.Model st req resp -> ProtocolEnv st req resp
 mkProtocolEnv = ProtocolEnv
 
 newFollower :: RaftRole resp
@@ -482,15 +481,10 @@ handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = d
     responseToEntries :: Proto.LogIdx -> ProtoStateMachine st req resp resp
     responseToEntries reqIdx = do
       (prev, evp, _) <- Map.splitLookup reqIdx <$> use logEntries
-      v0 <- modelInit
-      f <- view modelTransition
-      let st = foldl' (\s -> fst . f s . Proto.logValue) v0 $ Map.elems prev
-      let (_, r) = f st $ Proto.logValue $ maybe (error $ "No item at " ++ show reqIdx) id evp
+      m <- view model
+      let st = foldl' (\s -> fst . Models.modelStep m s . Proto.logValue) (Models.modelInit m) $ Map.elems prev
+      let (_, r) = Models.modelStep m st $ Proto.logValue $ maybe (error $ "No item at " ++ show reqIdx) id evp
       return r
-
-    modelInit :: ProtoStateMachine st req resp st
-    modelInit = view modelInitState
-
 
 handleAppendEntriesResponse _ req sender _msg = do
     me <- view selfId

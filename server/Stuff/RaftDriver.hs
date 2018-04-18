@@ -73,12 +73,10 @@ runModel :: (Show req, Show resp)
             -> Listener req (Proto.ClientResponse resp)
             -> Listener (Proto.PeerRequest req) Proto.PeerResponse
             -> Ticker
-            -- -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse (ProtoStateMachine st req resp ())
             -> Outgoing req (ProtoStateMachine st req resp ())
-            -> Models.ModelFun st req resp
-            -> st
+            -> Models.Model st req resp
             -> IO ()
-runModel myName clients peers ticker outgoing modelFn initState = do
+runModel myName clients peers ticker outgoing model = do
     stateRef <- STM.newTVarIO $ mkRaftState :: IO (STM.TVar (RaftState req resp))
     -- incoming requests _from_ clients
     pendingClientResponses <- STM.newTVarIO $ Map.empty :: IO (STM.TVar (Map z x))
@@ -93,7 +91,7 @@ runModel myName clients peers ticker outgoing modelFn initState = do
     let aeTimeout = 1 :: Time
     putStrLn $ show ("Election timeout is", elTimeout, "append entries", aeTimeout)
 
-    let protocolEnv = mkProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar (outgoingPeers outgoing)) <*> pure elTimeout <*> pure aeTimeout <*> pure initState <*> pure modelFn
+    let protocolEnv = mkProtocolEnv myName <$> (Set.fromList . Map.keys <$> STM.readTVar (outgoingPeers outgoing)) <*> pure elTimeout <*> pure aeTimeout <*> pure model
 
     run $ Driver stateRef protocolEnv logVar pendingClientResponses outgoing pendingPeerResponses clients peers ticker
 
@@ -106,7 +104,7 @@ run self = forever $ do
     where
     processClientMessage   = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM self (driverPendingClientResponses self) (driverClients self) processClientReqRespMessage
     processPeerRequest     = runLoggerSTM (driverLogs self) $ processReqRespMessageSTM self (driverPendingPeerResponses self)   (driverPeers self) processPeerRequestMessage
-    processTickMessage     = runLoggerSTM (driverLogs self) $ tickerSTM                self (driverTicker self) processTick
+    processTickMessage     = runLoggerSTM (driverLogs self) $ tickerSTM self
     processPeerResponse    = runLoggerSTM (driverLogs self) $ processRespMessageSTM    self
 
     once                   = do
@@ -125,13 +123,15 @@ runLoggerSTM out action = do
   STM.modifyTVar' out (++ logs)
   return a
 
-tickerSTM :: Driver st req resp
-                  -> Ticker
-                  -> (() -> Tick -> ProtoStateMachine st req resp ())
-                  -> Logger.WriterLoggingT STM.STM [ProcessorMessage st req resp]
-tickerSTM self ticker process = do
-    m <- lift $ Ticker.tickerReceive ticker
-    snd <$> (processActions self $ process () m)
+tickerSTM :: (Show req, Show resp)
+          => Driver st req resp
+          -> Logger.WriterLoggingT STM.STM [ProcessorMessage st req resp]
+tickerSTM self = go
+  where
+  go = do
+    m <- lift $ Ticker.tickerReceive $ driverTicker self
+    snd <$> (processActions self $ processTick () m)
+
 
 processRespMessageSTM :: Driver st req resp
                       -> LoggedSTM [ProcessorMessage st req resp]
