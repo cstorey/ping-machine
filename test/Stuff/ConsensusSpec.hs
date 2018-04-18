@@ -443,7 +443,6 @@ simulateUntil allPeers ts fname aCmd model enough = do
 
     (msgs, network') <- State.runStateT (runFileLoggingT fname $ runSched toRun) network
     runFileLoggingT fname $ do
-      $(logDebug) $ Text.pack $ ppShow ("toRun", toRun)
       $(logDebug) $ Text.pack $ ppShow ("Network", network')
       $(logDebug) $ Text.pack $ ppShow ("Messages", msgs)
     return $ msgs
