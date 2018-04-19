@@ -314,11 +314,12 @@ processPeerRequestMessage
     $(logDebugSH) ("<- Append Entries", _msg)
 
     thisTerm <- use currentTerm
+    (_prevTerm, logHeadIdx) <- getPrevLogTermIdx
     if leaderTerm < thisTerm
     then do
         return ()
         $(logDebugSH) ("Refuse appendentries", leaderTerm, " < ", thisTerm)
-        refuseAppendEntries thisTerm
+        refuseAppendEntries thisTerm logHeadIdx
     else
         if leaderTerm > thisTerm
         then observeTerm leaderTerm
@@ -335,10 +336,10 @@ processPeerRequestMessage
                     error ("appendEntries recieved when leader? " ++ show _msg)
 
     where
-        refuseAppendEntries :: HasCallStack => Proto.Term -> ProtoStateMachine st req resp ()
-        refuseAppendEntries thisTerm = tell [PeerReply reqId $ Proto.AppendResult $ Proto.AppendEntriesResponse thisTerm False]
-        ackAppendEntries :: HasCallStack => Proto.Term -> ProtoStateMachine st req resp ()
-        ackAppendEntries thisTerm = tell [PeerReply reqId $ Proto.AppendResult $ Proto.AppendEntriesResponse thisTerm True]
+        refuseAppendEntries :: HasCallStack => Proto.Term -> Proto.LogIdx -> ProtoStateMachine st req resp ()
+        refuseAppendEntries thisTerm curHead = tell [PeerReply reqId $ Proto.AppendResult $ Proto.AppendEntriesResponse thisTerm False curHead]
+        ackAppendEntries :: HasCallStack => Proto.Term -> Proto.LogIdx -> ProtoStateMachine st req resp ()
+        ackAppendEntries thisTerm curHead = tell [PeerReply reqId $ Proto.AppendResult $ Proto.AppendEntriesResponse thisTerm True curHead]
 
         whenFollower thisTerm follower = do
             prevTick <- use prevTickTime
@@ -352,11 +353,11 @@ processPeerRequestMessage
             case Proto.logTerm <$> myEntry of
                 Just n | n /= assumedHeadTerm -> do
                     $(logDebugSH) ("Refusing as prev item was", myEntry, "wanted term", assumedHeadTerm)
-                    refuseAppendEntries thisTerm
+                    refuseAppendEntries thisTerm logHeadIdx
                 -- We need to refuse here iff it's ahead of our log
                 Nothing | assumedHeadIdx > logHeadIdx -> do
                     $(logDebugSH) ("Refusing as prevIdx index", assumedHeadIdx, "ahead of our", logHeadIdx)
-                    refuseAppendEntries thisTerm
+                    refuseAppendEntries thisTerm logHeadIdx
                 _ -> do
                     $(logDebugSH) ("Appending from ", assumedHeadIdx, "was", logHeadIdx)
                     let prefix   = Map.takeWhileAntitone (<= assumedHeadIdx) entries
@@ -374,7 +375,8 @@ processPeerRequestMessage
                     $(logDebugSH) ( Proto.unPeerName self, thisTerm, "Now", map Proto.unLogIdx $ Map.keys entries')
                     logEntries .= entries'
                     currentLeader .= Just leaderName
-                    ackAppendEntries thisTerm
+                    (_prevTerm, newLogHead) <- getPrevLogTermIdx
+                    ackAppendEntries thisTerm newLogHead
 
 handleVoteResponse :: HasCallStack => Proto.RequestVoteReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine st req resp ()
 handleVoteResponse req sender _msg@(Proto.VoteResult peerTerm granted) = do

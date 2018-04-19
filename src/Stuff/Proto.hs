@@ -74,6 +74,7 @@ instance Binary req => Binary (PeerRequest req)
 data AppendEntriesResponse = AppendEntriesResponse {
   aerTerm :: Term
 , aerSucceeded :: Bool
+, aerLogHead :: LogIdx
 } deriving (Show, Generic)
 instance Binary.Binary AppendEntriesResponse
 
