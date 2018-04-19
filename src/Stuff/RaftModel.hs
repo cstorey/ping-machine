@@ -215,7 +215,7 @@ processClientReqRespMessage command pendingResponse = do
             idx <- appendToLog command
             $(logDebugSH) ("processClientReqRespMessage accepting", command, pendingResponse, "index", Proto.unLogIdx idx)
             leader' <- recordPendingClientRequest idx leader
-            leader'' <- replicatePendingEntriesToFollowers leader'
+            leader'' <- return leader' -- replicatePendingEntriesToFollowers leader'
             currentRole .= Leader leader''
             $(logDebugSH) ("processClientReqRespMessage post", leader'')
         _ -> do
@@ -420,7 +420,7 @@ transitiontoLeaderWithEnoughVotes sender candidate = do
 
             currentRole .= newRole
 
-handleAppendEntriesResponse :: forall st req resp . (HasCallStack, Show req)
+handleAppendEntriesResponse :: forall st req resp . (HasCallStack, Show req, Show resp)
                             => Proto.LogIdx
                             -> (Proto.AppendEntriesReq req)
                             -> Proto.PeerName
@@ -433,7 +433,8 @@ handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = d
         Leader leader -> do
             leader' <- whenLeader leader
             leader'' <- maybe (return leader') (ackPendingClientResponses leader' ) $ view committed leader'
-            currentRole .= (Leader $ leader'')
+            leader''' <- replicatePendingEntriesToFollowers leader''
+            currentRole .= (Leader $ leader''')
         _st -> do
             $(logWarnSH) ("append response recieved when non leader?", _msg)
     where
@@ -451,7 +452,7 @@ handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = d
 
       else do
           let toTry = predIdx sentIdx
-          $(logDebugSH) ("Retry peer " , sender , " at : " , toTry)
+          $(logDebugSH) ("Retry peer " , sender , " at : " , toTry, "from", sentIdx)
           return $ leader & set (followers . ix sender . prevIdx) toTry
 
     findCommittedIndex :: HasCallStack => LeaderState resp -> ProtoStateMachine st req resp (Maybe Proto.LogIdx)
@@ -591,7 +592,7 @@ replicatePendingEntriesToFollowers leader = do
         return $ st & over followers (Map.insert peer peerState')
 
 
-sendAppendEntriesRequest :: (HasCallStack, Show req)
+sendAppendEntriesRequest :: (HasCallStack, Show req, Show resp)
                          => Proto.LogIdx -> Proto.PeerName -> Proto.AppendEntriesReq req -> ProtoStateMachine st req resp ()
 sendAppendEntriesRequest sentIdx peer req = do
     tell [PeerRequest peer (Proto.AppendEntries req) $ handleAppendEntriesResponse sentIdx req peer]
