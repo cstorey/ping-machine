@@ -183,11 +183,6 @@ succIdx :: Proto.LogIdx -> Proto.LogIdx
 succIdx (Proto.LogIdx Nothing) = Proto.LogIdx $ Just 0
 succIdx (Proto.LogIdx (Just x)) = Proto.LogIdx $ Just $ succ x
 
-predIdx :: Proto.LogIdx -> Proto.LogIdx
-predIdx (Proto.LogIdx Nothing) = Proto.LogIdx $ Nothing
-predIdx (Proto.LogIdx (Just 0)) = Proto.LogIdx $ Nothing
-predIdx (Proto.LogIdx (Just x)) = Proto.LogIdx $ Just $ pred x
-
 mkProtocolEnv :: Proto.PeerName -> PeerSet -> Time -> Time -> Models.Model st req resp -> ProtocolEnv st req resp
 mkProtocolEnv = ProtocolEnv
 
@@ -450,7 +445,7 @@ handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = d
               & set committed committedIdx
 
       else do
-          let toTry = predIdx sentIdx
+          let toTry = Proto.aerLogHead aer
           $(logDebugSH) ("Retry peer " , sender , " at : " , toTry)
           return $ leader & set (followers . ix sender . prevIdx) toTry
 
