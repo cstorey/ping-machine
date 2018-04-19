@@ -558,7 +558,7 @@ processTick () (Tick t) = do
         leader' <- replicatePendingEntriesToFollowers leader
         currentRole .= (Leader leader')
 
-
+-- Here, we send keepalives to everything every time. This ... seems suboptimal.
 replicatePendingEntriesToFollowers :: forall st req resp . (HasCallStack, Show req, Show resp)
                                    => LeaderState resp -> ProtoStateMachine st req resp (LeaderState resp)
 replicatePendingEntriesToFollowers leader = do
