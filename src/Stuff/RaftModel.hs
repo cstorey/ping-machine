@@ -446,8 +446,10 @@ handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = d
 
       else do
           let toTry = Proto.aerLogHead aer
-          $(logDebugSH) ("Retry peer " , sender , " at : " , toTry)
-          return $ leader & set (followers . ix sender . prevIdx) toTry
+          $(logDebugSH) ("Retry peer " , sender , " at : " , toTry, "from", sentIdx)
+          return $ leader
+                    & set (followers . ix sender . prevIdx) toTry
+                    & set (followers . ix sender . lastSent) toTry
 
     findCommittedIndex :: HasCallStack => LeaderState resp -> ProtoStateMachine st req resp (Maybe Proto.LogIdx)
     findCommittedIndex st = do
