@@ -388,7 +388,7 @@ eventuallyElectsLeader = property $ do
   let h = hash $ show (allPeers, ts)
   let fname = "/tmp/prop_eventuallyElectsLeader_" ++ show n ++ "_" ++ show h
 
-  network <- simulateUntil allPeers nclients ts fname Bing bingBongModel $ not . Map.null . mconcat . map leadersOf
+  network <- simulateUntil allPeers nclients ts fname Bing bingBongModel isDone
 
   let allLeaders = leadersByTerm $ toList $ view allMessages network
 
@@ -397,6 +397,7 @@ eventuallyElectsLeader = property $ do
     assert $ Map.size allLeaders > 0
 
   where
+    isDone = not . Map.null . foldl' mappend mempty . fmap leadersOf . view allMessages
     leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
       -- let allLeaders = List.foldl' ... $
     leadersOf (MessageOut _mid sender (PeerRequest _ (AppendEntries aer) _)) =
@@ -413,7 +414,7 @@ eventuallyRepliesToClient = property $ do
   let h = hash $ show (allPeers, ts)
   let fname = "/tmp/prop_eventuallyRepliesToClient_" ++ show n ++ "_" ++ show h
 
-  network <- simulateUntil allPeers nclients ts fname Bing bingBongModel $ ((>0) . length . filter hasClientReply)
+  network <- simulateUntil allPeers nclients ts fname Bing bingBongModel isDone
 
   let responses = filter hasClientReply . toList $ view allMessages network
 
@@ -422,12 +423,13 @@ eventuallyRepliesToClient = property $ do
     assert $ length responses > 0
 
   where
+    isDone = (>0) . Seq.length . mfilter hasClientReply . view allMessages
     hasClientReply :: MessageEvent st req resp -> Bool
     hasClientReply (MessageOut _ _ (Reply _ (Right _))) = True
     hasClientReply _ = False
 
 simulateUntil :: (Show req, Show resp, Show st)
-              => PeerMap -> Int -> [Integer] -> String -> req -> Model st req resp -> ([MessageEvent st req resp] -> Bool) -> PropertyT IO (Network st req resp)
+              => PeerMap -> Int -> [Integer] -> String -> req -> Model st req resp -> (Network st req resp -> Bool) -> PropertyT IO (Network st req resp)
 simulateUntil allPeers nclients ts fname aCmd model enough = do
   footnoteShow $ "Logging to: " ++ fname
 
@@ -461,9 +463,9 @@ simulateUntil allPeers nclients ts fname aCmd model enough = do
           (t, p, ev) : rest -> do
             $(logDebugSH) ("Iterate at", t, p)
             simulateIteration t p ev
-            msgs <- toList <$> use allMessages
-            $(logDebugSH) ("enough", enough msgs)
-            if not (enough msgs)
+            net <- get
+            $(logDebugSH) ("enough", enough net)
+            if not (enough net)
             then do
               $(logDebugSH) ("Repeat at", t, p)
               runSched rest
