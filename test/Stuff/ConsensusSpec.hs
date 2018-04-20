@@ -190,6 +190,22 @@ data ProcessEvent =
   | Inbox
   deriving (Show, Eq, Ord)
 
+data SimulationConfig = SimulationConfig {
+  simName :: String
+, simNClients :: Int
+, simPeers :: PeerMap
+, simSchedule :: SystemSchedule
+} deriving (Show)
+
+instance Hashable SimulationConfig where
+  hashWithSalt salt v =
+    hashWithSalt salt
+         ( simName v
+         , simNClients v
+         , Bimap.toList $ simPeers v
+         )
+
+
 type ProcessSchedule = [(Integer, ProcessEvent)]
 newtype SystemSchedule = SystemSchedule (Map ProcessId [(Integer, ProcessEvent)])
   deriving (Show)
@@ -308,37 +324,6 @@ configs name numPeers scheduler = do
     sched <- scheduler $ nodeProcs mypeers <|> clientProcs cs
     return $ SimulationConfig name cs mypeers sched
 
-runSimulation :: (Show req, Show resp, Show st) => SimulationConfig -> req -> Model st req resp -> PropertyT IO (Network st req resp)
-runSimulation config aCmd model = do
-      let fname = logFileName config
-      footnoteShow $ "Logging to: " ++ fname
-
-      let SystemSchedule sched = simSchedule config
-      let byProc = map (\(p, s) -> map (\(t, e) -> (t, p, e)) $ toAbsTimes s) $ Map.toList sched :: [[(Integer,ProcessId,ProcessEvent)]]
-
-      let toRun = List.mergeAll byProc
-      -- footnoteShow toRun
-
-      assert $ List.length toRun == 0 || List.isSorted (map (\(t,_,_) -> t) toRun)
-
-      let network = networkOfConfig config model aCmd
-      evalIO $ do
-        runFileLoggingT fname $ do
-          $(logDebug) $ Text.pack $ ppShow ("config", config)
-        let simulation = forM_ toRun $ \(t, p, ev) -> simulateIteration t p ev
-        ((), network') <- State.runStateT (runFileLoggingT fname simulation) network
-        runFileLoggingT fname $ do
-          $(logDebug) $ Text.pack $ ppShow ("Network", network')
-        return network'
-
-  where
-    toAbsTimes :: [(Integer, a)] -> [(Integer, a)]
-    toAbsTimes byInterval =
-      let lefts = scanl (+) 0 $ map fst byInterval
-          rights = map snd byInterval
-      in
-      lefts `zip` rights
-
 
 prop_leaderElectionOnlyElectsOneLeaderPerTerm :: HasCallStack => Property
 prop_leaderElectionOnlyElectsOneLeaderPerTerm = leaderElectionOnlyElectsOneLeaderPerTerm
@@ -381,27 +366,6 @@ bongsAreMonotonic = property $ do
   where
     findResponse (ClientHistResponse _i _peer (Right val)) r = val : r
     findResponse _ r = r
-
-data SimulationConfig = SimulationConfig {
-  simName :: String
-, simNClients :: Int
-, simPeers :: PeerMap
-, simSchedule :: SystemSchedule
-} deriving (Show)
-
-instance Hashable SimulationConfig where
-  hashWithSalt salt v =
-    hashWithSalt salt
-         ( simName v
-         , simNClients v
-         , Bimap.toList $ simPeers v
-         )
-
-logFileName :: SimulationConfig -> String
-logFileName config = "/tmp/prop_" ++ simName config ++ "_" ++ show npeers ++ "_" ++ show h
-  where
-  npeers = (Bimap.size . simPeers $ config)
-  h = hash config
 
 eventuallyElectsLeader :: HasCallStack => Property
 eventuallyElectsLeader = property $ do
@@ -452,6 +416,42 @@ networkOfConfig config model aCmd =
   allClients = Map.fromList [(genClientName i, (ClientSim Nothing 0 aCmd Seq.empty)) | i <- [0..simNClients config] ]
   myclientMap = Bimap.fromList $ Map.keys allClients `zip` fmap IdFor [10000..]
 
+logFileName :: SimulationConfig -> String
+logFileName config = "/tmp/prop_" ++ simName config ++ "_" ++ show npeers ++ "_" ++ show h
+  where
+  npeers = (Bimap.size . simPeers $ config)
+  h = hash config
+
+runSimulation :: (Show req, Show resp, Show st) => SimulationConfig -> req -> Model st req resp -> PropertyT IO (Network st req resp)
+runSimulation config aCmd model = do
+      let fname = logFileName config
+      footnoteShow $ "Logging to: " ++ fname
+
+      let SystemSchedule sched = simSchedule config
+      let byProc = map (\(p, s) -> map (\(t, e) -> (t, p, e)) $ toAbsTimes s) $ Map.toList sched :: [[(Integer,ProcessId,ProcessEvent)]]
+
+      let toRun = List.mergeAll byProc
+      -- footnoteShow toRun
+
+      assert $ List.length toRun == 0 || List.isSorted (map (\(t,_,_) -> t) toRun)
+
+      let network = networkOfConfig config model aCmd
+      evalIO $ do
+        runFileLoggingT fname $ do
+          $(logDebug) $ Text.pack $ ppShow ("config", config)
+        let simulation = forM_ toRun $ \(t, p, ev) -> simulateIteration t p ev
+        ((), network') <- State.runStateT (runFileLoggingT fname simulation) network
+        runFileLoggingT fname $ do
+          $(logDebug) $ Text.pack $ ppShow ("Network", network')
+        return network'
+
+  where
+    toAbsTimes :: [(Integer, a)] -> [(Integer, a)]
+    toAbsTimes byInterval =
+      let lefts = scanl (+) 0 $ map fst byInterval
+          rights = map snd byInterval
+      in
+      lefts `zip` rights
 
 simulateUntil :: (Show req, Show resp, Show st)
               => SimulationConfig -> req -> Model st req resp -> (Network st req resp -> Bool) -> PropertyT IO (Network st req resp)
