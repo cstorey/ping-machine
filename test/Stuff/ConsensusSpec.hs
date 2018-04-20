@@ -58,11 +58,15 @@ newtype ClientName = ClientName String
   deriving (Show, Eq, Ord)
 
 genClientName :: Int -> ClientName
-genClientName n = ClientName pretty
+genClientName = ClientName . prettyName
+
+prettyName :: Int -> String
+prettyName n = pretty
   where
   pretty = List.unfoldr unf $ succ n
   unf i | i > 0 = Just (toEnum $ (fromEnum 'a') + mod i 26, div i 26)
   unf _  = Nothing
+
 
 type PeerMap = Bimap PeerName (IdFor PeerResponse)
 type ClientMap resp = Bimap ClientName (IdFor (ClientResponse resp))
@@ -216,13 +220,10 @@ ticksPerSecond = 1000
 eventsPerSecond :: Integer
 eventsPerSecond = 1
 
-aPeerName :: Gen PeerName
-aPeerName = PeerName <$> Gen.string (Range.linear 1 4) Gen.lower
-
 peers :: Int -> Gen (PeerMap)
 peers npeers = Bimap.fromList <$> (zip <$> names <*> (map (IdFor . hash) <$> names))
   where
-    possibleNames = pure $ map (PeerName . show) ([0..] :: [Integer])
+    possibleNames = pure $ map (PeerName . prettyName) [0..]
     names = take <$> Gen.int (Range.singleton npeers) <*> possibleNames
 
 processSchedule :: Gen ProcessSchedule
