@@ -110,6 +110,7 @@ data Network st req resp = Network {
 , _clients :: Map ClientName (ClientSim req)
 , _idCounter :: Int
 , _clientMap :: ClientMap resp
+, _peerMapping :: PeerMap
 } deriving (Show)
 
 makeLenses ''NodeSim
@@ -123,17 +124,19 @@ makeNode allPeers self elTimeout model = NodeSim newnodeEnv mkRaftState Seq.empt
     names = Set.fromList $ Bimap.keys allPeers
 
 
-applyState :: (HasCallStack, Show req, Show resp) => Bimap PeerName (IdFor PeerResponse) -> InboxItem st req resp -> ProtoStateMachine st req resp ()
-applyState _ (ClockTick t) = do
-  processTick () $ Tick t
+applyState :: (HasCallStack, Show req, Show resp, MonadState (Network st req resp) m)
+           => InboxItem st req resp
+           -> m (ProtoStateMachine st req resp ())
+applyState (ClockTick t) = do
+  pure $ processTick () $ Tick t
 
-applyState allPeers (RequestFromPeer sender req) = do
-  processPeerRequestMessage req $ peerIdOfName allPeers sender
+applyState (RequestFromPeer sender req) = do
+  (processPeerRequestMessage req <$> peerIdOfName sender)
 
-applyState _ (ResponseFromPeer _sender (WaitingCallback f) resp) = f resp
+applyState (ResponseFromPeer _sender (WaitingCallback f) resp) = pure $ f resp
 
-applyState _ (ClientRequest rid cmd) = do
-  processClientReqRespMessage cmd rid
+applyState (ClientRequest rid cmd) = do
+  pure $ processClientReqRespMessage cmd rid
 
 -- applyState other = error $ "applyState: " ++ show other
 
@@ -294,14 +297,14 @@ runSimulation allPeers nclients ts (SystemSchedule sched) aCmd model fname = do
 
       assert $ List.length toRun == 0 || List.isSorted (map (\(t,_,_) -> t) toRun)
 
-      let network = Network allNodes allClients 0 myclientMap
+      let network = Network allNodes allClients 0 myclientMap allPeers
       evalIO $ do
         runFileLoggingT fname $ do
           $(logDebug) $ Text.pack $ ppShow ("allPeers", allPeers)
           $(logDebug) $ Text.pack $ ppShow ("timeouts", ts)
           $(logDebug) $ Text.pack $ ppShow ("sched", sched)
         let simulation = forM toRun $ \(t, p, ev) -> do
-              msgs <- simulateIteration allPeers t p ev
+              msgs <- simulateIteration t p ev
               return msgs
         (msgs, network') <- State.runStateT (runFileLoggingT fname simulation) network
         runFileLoggingT fname $ do
@@ -440,7 +443,7 @@ simulateUntil allPeers nclients ts fname aCmd model enough = do
   let toRun = List.takeWhile (\(t, _, _) -> t < ticksPerSecond * simLength ) $ List.mergeAll byProc
   assert $ List.length toRun == 0 || List.isSorted (map (\(t,_,_) -> t) toRun)
 
-  let network = Network allNodes allClients 0 myclientMap
+  let network = Network allNodes allClients 0 myclientMap allPeers
   debugp <- evalIO $ do
     maybe False (/= "") <$> Env.lookupEnv "STUFF_DEBUG"
 
@@ -453,7 +456,7 @@ simulateUntil allPeers nclients ts fname aCmd model enough = do
     let runSched l = case l of
           (t, p, ev) : rest -> do
             $(logDebugSH) ("Iterate at", t, p)
-            msgs <- simulateIteration allPeers t p ev
+            msgs <- simulateIteration t p ev
             $(logDebugSH) ("msgs", msgs)
             $(logDebugSH) ("enough", enough msgs)
             if not (enough msgs)
@@ -499,24 +502,24 @@ nextId :: MonadState (Network st req resp) m => m (IdFor a)
 nextId = IdFor <$> (idCounter <<%= succ)
 
 simulateIteration :: forall m st req resp . (HasCallStack, MonadLogger m, MonadState (Network st req resp) m, Show req, Show resp)
-                  => PeerMap
-                  -> Integer
+                  => Integer
                   -> ProcessId
                   -> ProcessEvent
                   -> m [MessageEvent st req resp]
-simulateIteration _ n (Node name) Clock = do
+simulateIteration n (Node name) Clock = do
     let t = n % ticksPerSecond
     mid <- nextId
     $(logDebugSH) ("Clock", name, t)
     (nodes . ix name . nodeInbox) %= (|> (mid, ClockTick t))
     return []
 
-simulateIteration allPeers _t (Node name) Inbox = do
-    simulateStep allPeers name
+simulateIteration _t (Node name) Inbox = do
+    simulateStep name
 
-simulateIteration allPeers n (Client i) Clock = do
+simulateIteration n (Client i) Clock = do
     rid <- clientIdOfName i
-    r <- zoomClient i (widget rid)
+    allPeers <- use peerMapping
+    r <- zoomClient i (widget allPeers rid)
     case r of
       Just  (peer, req) -> do
         mid <- nextId
@@ -528,14 +531,14 @@ simulateIteration allPeers n (Client i) Clock = do
         return []
 
   where
-    widget :: forall m' . MonadState (ClientSim req) m' => IdFor (ClientResponse resp) -> m' (PeerName, (InboxItem st req resp))
-    widget rid = do
+    widget :: forall m' . MonadState (ClientSim req) m' => PeerMap -> IdFor (ClientResponse resp) -> m' (PeerName, (InboxItem st req resp))
+    widget allPeers rid = do
       cmd <- use (newCommand)
       lastSeen <- use (lastSeenLeader)
       let peer = fromMaybe (Bimap.keys allPeers !!  (fromInteger n `mod` Bimap.size allPeers)) lastSeen
       return (peer, ClientRequest rid cmd)
 
-simulateIteration _allPeers _n (Client _) Inbox = return []
+simulateIteration _n (Client _) Inbox = return []
 
 zoomClient :: (MonadState (Network st req resp) m) => ClientName -> State.StateT (ClientSim req) m a -> m (Maybe a)
 zoomClient i action = do
@@ -554,16 +557,16 @@ getQuiesecent name = do
   return $ all Seq.null $ inboxes
 
 
-simulateStep :: forall st req resp m . (Show req, Show resp, HasCallStack, MonadLogger m, MonadState (Network st req resp) m) => PeerMap -> PeerName -> m [MessageEvent st req resp]
-simulateStep allPeers thisNode = do
+simulateStep :: forall st req resp m . (Show req, Show resp, HasCallStack, MonadLogger m, MonadState (Network st req resp) m) => PeerName -> m [MessageEvent st req resp]
+simulateStep thisNode = do
   node <- fromMaybe (error $ "No node: " ++ show thisNode) <$> preview (nodes . ix thisNode) <$> get :: m (NodeSim st req resp)
   let inbox = view nodeInbox node :: Seq (IdFor (MessageEvent st req resp), InboxItem st req resp)
   nodes . ix thisNode . nodeInbox .= Seq.empty
 
   $(logDebugSH) ("Run", thisNode, inbox)
-  let actions = flip traverse_ inbox $ \(mid, action) -> do
-                  $(logDebugSH) ("apply", thisNode, mid, action)
-                  applyState allPeers action
+  psmActions <- flip traverse inbox $ \(_, action) -> do applyState action
+
+  let actions = traverse_ id psmActions
 
   let (((), s', toSend), logs) = Identity.runIdentity $
                                  Logger.runWriterLoggingT $
@@ -596,7 +599,7 @@ simulateStep allPeers thisNode = do
           $(logDebugSH) (unPeerName thisNode, "post sendPeerRequest", "num pending callbacks", fmap Seq.length p)
 
   sendPeerReply mid peerId m = do
-        let dst = nameOfPeerId allPeers peerId
+        dst <- nameOfPeerId peerId
         $(logDebugSH) (unPeerName dst, "<-", unPeerName thisNode, "PeerReply", m)
 
         do
@@ -627,12 +630,15 @@ simulateStep allPeers thisNode = do
         st <- use (clients . at dst)
         $(logDebugSH) (thisNode, clientId, "sendClientReply", m, st)
 
-nameOfPeerId :: HasCallStack => PeerMap -> IdFor PeerResponse -> PeerName
-nameOfPeerId m name =
-  maybe (error $ "peer Not found: " ++ show name) id $ Bimap.lookupR name m
+nameOfPeerId :: (HasCallStack, MonadState (Network st req resp) m) => IdFor PeerResponse -> m PeerName
+nameOfPeerId name = do
+  m <- use peerMapping
+  return $ maybe (error $ "peer Not found: " ++ show name) id $ Bimap.lookupR name m
 
-peerIdOfName :: PeerMap -> PeerName -> IdFor PeerResponse
-peerIdOfName m name = m Bimap.! name
+peerIdOfName :: (HasCallStack, MonadState (Network st req resp) m) => PeerName -> m (IdFor PeerResponse)
+peerIdOfName name = do
+  m <- use peerMapping
+  return $ m Bimap.! name
 
 nameOfClientId :: (HasCallStack, MonadState (Network st req resp) m) => IdFor (ClientResponse resp) -> m ClientName
 nameOfClientId name = do
