@@ -2,6 +2,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Stuff.RaftModel
 ( ProcessorMessage(..)
@@ -25,13 +26,15 @@ import qualified Control.Monad.Trans.RWS.Strict as RWS
 import           Control.Monad.Writer.Class (MonadWriter(..))
 import           Control.Monad.State.Class (MonadState(..))
 import           Control.Monad.Reader.Class (MonadReader(..))
+import           Control.Monad.Trans.State.Strict (State)
+import qualified Control.Monad.Trans.State.Strict as State
 import           Control.Monad.Logger (WriterLoggingT, MonadLogger, logDebug, logDebugSH, logWarnSH, logInfoSH)
 import qualified Data.Map as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Maybe as Maybe
 import qualified Data.List as List
-import Data.Foldable (foldl')
+import Data.Tuple (swap)
 import Control.Monad
 import Data.Functor.Identity (Identity)
 import Lens.Micro.Platform
@@ -192,6 +195,7 @@ newFollower = Follower $ FollowerState 0
 mkRaftState :: RaftState req resp
 mkRaftState = RaftState newFollower 0 Map.empty Nothing 0 Nothing
 
+-- Log operations
 appendToLog :: req -> ProtoStateMachine st req resp Proto.LogIdx
 appendToLog command = do
     thisTerm <- use currentTerm
@@ -200,6 +204,61 @@ appendToLog command = do
     let idx = succIdx logIdx
     logEntries %= Map.insert idx entry
     return idx
+
+getPrevLogTermIdx :: HasCallStack => ProtoStateMachine st req resp (Proto.Term, Proto.LogIdx)
+getPrevLogTermIdx = do
+    myLog <- use logEntries
+    return $ maybe (0, Proto.LogIdx $ Nothing) (\(idx, it) -> (Proto.logTerm it, idx)) $ Map.lookupMax myLog
+
+readLogEntry :: MonadState (RaftState req resp) m
+             => Proto.LogIdx
+             -> m (Maybe (Proto.LogEntry req))
+readLogEntry assumedHeadIdx = Map.lookup assumedHeadIdx <$> use logEntries
+
+appendLogAfter :: (MonadLogger m, Show req,
+                   MonadReader (ProtocolEnv st req resp) m,
+                   MonadState (RaftState req resp) m) =>
+                  Proto.LogIdx -> Map.Map Proto.LogIdx (Proto.LogEntry req) -> m ()
+
+appendLogAfter assumedHeadIdx newEntries = do
+  entries <- use logEntries
+  let prefix   = Map.takeWhileAntitone (<= assumedHeadIdx) entries
+  $(logDebug) $ Text.pack (
+      "Map.takeWhileAntitone (<= " ++ show assumedHeadIdx ++ ") " ++ show entries
+      ++ " => " ++ show prefix)
+
+  self <- view selfId
+  $(logDebugSH) (
+      Proto.unPeerName self,
+      "Have", map Proto.unLogIdx $ Map.keys entries,
+      "new prefix", map Proto.unLogIdx $ Map.keys prefix,
+      "adding", map Proto.unLogIdx $ Map.keys newEntries)
+  let entries' = Map.union prefix newEntries
+
+  $(logDebugSH) ( Proto.unPeerName self, "Now", map Proto.unLogIdx $ Map.keys entries')
+  logEntries .= entries'
+
+
+readLogUptoInclusive :: MonadState (RaftState req resp) m =>
+                                   Proto.LogIdx
+                                   -> m (Map.Map Proto.LogIdx (Proto.LogEntry req))
+readLogUptoInclusive reqIdx = do
+  prev <- Map.takeWhileAntitone (<= reqIdx) <$> use logEntries
+  pure prev
+
+readItemsAfter :: (MonadLogger m,
+                         MonadState (RaftState req resp) m) =>
+                        Proto.LogIdx -> m (Map.Map Proto.LogIdx (Proto.LogEntry req))
+readItemsAfter peerLastSent = do
+        entries <- use logEntries
+        -- Send everything _after_ their previous index
+        let toSend = Map.dropWhileAntitone (<= peerLastSent) entries
+        $(logDebugSH) ("sendingitems", Map.size toSend, "out of", Map.size entries)
+        return toSend
+
+
+
+-- handlers
 
 processClientReqRespMessage :: (Show req, Show resp) => req -> IdFor (Proto.ClientResponse resp) -> ProtoStateMachine st req resp ()
 processClientReqRespMessage command pendingResponse = do
@@ -259,11 +318,6 @@ stepDown = do
     let role' = Follower $ st
     currentRole .= role'
     return st
-
-getPrevLogTermIdx :: HasCallStack => ProtoStateMachine st req resp (Proto.Term, Proto.LogIdx)
-getPrevLogTermIdx = do
-    myLog <- use logEntries
-    return $ maybe (0, Proto.LogIdx $ Nothing) (\(idx, it) -> (Proto.logTerm it, idx)) $ Map.lookupMax myLog
 
 getMajority :: HasCallStack => ProtoStateMachine st req resp Int
 getMajority = do
@@ -342,12 +396,10 @@ processPeerRequestMessage
             currentRole .= Follower follower'
 
             (_prevTerm, logHeadIdx) <- getPrevLogTermIdx
-            entries <- use logEntries
-
-            let myEntry = Map.lookup assumedHeadIdx entries
+            myEntry <- readLogEntry assumedHeadIdx
             case Proto.logTerm <$> myEntry of
                 Just n | n /= assumedHeadTerm -> do
-                    $(logDebugSH) ("Refusing as prev item was", myEntry, "wanted term", assumedHeadTerm)
+                    -- $(logDebugSH) ("Refusing as prev item was", myEntry, "wanted term", assumedHeadTerm)
                     refuseAppendEntries thisTerm logHeadIdx
                 -- We need to refuse here iff it's ahead of our log
                 Nothing | assumedHeadIdx > logHeadIdx -> do
@@ -355,23 +407,14 @@ processPeerRequestMessage
                     refuseAppendEntries thisTerm logHeadIdx
                 _ -> do
                     $(logDebugSH) ("Appending from ", assumedHeadIdx, "was", logHeadIdx)
-                    let prefix   = Map.takeWhileAntitone (<= assumedHeadIdx) entries
-                    $(logDebug) $ Text.pack (
-                        "Map.takeWhileAntitone (<= " ++ show assumedHeadIdx ++ ") " ++ show entries
-                        ++ " => " ++ show prefix)
-                    self <- view selfId
-                    $(logDebugSH) (
-                        Proto.unPeerName self, thisTerm,
-                        "Have", map Proto.unLogIdx $ Map.keys entries,
-                        "new prefix", map Proto.unLogIdx $ Map.keys prefix,
-                        "adding", map Proto.unLogIdx $ Map.keys newEntries)
-                    let entries' = Map.union prefix newEntries
 
-                    $(logDebugSH) ( Proto.unPeerName self, thisTerm, "Now", map Proto.unLogIdx $ Map.keys entries')
-                    logEntries .= entries'
+                    appendLogAfter assumedHeadIdx newEntries
                     currentLeader .= Just leaderName
+
                     (_prevTerm, newLogHead) <- getPrevLogTermIdx
+
                     ackAppendEntries thisTerm newLogHead
+
 
 handleVoteResponse :: HasCallStack => Proto.RequestVoteReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine st req resp ()
 handleVoteResponse req sender _msg@(Proto.VoteResult peerTerm granted) = do
@@ -477,12 +520,18 @@ handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = d
 
         return $ leader & set pendingClientRequests unCommitted
 
+    asState :: (Models.Model st req resp) -> (Proto.LogEntry req -> State st resp)
+    asState m item = State.state update
+      where
+      update st = swap $ Models.modelStep m st $ Proto.logValue item
+
     responseToEntries :: Proto.LogIdx -> ProtoStateMachine st req resp resp
     responseToEntries reqIdx = do
-      (prev, evp, _) <- Map.splitLookup reqIdx <$> use logEntries
+      prev <- Map.elems <$> readLogUptoInclusive reqIdx
       m <- view model
-      let st = foldl' (\s -> fst . Models.modelStep m s . Proto.logValue) (Models.modelInit m) $ Map.elems prev
-      let (_, r) = Models.modelStep m st $ Proto.logValue $ maybe (error $ "No item at " ++ show reqIdx) id evp
+      let (rs, _) = flip State.runState (Models.modelInit m) $ mapM (asState m) prev
+      -- let st = foldl' (\s -> fst . Models.modelStep m s . Proto.logValue) (Models.modelInit m) $ Map.elems prev
+      let r = last rs
       return r
 
 handleAppendEntriesResponse _ req sender _msg = do
@@ -576,17 +625,15 @@ replicatePendingEntriesToFollowers leader = do
         (logTerm, logIdx) <- getPrevLogTermIdx
         let peerState = maybe (LeaderFollowerState logIdx logIdx) id $ preview (followers . ix peer) st
         let peerLastSent = view lastSent peerState
-        entries <- use logEntries
-        let peerPrevTerm = maybe logTerm Proto.logTerm $ Map.lookup peerLastSent entries
-        -- Send everything _after_ their previous index
-        let toSend = Map.dropWhileAntitone (<= peerLastSent) entries
-        $(logDebugSH) ("sendingitems", Map.size toSend, "out of", Map.size entries)
+
+        peerPrevTerm <- maybe logTerm Proto.logTerm <$> readLogEntry peerLastSent
+        toSend <- readItemsAfter peerLastSent
+
         let sentIdx = maybe peerLastSent fst $ Map.lookupMax $ toSend
         sendAppendEntriesRequest sentIdx peer $ Proto.AppendEntriesReq thisTerm myId peerPrevTerm peerLastSent toSend
         $(logDebugSH) ("post send to", peer, "lastSent", sentIdx)
         let peerState' = peerState & set lastSent sentIdx
         return $ st & over followers (Map.insert peer peerState')
-
 
 sendAppendEntriesRequest :: (HasCallStack, Show req)
                          => Proto.LogIdx -> Proto.PeerName -> Proto.AppendEntriesReq req -> ProtoStateMachine st req resp ()
