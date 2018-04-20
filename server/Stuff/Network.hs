@@ -1,3 +1,4 @@
+{-# LANGUAGE ScopedTypeVariables #-}
 module Stuff.Network
 ( withOutgoing
 , withReqRespListener
@@ -30,9 +31,9 @@ oneSecondMicroSeconds = 1000000
 
 
 -- Supervisor
-withOutgoing :: (Binary req, Show req)
+withOutgoing :: forall req resp a . (Binary req, Show req, Binary resp, Show resp)
             => [Proto.PeerName]
-            -> (Outgoing req r -> IO a)
+            -> (Outgoing req resp -> IO a)
             -> IO a
 withOutgoing seedPeers rest = do
     -- "Responses"
@@ -48,6 +49,7 @@ withOutgoing seedPeers rest = do
       rest $ outgoing
 
     where
+    go :: Outgoing req resp -> STM.TVar (Map.Map (Async.Async ()) Proto.PeerName) -> IO ()
     go (Outgoing peers peerRespQ) processes = void $ forever $ do
         runningProcesses <- Map.elems <$> STM.readTVarIO processes
         let toStart = (seedPeers \\ runningProcesses)
@@ -85,13 +87,13 @@ connect addr = do
     Trace.trace ("Connected " ++ show sock ++ " to "  ++ show addr) $ return ()
     return sock
 
-runPeer :: (Binary.Binary req, Show req, Binary.Binary resp, Show resp)
-        => OutgoingReqQ req resp r -> STM.TQueue r -> Proto.PeerName -> IO ()
+runPeer :: forall req resp . (Binary.Binary req, Show req, Binary.Binary resp, Show resp)
+        => OutgoingReqQ req resp -> STM.TQueue (Proto.PeerName, resp) -> Proto.PeerName -> IO ()
 runPeer toPeerQ fromPeerQ name = do
     Trace.trace ("lookup peer " ++ show name) $ return ()
     addrInfo <- resolve $ Proto.unPeerName name
     Trace.trace ("initiate open " ++ show name) $ return ()
-    (is, os) <- streamsOf =<< connect addrInfo
+    (is, os) <- streamsOf =<< connect addrInfo :: IO (Streams.InputStream resp, Streams.OutputStream req)
 
     Trace.trace ("Talking to peer " ++ show name) $ return ()
     processOutgoingConnection toPeerQ fromPeerQ name (is, os)
@@ -136,8 +138,8 @@ runAcceptor newId handler listener = go
                 E.bracket (streamsOf client) (const $ S.close client) (handler n)
 
 processOutgoingConnection :: (Show xid, Show req, Show resp) =>
-       OutgoingReqQ req resp r
-    -> STM.TQueue r
+       OutgoingReqQ req resp
+    -> STM.TQueue (xid, resp)
     -> xid
     -> (Streams.InputStream resp, Streams.OutputStream req)
     -> IO ()
@@ -149,8 +151,7 @@ processOutgoingConnection reqQ respQ clientId (is, os) = do
     where
     requests pendingResponses = do
         msg <- STM.atomically $ do
-          (msg, k) <- STM.readTQueue reqQ
-          STM.writeTQueue pendingResponses k
+          msg <- STM.readTQueue reqQ
           return msg
 
         when False $ putStrLn $ "-> " ++ show clientId ++ ":" ++ show msg
@@ -164,8 +165,7 @@ processOutgoingConnection reqQ respQ clientId (is, os) = do
             Just msg -> do
                 when False $ putStrLn $ "<- " ++ show clientId ++ ":" ++ show msg
                 STM.atomically $ do
-                  k <- STM.readTQueue pendingResponses
-                  STM.writeTQueue respQ $ k msg
+                  STM.writeTQueue respQ (clientId, msg)
                 responses pendingResponses
             Nothing -> error $ "Well, I'm done: " ++ show clientId
 

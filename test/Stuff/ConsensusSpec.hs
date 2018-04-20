@@ -52,8 +52,6 @@ import Stuff.Proto
 import Stuff.Models
 import Stuff.Types
 
-newtype WaitingCallback st req resp = WaitingCallback (PeerResponse -> ProtoStateMachine st req resp ())
-
 newtype ClientName = ClientName String
   deriving (Show, Eq, Ord)
 
@@ -71,20 +69,12 @@ prettyName n = pretty
 type PeerMap = Bimap PeerName (IdFor PeerResponse)
 type ClientMap resp = Bimap ClientName (IdFor (ClientResponse resp))
 
-instance Show (WaitingCallback st req resp) where
-  show _ = "WaitingCallback"
-
 data InboxItem st req resp =
     RequestFromPeer PeerName (PeerRequest req)
-  | ResponseFromPeer PeerName (WaitingCallback st req resp) PeerResponse
+  | ResponseFromPeer PeerName PeerResponse
   | ClockTick Time
   | ClientRequest (IdFor (ClientResponse resp)) req
-
-instance (Show req) => Show (InboxItem st req resp) where
-  show (RequestFromPeer name req) = "RequestFromPeer " ++ show name ++ " " ++ show req
-  show (ResponseFromPeer name _ resp) = "ResponseFromPeer " ++ show name ++ " WaitingCallback " ++ show resp
-  show (ClockTick t) = "ClockTick " ++ show t
-  show (ClientRequest rid req) = "ClientRequest " ++ show rid ++ " " ++ show req
+  deriving (Show)
 
 -- The IdFor fields for MessageOut should match the matching MessageIn
 data MessageEvent st req resp =
@@ -96,7 +86,6 @@ data NodeSim st req resp = NodeSim {
   _nodeEnv :: ProtocolEnv st req resp
 , _nodeState :: !(RaftState req resp)
 , _nodeInbox :: Seq (IdFor (MessageEvent st req resp), (InboxItem st req resp))
-, _nodePendingResponses :: Map PeerName (Seq (WaitingCallback st req resp))
 } deriving (Show)
 
 data ClientSim req resp = ClientSim {
@@ -126,7 +115,7 @@ makeLenses ''ClientSim
 makeLenses ''Network
 
 makeNode :: PeerMap -> PeerName -> Time -> Model st req resp -> NodeSim st req resp
-makeNode allPeers self elTimeout model = NodeSim newnodeEnv mkRaftState Seq.empty Map.empty
+makeNode allPeers self elTimeout model = NodeSim newnodeEnv mkRaftState Seq.empty
   where
     newnodeEnv = mkProtocolEnv self (Set.difference names $ Set.singleton self) elTimeout (elTimeout / 3.0) model
     names = Set.fromList $ Bimap.keys allPeers
@@ -141,7 +130,7 @@ applyState (ClockTick t) = do
 applyState (RequestFromPeer sender req) = do
   (processPeerRequestMessage req <$> peerIdOfName sender)
 
-applyState (ResponseFromPeer _sender (WaitingCallback f) resp) = pure $ f resp
+applyState (ResponseFromPeer sender resp) = pure $ processPeerResponseMessage sender resp
 
 applyState (ClientRequest rid cmd) = do
   pure $ processClientReqRespMessage cmd rid
@@ -324,6 +313,12 @@ configs name numPeers scheduler = do
     sched <- scheduler $ nodeProcs mypeers <|> clientProcs cs
     return $ SimulationConfig name cs mypeers sched
 
+leadersByTerm ::  Seq (MessageEvent Int BingBongReq BingBongRet) -> Map Term (Set.Set PeerName)
+leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ fmap leadersOf events
+leadersOf :: MessageEvent st1 req1 resp1 -> Map Term (Set.Set PeerName)
+leadersOf (MessageOut _mid sender (PeerRequest _ (AppendEntries aer))) =
+    Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
+leadersOf _ = Map.empty
 
 prop_leaderElectionOnlyElectsOneLeaderPerTerm :: HasCallStack => Property
 prop_leaderElectionOnlyElectsOneLeaderPerTerm = leaderElectionOnlyElectsOneLeaderPerTerm
@@ -333,18 +328,13 @@ leaderElectionOnlyElectsOneLeaderPerTerm = property $ do
       config <- forAll $ configs "leaderElectionOnlyElectsOneLeaderPerTerm" (Range.linear 2 23) randomSchedule
       network <- runSimulation config Bing bingBongModel
 
+      let _ = view allMessages network :: Seq (MessageEvent Int BingBongReq BingBongRet)
       let allLeaders = leadersByTerm $ view allMessages network
 
       test $ do
         footnoteShow $ ("Leaders by term", allLeaders)
         forM_ (Map.toList allLeaders) $ \(_term, leaders) -> do
           assert $ 1 >= Set.size leaders
-
-  where
-      leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ fmap leadersOf events
-      leadersOf (MessageOut _mid sender (PeerRequest _ (AppendEntries aer) _)) =
-          Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
-      leadersOf _ = Map.empty
 
 prop_bongsAreMonotonic :: HasCallStack => Property
 prop_bongsAreMonotonic = bongsAreMonotonic
@@ -375,7 +365,7 @@ eventuallyElectsLeader = property $ do
 
   network <- simulateUntil config Bing bingBongModel isDone
 
-  let allLeaders = leadersByTerm $ toList $ view allMessages network
+  let allLeaders = leadersByTerm $ view allMessages network
 
   test $ do
     footnoteShow $ ("Leaders by term", allLeaders)
@@ -383,11 +373,6 @@ eventuallyElectsLeader = property $ do
 
   where
     isDone = not . Map.null . foldl' mappend mempty . fmap leadersOf . view allMessages
-    leadersByTerm events = foldl' (Map.unionWith Set.union) Map.empty $ map leadersOf events
-      -- let allLeaders = List.foldl' ... $
-    leadersOf (MessageOut _mid sender (PeerRequest _ (AppendEntries aer) _)) =
-        Map.singleton (aeLeaderTerm aer) $ Set.singleton sender
-    leadersOf _ = Map.empty
 
 eventuallyRepliesToClient :: HasCallStack => Property
 eventuallyRepliesToClient = property $ do
@@ -593,7 +578,7 @@ simulateStep thisNode = do
   outs <- forM toSend $ \msg -> do
     mid <- nextId
     case msg of
-      PeerRequest dst m cb -> sendPeerRequest mid dst m cb
+      PeerRequest dst m -> sendPeerRequest mid dst m
       PeerReply peerId m -> sendPeerReply mid peerId m
       Reply clientId m -> sendClientReply clientId m
     return $ MessageOut mid thisNode msg
@@ -603,32 +588,15 @@ simulateStep thisNode = do
   where
 
 
-  sendPeerRequest mid dst m cb= do
+  sendPeerRequest mid dst m = do
         $(logDebugSH) (unPeerName thisNode, "->", unPeerName dst, "PeerRequest", m)
         nodes . ix dst . nodeInbox %= (|> (mid, RequestFromPeer thisNode m))
-        nodes . ix thisNode . nodePendingResponses %= (Map.insertWith (flip mappend) dst $ Seq.singleton $ WaitingCallback cb)
-        do
-          p <-  use $ nodes . ix thisNode . nodePendingResponses
-          $(logDebugSH) (unPeerName thisNode, "post sendPeerRequest", "num pending callbacks", fmap Seq.length p)
 
   sendPeerReply mid peerId m = do
         dst <- nameOfPeerId peerId
         $(logDebugSH) (unPeerName dst, "<-", unPeerName thisNode, "PeerReply", m)
 
-        do
-          p <-  use $ nodes . ix dst . nodePendingResponses
-          $(logDebugSH) (unPeerName dst, "pre sendPeerReply", "num pending callbacks", fmap Seq.length p)
-
-        pendingCb <- use (nodes . ix dst . nodePendingResponses . ix thisNode)
-        case Seq.viewl pendingCb of
-          Seq.EmptyL -> error "No waiting callback?"
-          cb :< rest -> do
-            (nodes . ix dst . nodePendingResponses . ix thisNode)  .= rest
-            nodes . ix dst . nodeInbox %= (|> (mid, ResponseFromPeer thisNode cb m))
-        do
-          p <-  use $ nodes . ix dst . nodePendingResponses
-          $(logDebugSH) (unPeerName dst, "post sendPeerReply", "num pending callbacks", fmap Seq.length p)
-        return ()
+        nodes . ix dst . nodeInbox %= (|> (mid, ResponseFromPeer thisNode m))
 
   sendClientReply clientId m@(Left (NotLeader leaderp)) = do
         dst <- nameOfClientId clientId

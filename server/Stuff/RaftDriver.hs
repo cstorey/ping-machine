@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Stuff.RaftDriver
 ( runModel
@@ -42,7 +43,7 @@ data Driver st req resp = Driver {
 , driverLogs                   :: STM.TVar [LogLine]
 , driverPendingClientResponses :: STMPendingRespMap (Proto.ClientResponse resp)
 --, driverPeerOuts               :: STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse (ProtoStateMachine st req resp ())
-, driverOutgoing               :: Outgoing req (ProtoStateMachine st req resp ())
+, driverOutgoing               :: Outgoing req resp
 , driverPendingPeerResponses   :: STMPendingRespMap Proto.PeerResponse
 , driverClients                :: Listener req (Proto.ClientResponse resp)
 , driverPeers                  :: Listener (Proto.PeerRequest req) Proto.PeerResponse
@@ -53,9 +54,9 @@ data Listener req resp = Listener {
   listenerRequests :: RequestsQ req resp
 }
 
-data Outgoing req r = Outgoing {
-  outgoingPeers :: STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse r
-, outgoingResponses :: STM.TQueue r
+data Outgoing req resp = Outgoing {
+  outgoingPeers :: STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse
+, outgoingResponses :: STM.TQueue (Proto.PeerName, Proto.PeerResponse)
 }
 
 nextIds :: STM.TVar Int
@@ -73,7 +74,7 @@ runModel :: (Show req, Show resp)
             -> Listener req (Proto.ClientResponse resp)
             -> Listener (Proto.PeerRequest req) Proto.PeerResponse
             -> Ticker
-            -> Outgoing req (ProtoStateMachine st req resp ())
+            -> Outgoing req resp
             -> Models.Model st req resp
             -> IO ()
 runModel myName clients peers ticker outgoing model = do
@@ -111,7 +112,7 @@ run self = forever $ do
                                 outputs <- processClientMessage <|> processPeerRequest <|> processTickMessage <|> processPeerResponse
                                 sendMessages (driverPendingClientResponses self) (outgoingPeers $ driverOutgoing self) (driverPendingPeerResponses self) outputs
 
-    logFromVar logVar = do 
+    logFromVar logVar = do
           logs <- lift $ STM.atomically $ STM.swapTVar logVar []
           forM_ logs $ \(loc, src, lvl, s) -> Logger.monadLoggerLog loc src lvl s
 
@@ -133,11 +134,15 @@ tickerSTM self = go
     snd <$> (processActions self $ processTick () m)
 
 
-processRespMessageSTM :: Driver st req resp
+processRespMessageSTM :: forall st req resp . (Show req)
+                      => Driver st req resp
                       -> LoggedSTM [ProcessorMessage st req resp]
 processRespMessageSTM self = do
-    action <- lift . STM.readTQueue . outgoingResponses . driverOutgoing $ self
-    snd <$> processActions self action
+
+    (sender, msg) <- lift . STM.readTQueue $ outgoingResponses . driverOutgoing $ self
+    let act = processPeerResponseMessage sender msg
+    ((), msgs) <- processActions self $ act
+    pure msgs
 
 processReqRespMessageSTM :: Driver st req resp
                   -> STMPendingRespMap outs
@@ -153,7 +158,7 @@ processReqRespMessageSTM self pendingResponses listener process = do
 
 sendMessages :: (Show resp)
              => STMPendingRespMap (Proto.ClientResponse resp)
-             -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse (ProtoStateMachine st req resp ())
+             -> STMReqChanMap Proto.PeerName (Proto.PeerRequest req) Proto.PeerResponse
              -> STMPendingRespMap Proto.PeerResponse
              -> [ProcessorMessage st req resp]
              -> STM.STM ()
@@ -162,7 +167,7 @@ sendMessages pendingClientResponses peerRequests pendingPeerResponses toSend = d
                 case msg' of
                     Reply respId reply -> sendPendingReply pendingClientResponses respId reply
                     PeerReply respId reply -> sendPendingReply pendingPeerResponses respId reply
-                    PeerRequest peerName req k -> sendRequest peerRequests peerName req k
+                    PeerRequest peerName req -> sendRequest peerRequests peerName req
     where
         sendPendingReply mapping respId reply = do
           mvarp <- Map.lookup respId <$> STM.readTVar mapping
@@ -171,11 +176,11 @@ sendMessages pendingClientResponses peerRequests pendingPeerResponses toSend = d
               Just mvar -> STM.putTMVar mvar reply
               Nothing -> error $ "No mvar for response id " ++ show respId ++ " : " ++ show reply
 
-        sendRequest mapping xid msg k = do
+        sendRequest mapping xid msg = do
             queuep <- Map.lookup xid <$> STM.readTVar mapping
             case queuep of
                 Just q -> do
-                  STM.writeTQueue q $ (msg, k)
+                  STM.writeTQueue q $ msg
                 Nothing -> error "what?"
 
 processActions :: Driver st req resp -> ProtoStateMachine st req resp a -> LoggedSTM (a, [ProcessorMessage st req resp])
@@ -187,7 +192,7 @@ processActions self actions = do
   lift $ STM.writeTVar stateRef s'
   return (a, toSend)
   where
-  stateRef = (driverState self) 
+  stateRef = (driverState self)
   envSTM = (driverProtocolEnv self)
 
 

@@ -14,6 +14,7 @@ module Stuff.RaftModel
 , IdFor(..)
 , processClientReqRespMessage
 , processPeerRequestMessage
+, processPeerResponseMessage
 , processTick
 , mkRaftState
 )
@@ -49,63 +50,6 @@ newtype IdFor a = IdFor Int
     deriving (Show, Eq, Ord, Generic)
 
 instance Hashable (IdFor a)
-
-{-
-
-Suspicions
-We need to be able to inform the model when a response has landed. We used to do this via the
-processPeerResponseMessage function. However, what we need to be able to do is:
-a) Send a message to the peer,
-b) Handle the response.
-
-So, whenever the model needs to send a message to a peer, we should:
-* Create a new response mvar
-* Send the request + mvar to the outgoing peer bits
-* push the respose mvar onto the back of a per peer dequeue
-
-And then on each iteration, we have a per peer stm action, that:
-* Takes the value of the head of the per peer mvar queue
-* Drops it from the queue
-* Injects the response into the model.
-
-
-On the other hand, for each request, we kinda need to know what the response
-is _to_, so for AppendEntries, what it's acking. So, like, maybe we need to
-stash a continuation for the rest of the workflow instead? No? ...
-
-Maybe we should reconsider what we're doing After all.
-
-At each point in time, we should keep a note of the outgoing requests we've
-made, along with the last offset .
-* Receive AppendEntries response.
-* Update acked offset _for that follower_
-* Then derive the committed offset from a quorum of items.
-
-So, what we need do is update the acked offset for the follower with
-max(oldOffset, acked) So we need to route the response to a per follower
-widget. Queue? Sub-process (ie: alternative case for STM)
-
----
-
-Alternatively, use a callback type approach?
-
-Ie: schedule an action to be run once a rpc has completed? Eg:
-
-sendRequestVoteRpc ... $ \case
-  Granted -> do
-    ...
-  Rejected peerTerm -> do
-    ...
-
----
-
-TODO:
-
- * Make use of appendEntriesPeriod, so that we can
- * Use more "dense" timesteps in simulation
- * Avoid random scheduling oddness.
-
--}
 
 type PeerSet = Set Proto.PeerName
 
@@ -164,17 +108,10 @@ data RaftState req resp = RaftState {
 makeLenses ''RaftState
 
 
-type Receiver st req resp a = a -> ProtoStateMachine st req resp ()
-
--- Maybe generalise Receiver to some contrafunctor?
 data ProcessorMessage st req resp = Reply (IdFor (Proto.ClientResponse resp)) (Proto.ClientResponse resp)
     | PeerReply (IdFor Proto.PeerResponse) Proto.PeerResponse
-    | PeerRequest Proto.PeerName (Proto.PeerRequest req) (Receiver st req resp Proto.PeerResponse)
-
-instance (Show req, Show resp) => Show (ProcessorMessage st req resp) where
-  show (Reply reqid resp) = "Reply " ++ show reqid ++ " (" ++ show resp ++ ")"
-  show (PeerReply reqid resp) = "PeerReply " ++ show reqid ++ " (" ++ show resp ++ ")"
-  show (PeerRequest name req _) = "PeerRequest " ++ show name ++ " (" ++ show req ++ ") Cb"
+    | PeerRequest Proto.PeerName (Proto.PeerRequest req)
+  deriving (Show)
 
 newtype ProtoStateMachine st req resp a = ProtoStateMachine {
     runProto :: (RWS.RWST (ProtocolEnv st req resp) [ProcessorMessage st req resp] (RaftState req resp) (WriterLoggingT Identity)) a
@@ -416,9 +353,9 @@ processPeerRequestMessage
                     ackAppendEntries thisTerm newLogHead
 
 
-handleVoteResponse :: HasCallStack => Proto.RequestVoteReq -> Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine st req resp ()
-handleVoteResponse req sender _msg@(Proto.VoteResult peerTerm granted) = do
-    $(logDebugSH) ("handleVoteResponse to", req, _msg)
+handleVoteResponse :: HasCallStack => Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine st req resp ()
+handleVoteResponse sender _msg@(Proto.VoteResult peerTerm granted) = do
+    $(logDebugSH) ("handleVoteResponse to", _msg)
     role <- use currentRole
     myTerm <- use currentTerm
 
@@ -431,11 +368,11 @@ handleVoteResponse req sender _msg@(Proto.VoteResult peerTerm granted) = do
         _ -> do
             $(logDebugSH) ("vote recieved when non candidate?")
 
-handleVoteResponse req sender _msg = do
+handleVoteResponse sender _msg = do
     me <- view selfId
     let msg =
             (Proto.unPeerName me , ": Unexpected response from " , sender ,
-            " to vote request " , req , " resp " , _msg)
+            " resp " , _msg)
     $(logWarnSH) msg
     void $ error $ show msg
 
@@ -459,13 +396,11 @@ transitiontoLeaderWithEnoughVotes sender candidate = do
             currentRole .= newRole
 
 handleAppendEntriesResponse :: forall st req resp . (HasCallStack, Show req)
-                            => Proto.LogIdx
-                            -> (Proto.AppendEntriesReq req)
-                            -> Proto.PeerName
+                            => Proto.PeerName
                             -> Proto.PeerResponse
                             -> ProtoStateMachine st req resp ()
-handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = do
-    $(logDebugSH) ("handleAppendEntriesResponse", req, _msg)
+handleAppendEntriesResponse sender _msg@(Proto.AppendResult aer) = do
+    $(logDebugSH) ("handleAppendEntriesResponse", _msg)
     role <- use currentRole
     case role of
         Leader leader -> do
@@ -476,6 +411,7 @@ handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = d
             $(logWarnSH) ("append response recieved when non leader?", _msg)
     where
     whenLeader leader = do
+      let sentIdx = Proto.aerLogHead aer
       if Proto.aerSucceeded aer
       then do
           -- let followerPrevIdx' = Map.insert sender sentIdx $ view followerPrevIdx leader
@@ -534,13 +470,16 @@ handleAppendEntriesResponse sentIdx req sender _msg@(Proto.AppendResult aer) = d
       let r = last rs
       return r
 
-handleAppendEntriesResponse _ req sender _msg = do
+handleAppendEntriesResponse sender _msg = do
     me <- view selfId
     let msg = Proto.unPeerName me ++ ": Unexpected response from " ++ show sender ++
-                " to append entries request:" ++ show req ++
                 " got " ++ show _msg
     $(logWarnSH) msg
     void $ error $ show msg
+
+processPeerResponseMessage :: (Show req) => Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine st req resp ()
+processPeerResponseMessage name m@(Proto.VoteResult _ _)  = handleVoteResponse name m
+processPeerResponseMessage name m@(Proto.AppendResult _)  = handleAppendEntriesResponse name m
 
 processTick :: (HasCallStack, Show req, Show resp) => () -> Tick -> ProtoStateMachine st req resp ()
 processTick () (Tick t) = do
@@ -589,7 +528,7 @@ processTick () (Tick t) = do
 
     sendRequestVotes :: HasCallStack => Proto.RequestVoteReq -> Set Proto.PeerName -> ProtoStateMachine st req resp ()
     sendRequestVotes req peers =
-        tell $ map (\p -> PeerRequest p (Proto.RequestVote req) $ handleVoteResponse req p) $ Set.toList peers
+        tell $ map (\p -> PeerRequest p (Proto.RequestVote req)) $ Set.toList peers
 
     whenCandidate :: CandidateState -> ProtoStateMachine st req resp ()
     whenCandidate candidate = do
@@ -630,12 +569,12 @@ replicatePendingEntriesToFollowers leader = do
         toSend <- readItemsAfter peerLastSent
 
         let sentIdx = maybe peerLastSent fst $ Map.lookupMax $ toSend
-        sendAppendEntriesRequest sentIdx peer $ Proto.AppendEntriesReq thisTerm myId peerPrevTerm peerLastSent toSend
+        sendAppendEntriesRequest peer $ Proto.AppendEntriesReq thisTerm myId peerPrevTerm peerLastSent toSend
         $(logDebugSH) ("post send to", peer, "lastSent", sentIdx)
         let peerState' = peerState & set lastSent sentIdx
         return $ st & over followers (Map.insert peer peerState')
 
-sendAppendEntriesRequest :: (HasCallStack, Show req)
-                         => Proto.LogIdx -> Proto.PeerName -> Proto.AppendEntriesReq req -> ProtoStateMachine st req resp ()
-sendAppendEntriesRequest sentIdx peer req = do
-    tell [PeerRequest peer (Proto.AppendEntries req) $ handleAppendEntriesResponse sentIdx req peer]
+sendAppendEntriesRequest :: HasCallStack
+                         => Proto.PeerName -> Proto.AppendEntriesReq req -> ProtoStateMachine st req resp ()
+sendAppendEntriesRequest peer req = do
+    tell [PeerRequest peer (Proto.AppendEntries req)]
