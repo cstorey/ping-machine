@@ -617,18 +617,20 @@ simulateStep thisNode = do
           $(logDebugSH) (unPeerName dst, "post sendPeerReply", "num pending callbacks", fmap Seq.length p)
         return ()
 
-  -- sendClientReply :: (Show y, MonadState (Network st req resp) m) => IdFor (ClientResponse resp) -> Either ClientError y -> m ()
   sendClientReply clientId m@(Left (NotLeader leaderp)) = do
         dst <- nameOfClientId clientId
-        st <- preuse $ clients . ix dst
-        $(logDebugSH) (thisNode, clientId, "pre  sendClientReply", m, st)
+
+        use (clients . at dst) >>= \st -> $(logDebugSH) (thisNode, clientId, "pre sendClientReply", m, st)
+
         clients . ix dst . lastSeenLeader .= leaderp
-        st' <- preuse $ clients . ix dst
-        $(logDebugSH) (thisNode, clientId, "post sendClientReply", m, st')
+
+        use (clients . at dst) >>= \st -> $(logDebugSH) (thisNode, clientId, "post sendClientReply", m, st)
+
+        return ()
+
   sendClientReply clientId m@(Right _) = do
         dst <- nameOfClientId clientId
-        st <- use (clients . at dst)
-        $(logDebugSH) (thisNode, clientId, "sendClientReply", m, st)
+        use (clients . at dst) >>= \st -> $(logDebugSH) (thisNode, clientId, "sendClientReply", m, st)
 
 nameOfPeerId :: (HasCallStack, MonadState (Network st req resp) m) => IdFor PeerResponse -> m PeerName
 nameOfPeerId name = do
