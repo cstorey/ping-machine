@@ -3,6 +3,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE KindSignatures #-}
 
 module Stuff.RaftModel
 ( ProcessorMessage(..)
@@ -164,22 +165,22 @@ data RaftState req resp = RaftState {
 makeLenses ''RaftState
 
 
-type Receiver st req resp a = a -> ProtoStateMachine st req resp ()
+type Receiver st req resp (m :: * -> *) a = a -> ProtoStateMachine st req resp m ()
 
 -- Maybe generalise Receiver to some contrafunctor?
-data ProcessorMessage st req resp = Reply (IdFor (Proto.ClientResponse resp)) (Proto.ClientResponse resp)
+data ProcessorMessage st req resp m = Reply (IdFor (Proto.ClientResponse resp)) (Proto.ClientResponse resp)
     | PeerReply (IdFor Proto.PeerResponse) Proto.PeerResponse
-    | PeerRequest Proto.PeerName (Proto.PeerRequest req) (Receiver st req resp Proto.PeerResponse)
+    | PeerRequest Proto.PeerName (Proto.PeerRequest req) (Receiver st req resp m Proto.PeerResponse)
 
-instance (Show req, Show resp) => Show (ProcessorMessage st req resp) where
+instance (Show req, Show resp) => Show (ProcessorMessage st req resp m) where
   show (Reply reqid resp) = "Reply " ++ show reqid ++ " (" ++ show resp ++ ")"
   show (PeerReply reqid resp) = "PeerReply " ++ show reqid ++ " (" ++ show resp ++ ")"
   show (PeerRequest name req _) = "PeerRequest " ++ show name ++ " (" ++ show req ++ ") Cb"
 
-newtype ProtoStateMachine st req resp a = ProtoStateMachine {
-    runProto :: (RWS.RWST (ProtocolEnv st req resp) [ProcessorMessage st req resp] (RaftState req resp) (WriterLoggingT Identity)) a
+newtype ProtoStateMachine st req resp m a = ProtoStateMachine {
+    runProto :: (RWS.RWST (ProtocolEnv st req resp) [ProcessorMessage st req resp m] (RaftState req resp) (WriterLoggingT m)) a
 } deriving (Monad, Applicative, Functor,
-            MonadState (RaftState req resp), MonadWriter [ProcessorMessage st req resp],
+            MonadState (RaftState req resp), MonadWriter [ProcessorMessage st req resp m],
             MonadReader (ProtocolEnv st req resp), MonadLogger)
 
 succIdx :: Proto.LogIdx -> Proto.LogIdx
