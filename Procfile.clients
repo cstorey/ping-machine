@@ -1,0 +1,1 @@
+client: sh -c 'until unbuffer stack exec -- stuff-client  +RTS $RTS_OPTS -RTS "$PORT" | tai64n | tai64nlocal; do sleep 1; done'
