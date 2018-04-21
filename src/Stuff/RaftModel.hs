@@ -3,6 +3,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE KindSignatures #-}
 
 module Stuff.RaftModel
 ( ProcessorMessage(..)
@@ -113,8 +114,8 @@ data ProcessorMessage st req resp = Reply (IdFor (Proto.ClientResponse resp)) (P
     | PeerRequest Proto.PeerName (Proto.PeerRequest req)
   deriving (Show)
 
-newtype ProtoStateMachine st req resp a = ProtoStateMachine {
-    runProto :: (RWS.RWST (ProtocolEnv st req resp) [ProcessorMessage st req resp] (RaftState req resp) (WriterLoggingT Identity)) a
+newtype ProtoStateMachine st req resp m a = ProtoStateMachine {
+    runProto :: (RWS.RWST (ProtocolEnv st req resp) [ProcessorMessage st req resp] (RaftState req resp) (WriterLoggingT m)) a
 } deriving (Monad, Applicative, Functor,
             MonadState (RaftState req resp), MonadWriter [ProcessorMessage st req resp],
             MonadReader (ProtocolEnv st req resp), MonadLogger)
@@ -133,7 +134,7 @@ mkRaftState :: RaftState req resp
 mkRaftState = RaftState newFollower 0 Map.empty Nothing 0 Nothing
 
 -- Log operations
-appendToLog :: req -> ProtoStateMachine st req resp Proto.LogIdx
+appendToLog :: Monad m => req -> ProtoStateMachine st req resp m Proto.LogIdx
 appendToLog command = do
     thisTerm <- use currentTerm
     let entry = Proto.LogEntry thisTerm command
@@ -142,7 +143,7 @@ appendToLog command = do
     logEntries %= Map.insert idx entry
     return idx
 
-getPrevLogTermIdx :: HasCallStack => ProtoStateMachine st req resp (Proto.Term, Proto.LogIdx)
+getPrevLogTermIdx :: (Monad m, HasCallStack) => ProtoStateMachine st req resp m (Proto.Term, Proto.LogIdx)
 getPrevLogTermIdx = do
     myLog <- use logEntries
     return $ maybe (0, Proto.LogIdx $ Nothing) (\(idx, it) -> (Proto.logTerm it, idx)) $ Map.lookupMax myLog
@@ -197,7 +198,7 @@ readItemsAfter peerLastSent = do
 
 -- handlers
 
-processClientReqRespMessage :: (Show req, Show resp) => req -> IdFor (Proto.ClientResponse resp) -> ProtoStateMachine st req resp ()
+processClientReqRespMessage :: (Show req, Show resp, Monad m) => req -> IdFor (Proto.ClientResponse resp) -> ProtoStateMachine st req resp m ()
 processClientReqRespMessage command pendingResponse = do
     $(logDebugSH) ("processClientReqRespMessage", command, pendingResponse)
     role <- use currentRole
@@ -223,7 +224,7 @@ processClientReqRespMessage command pendingResponse = do
         return $ over pendingClientRequests (Map.insert idx pendingResponse) leader
 
 
-observeTerm :: HasCallStack => Proto.Term -> ProtoStateMachine st req resp ()
+observeTerm :: (Monad m, HasCallStack) => Proto.Term -> ProtoStateMachine st req resp m ()
 observeTerm laterTerm = do
     thisTerm <- use currentTerm
     formerRole <- use currentRole
@@ -240,7 +241,7 @@ observeTerm laterTerm = do
 
     void $ stepDown
     where
-        whenLeader :: HasCallStack => LeaderState resp -> ProtoStateMachine st req resp ()
+        whenLeader :: (HasCallStack, Monad m) => LeaderState resp -> ProtoStateMachine st req resp m ()
         whenLeader leader = do
             let pending = view pendingClientRequests leader
             $(logDebugSH) ("Nacking requests", pending)
@@ -248,7 +249,7 @@ observeTerm laterTerm = do
                 -- We should really actually run a state machine here. But ...
                 tell [Reply clid $ Left $ Proto.NotLeader $ Nothing]
 
-stepDown :: HasCallStack => ProtoStateMachine st req resp FollowerState
+stepDown :: (Monad m, HasCallStack) => ProtoStateMachine st req resp m FollowerState
 stepDown = do
     prevTick <- use prevTickTime
     let st = FollowerState prevTick
@@ -256,15 +257,15 @@ stepDown = do
     currentRole .= role'
     return st
 
-getMajority :: HasCallStack => ProtoStateMachine st req resp Int
+getMajority :: (Monad m, HasCallStack) => ProtoStateMachine st req resp m Int
 getMajority = do
     memberCount <- succ . length <$> view peerNames
     return $ succ (memberCount `div` 2)
 
-processPeerRequestMessage :: forall st req resp . (HasCallStack, Show req)
+processPeerRequestMessage :: forall st req resp m . (HasCallStack, Monad m, Show req)
                           => Proto.PeerRequest req
                           -> IdFor Proto.PeerResponse
-                          -> ProtoStateMachine st req resp ()
+                          -> ProtoStateMachine st req resp m ()
 processPeerRequestMessage (Proto.RequestVote req) sender = do
     -- let x = (RequestVoteReq candidateTerm candidateName candidateIdx);
     thisTerm <- use currentTerm
@@ -287,9 +288,9 @@ processPeerRequestMessage (Proto.RequestVote req) sender = do
             grantVote candidateTerm
 
     where
-        refuseVote :: HasCallStack => Proto.Term -> ProtoStateMachine st req resp ()
+        refuseVote :: (HasCallStack, Monad m) => Proto.Term -> ProtoStateMachine st req resp m ()
         refuseVote thisTerm = tell [PeerReply sender $ Proto.VoteResult thisTerm False]
-        grantVote :: HasCallStack => Proto.Term -> ProtoStateMachine st req resp ()
+        grantVote :: (HasCallStack, Monad m) => Proto.Term -> ProtoStateMachine st req resp m ()
         grantVote thisTerm = do
             votedFor .= Just (Proto.rvName req)
             tell [PeerReply sender $ Proto.VoteResult thisTerm True]
@@ -322,9 +323,9 @@ processPeerRequestMessage
                     error ("appendEntries recieved when leader? " ++ show _msg)
 
     where
-        refuseAppendEntries :: HasCallStack => Proto.Term -> Proto.LogIdx -> ProtoStateMachine st req resp ()
+        refuseAppendEntries :: (HasCallStack, Monad m) => Proto.Term -> Proto.LogIdx -> ProtoStateMachine st req resp m ()
         refuseAppendEntries thisTerm curHead = tell [PeerReply reqId $ Proto.AppendResult $ Proto.AppendEntriesResponse thisTerm False curHead]
-        ackAppendEntries :: HasCallStack => Proto.Term -> Proto.LogIdx -> ProtoStateMachine st req resp ()
+        ackAppendEntries :: (HasCallStack, Monad m) => Proto.Term -> Proto.LogIdx -> ProtoStateMachine st req resp m ()
         ackAppendEntries thisTerm curHead = tell [PeerReply reqId $ Proto.AppendResult $ Proto.AppendEntriesResponse thisTerm True curHead]
 
         whenFollower thisTerm follower = do
@@ -353,7 +354,7 @@ processPeerRequestMessage
                     ackAppendEntries thisTerm newLogHead
 
 
-handleVoteResponse :: HasCallStack => Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine st req resp ()
+handleVoteResponse :: (HasCallStack, Monad m) => Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine st req resp m ()
 handleVoteResponse sender _msg@(Proto.VoteResult peerTerm granted) = do
     $(logDebugSH) ("handleVoteResponse to", _msg)
     role <- use currentRole
@@ -376,9 +377,10 @@ handleVoteResponse sender _msg = do
     $(logWarnSH) msg
     void $ error $ show msg
 
-transitiontoLeaderWithEnoughVotes :: Proto.PeerName
+transitiontoLeaderWithEnoughVotes :: (HasCallStack, Monad m)
+                                  => Proto.PeerName
                                   -> CandidateState
-                                  -> ProtoStateMachine st req resp ()
+                                  -> ProtoStateMachine st req resp m ()
 transitiontoLeaderWithEnoughVotes sender candidate = do
             let newCandidate = over votesForMe (Set.insert sender) candidate
             let currentVotes = view votesForMe newCandidate
@@ -395,10 +397,10 @@ transitiontoLeaderWithEnoughVotes sender candidate = do
 
             currentRole .= newRole
 
-handleAppendEntriesResponse :: forall st req resp . (HasCallStack, Show req)
+handleAppendEntriesResponse :: forall st req resp m . (HasCallStack, Monad m, Show req)
                             => Proto.PeerName
                             -> Proto.PeerResponse
-                            -> ProtoStateMachine st req resp ()
+                            -> ProtoStateMachine st req resp m ()
 handleAppendEntriesResponse sender _msg@(Proto.AppendResult aer) = do
     $(logDebugSH) ("handleAppendEntriesResponse", _msg)
     role <- use currentRole
@@ -430,7 +432,7 @@ handleAppendEntriesResponse sender _msg@(Proto.AppendResult aer) = do
                     & set (followers . ix sender . prevIdx) toTry
                     & set (followers . ix sender . lastSent) toTry
 
-    findCommittedIndex :: HasCallStack => LeaderState resp -> ProtoStateMachine st req resp (Maybe Proto.LogIdx)
+    findCommittedIndex :: (HasCallStack, Monad m) => LeaderState resp -> ProtoStateMachine st req resp m (Maybe Proto.LogIdx)
     findCommittedIndex st = do
         majority <- getMajority
         -- Find items acked by a ajority of servers.
@@ -441,8 +443,8 @@ handleAppendEntriesResponse sender _msg@(Proto.AppendResult aer) = do
         $(logDebugSH) ("Known follower indexes: " , known)
         return $ Maybe.listToMaybe $ List.drop (pred majority) known
 
-    ackPendingClientResponses :: HasCallStack
-                              => LeaderState resp -> Proto.LogIdx -> ProtoStateMachine st req resp (LeaderState resp)
+    ackPendingClientResponses :: (HasCallStack, Monad m)
+                              => LeaderState resp -> Proto.LogIdx -> ProtoStateMachine st req resp m (LeaderState resp)
     ackPendingClientResponses leader idx = do
         let pending = view pendingClientRequests leader
         let (canRespond, unCommitted) = Map.spanAntitone (<= idx) pending
@@ -461,7 +463,7 @@ handleAppendEntriesResponse sender _msg@(Proto.AppendResult aer) = do
       where
       update st = swap $ Models.modelStep m st $ Proto.logValue item
 
-    responseToEntries :: Proto.LogIdx -> ProtoStateMachine st req resp resp
+    responseToEntries :: (HasCallStack, Monad m) => Proto.LogIdx -> ProtoStateMachine st req resp m resp
     responseToEntries reqIdx = do
       prev <- Map.elems <$> readLogUptoInclusive reqIdx
       m <- view model
@@ -477,11 +479,11 @@ handleAppendEntriesResponse sender _msg = do
     $(logWarnSH) msg
     void $ error $ show msg
 
-processPeerResponseMessage :: (Show req) => Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine st req resp ()
+processPeerResponseMessage :: (HasCallStack, Monad m, Show req) => Proto.PeerName -> Proto.PeerResponse -> ProtoStateMachine st req resp m ()
 processPeerResponseMessage name m@(Proto.VoteResult _ _)  = handleVoteResponse name m
 processPeerResponseMessage name m@(Proto.AppendResult _)  = handleAppendEntriesResponse name m
 
-processTick :: (HasCallStack, Show req, Show resp) => () -> Tick -> ProtoStateMachine st req resp ()
+processTick :: (HasCallStack, Monad m, Show req, Show resp) => () -> Tick -> ProtoStateMachine st req resp m ()
 processTick () (Tick t) = do
     role <- use currentRole
     case role of
@@ -496,7 +498,7 @@ processTick () (Tick t) = do
     return ()
 
     where
-    whenFollower :: HasCallStack => FollowerState -> ProtoStateMachine st req resp ()
+    whenFollower :: (HasCallStack, Monad m) => FollowerState -> ProtoStateMachine st req resp m ()
     whenFollower follower = do
         let elapsed = (t - view lastLeaderHeartbeat follower)
         timeout <- view electionTimeout
@@ -507,7 +509,7 @@ processTick () (Tick t) = do
             transitionToCandidate
         else return ()
 
-    transitionToCandidate :: HasCallStack => ProtoStateMachine st req resp ()
+    transitionToCandidate :: (HasCallStack, Monad m) => ProtoStateMachine st req resp m ()
     transitionToCandidate = do
         myName <- view selfId
         let st = CandidateState t $ Set.singleton myName
@@ -526,11 +528,11 @@ processTick () (Tick t) = do
         transitiontoLeaderWithEnoughVotes myId st
 
 
-    sendRequestVotes :: HasCallStack => Proto.RequestVoteReq -> Set Proto.PeerName -> ProtoStateMachine st req resp ()
+    sendRequestVotes :: (HasCallStack, Monad m) => Proto.RequestVoteReq -> Set Proto.PeerName -> ProtoStateMachine st req resp m ()
     sendRequestVotes req peers =
         tell $ map (\p -> PeerRequest p (Proto.RequestVote req)) $ Set.toList peers
 
-    whenCandidate :: CandidateState -> ProtoStateMachine st req resp ()
+    whenCandidate :: (HasCallStack, Monad m) => CandidateState -> ProtoStateMachine st req resp m ()
     whenCandidate candidate = do
         -- has the election timeout passed?
         let elapsed = t - view requestVoteSentAt candidate
@@ -547,8 +549,8 @@ processTick () (Tick t) = do
         currentRole .= (Leader leader')
 
 -- Here, we send keepalives to everything every time. This ... seems suboptimal.
-replicatePendingEntriesToFollowers :: forall st req resp . (HasCallStack, Show req, Show resp)
-                                   => LeaderState resp -> ProtoStateMachine st req resp (LeaderState resp)
+replicatePendingEntriesToFollowers :: forall st req resp m . (HasCallStack, Monad m, Show req, Show resp)
+                                   => LeaderState resp -> ProtoStateMachine st req resp m (LeaderState resp)
 replicatePendingEntriesToFollowers leader = do
     $(logDebugSH) ("Leader Tick")
     peers <- view peerNames
@@ -557,7 +559,7 @@ replicatePendingEntriesToFollowers leader = do
     where
     updatePeer :: LeaderState resp
                -> Proto.PeerName
-               -> ProtoStateMachine st req resp (LeaderState resp)
+               -> ProtoStateMachine st req resp m (LeaderState resp)
     updatePeer st peer = do
         thisTerm <- use currentTerm
         myId <- view selfId
@@ -574,7 +576,7 @@ replicatePendingEntriesToFollowers leader = do
         let peerState' = peerState & set lastSent sentIdx
         return $ st & over followers (Map.insert peer peerState')
 
-sendAppendEntriesRequest :: HasCallStack
-                         => Proto.PeerName -> Proto.AppendEntriesReq req -> ProtoStateMachine st req resp ()
+sendAppendEntriesRequest :: (HasCallStack, Monad m)
+                         => Proto.PeerName -> Proto.AppendEntriesReq req -> ProtoStateMachine st req resp m ()
 sendAppendEntriesRequest peer req = do
     tell [PeerRequest peer (Proto.AppendEntries req)]

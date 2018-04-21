@@ -31,7 +31,7 @@ oneSecondMicroSeconds = 1000000
 
 
 -- Supervisor
-withOutgoing :: forall req resp a . (Binary req, Show req, Binary resp, Show resp)
+withOutgoing :: forall req resp a . (Binary req, Show req)
             => [Proto.PeerName]
             -> (Outgoing req resp -> IO a)
             -> IO a

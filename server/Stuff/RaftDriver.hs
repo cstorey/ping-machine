@@ -16,7 +16,6 @@ import qualified Stuff.Models as Models
 
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import qualified Control.Monad.Logger as Logger
-import qualified Data.Functor.Identity as Identity
 import qualified Control.Concurrent.STM as STM
 import           Control.Concurrent.STM (STM)
 import Data.Map (Map)
@@ -147,7 +146,7 @@ processRespMessageSTM self = do
 processReqRespMessageSTM :: Driver st req resp
                   -> STMPendingRespMap outs
                   -> Listener ins outs
-                  -> (ins -> IdFor outs -> ProtoStateMachine st req resp ())
+                  -> (ins -> IdFor outs -> ProtoStateMachine st req resp STM ())
                   -> LoggedSTM [ProcessorMessage st req resp]
 processReqRespMessageSTM self pendingResponses listener process = do
   (msg, pendingResponse) <- lift $ STM.readTQueue $ listenerRequests listener
@@ -183,12 +182,11 @@ sendMessages pendingClientResponses peerRequests pendingPeerResponses toSend = d
                   STM.writeTQueue q $ msg
                 Nothing -> error "what?"
 
-processActions :: Driver st req resp -> ProtoStateMachine st req resp a -> LoggedSTM (a, [ProcessorMessage st req resp])
+processActions :: Driver st req resp -> ProtoStateMachine st req resp STM a -> LoggedSTM (a, [ProcessorMessage st req resp])
 processActions self actions = do
   env <- lift $ envSTM
   s <- lift $ STM.readTVar stateRef
-  let ((a, s', toSend), logs) = Identity.runIdentity $ Logger.runWriterLoggingT $ RWS.runRWST (runProto actions) env s
-  forM_ logs $ \(loc, src, lvl, logmsg) -> Logger.monadLoggerLog loc src lvl logmsg
+  (a, s', toSend) <- RWS.runRWST (runProto actions) env s
   lift $ STM.writeTVar stateRef s'
   return (a, toSend)
   where

@@ -123,7 +123,7 @@ makeNode allPeers self elTimeout model = NodeSim newnodeEnv mkRaftState Seq.empt
 
 applyState :: (HasCallStack, Show req, Show resp, MonadState (Network st req resp) m)
            => InboxItem st req resp
-           -> m (ProtoStateMachine st req resp ())
+           -> m (ProtoStateMachine st req resp m ())
 applyState (ClockTick t) = do
   pure $ processTick () $ Tick t
 
@@ -566,8 +566,7 @@ simulateStep thisNode = do
 
   let actions = traverse_ id psmActions
 
-  let (((), s', toSend), logs) = Identity.runIdentity $
-                                 Logger.runWriterLoggingT $
+  (((), s', toSend), logs) <- Logger.runWriterLoggingT $
                                  RWS.runRWST (runProto $ actions) (view nodeEnv node) (view nodeState node)
   forM_ logs $ \(loc, src, lvl, logmsg) -> Logger.monadLoggerLog loc src lvl logmsg
 
