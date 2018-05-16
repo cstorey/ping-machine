@@ -2,6 +2,11 @@
 % What linearizable consistency is, why it's good and why it's bad, and why you might care
 % Ceri Storey
 
+<!--
+Build with:
+pandoc -t revealjs -s -o doc/slides.html -V revealjs-url=http://lab.hakim.se/reveal-js  --slide-level=2 --highlight-style=breezedark doc/linearizability-talk.md
+-->
+
 # Single computer makes life easier
 
 ## Need more than one
@@ -51,6 +56,85 @@
 ## Queue Example 4
 
 ![History 4 from Wing and Herlihy](laccfco-pp3-h4.png)
+
+# Algorithm breakdown
+
+## Haskell
+
+```haskell
+checkHistory :: forall req res s. (Eq req, Eq res, Show req, Show res, Show s)
+             => ModelFun s req res
+             -> s
+             -> [(Process, HistoryElement req res)]
+             -> Either (NotLinearizable req res) [Linearization req res]
+checkHistory model initialState h = runExcept $ go Map.empty Map.empty initialState 0 h
+  where
+    go calls rets s depth history =
+      doneRule <|> observationRule <|> linRule
+      where
+	-- ...
+```
+## Are we nearly there yet?
+```haskell
+-- ...
+doneRule = do
+  if history == [] && Map.null calls && Map.null rets
+  then return []
+  else empty
+
+-- ...
+```
+## Observe an event
+```haskell
+-- ...
+-- From Testing from "Testing for Linearizability", Gavin Lowe
+observationRule = case history of
+    (p, op) : future -> do
+      case (op, Map.lookup p calls, Map.lookup p rets) of
+        (Call req, Nothing, Nothing) -> do
+          go (Map.insert p req calls) rets s (succ depth) future
+        (Ret res, Nothing, Just (_call, expected)) | (res == expected) -> do
+          go calls (Map.delete p rets) s (succ depth) future
+
+-- ...
+```
+## Raise error for events that don't match our model
+```haskell
+-- observationRule continued
+        (Ret res, Nothing, Just (_call, expected)) -> do
+          throwE $ NotLinearizable (ModelMismatch _call expected res) []
+        _ -> do
+          throwE $ NotLinearizable (NonMatchInObservable op) []
+    [] -> do
+          throwE $ NotLinearizable (ExpectingOp) []
+
+  -- ...
+```
+## Synthesize linearisation point
+```haskell
+-- ...
+linRule = do
+  rs <- asum $ flip fmap (Map.toList calls) $ \(p, req) -> do
+    let (s', ret) = model s req
+    let lin = Op p req ret
+    rest <- go (Map.delete p calls) (Map.insert p (req, ret) rets) s' (succ depth) history
+      `catchE` prefixErrorWith lin
+
+    return $ lin : rest
+
+  return rs
+  -- ...
+```
+## helpers
+```haskell
+-- ...
+prefixErrorWith :: Linearization req res
+                -> NotLinearizable req res
+                -> Except (NotLinearizable req res) a
+prefixErrorWith lin err =
+  throwE $ err { linPrefix = lin : linPrefix err }
+```
+
 
 # See also:
 
