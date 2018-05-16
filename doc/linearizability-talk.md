@@ -137,7 +137,7 @@ prefixErrorWith lin err =
 
 
 # See also:
-
+## References
 * [Linearizability: a correctness condition for concurrent objects](https://dl.acm.org/citation.cfm?id=78972)
 * [Linearizability versus Serializability](http://www.bailis.org/blog/linearizability-versus-serializability/)
 * [Serializability, linearizability, and locality](https://aphyr.com/posts/333-serializability-linearizability-and-locality)
